@@ -160,9 +160,13 @@ pub(crate) fn open_file_error(
 }
 
 fn open_directory(path: &Path) -> Result<File, PlatformError> {
+    open_directory_with(path, 0)
+}
+
+fn open_directory_with(path: &Path, flags: i32) -> Result<File, PlatformError> {
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(flags | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|error| {
             if error.raw_os_error() == Some(libc::ENOTDIR)
@@ -173,6 +177,25 @@ fn open_directory(path: &Path) -> Result<File, PlatformError> {
             }
             open_file_error(path, "open_directory", error)
         })
+}
+
+// A cwd or an SSH file's parent needs search permission, even when listing
+// directory entries is forbidden. Let the kernel evaluate credentials and ACLs.
+fn searchable_directory_metadata(path: &Path) -> Result<Metadata, PlatformError> {
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_SEARCH;
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH;
+    let directory = open_directory_with(path, flags)?;
+    let metadata = fd_metadata(path, &directory)?;
+    // O_PATH pins the directory without checking search permission on the leaf.
+    #[cfg(target_os = "linux")]
+    {
+        let searched = fs::metadata(path.join("."))
+            .map_err(|error| PlatformError::io("search_directory", path, error))?;
+        check_inode(path, &metadata, &searched)?;
+    }
+    Ok(metadata)
 }
 
 fn check_inode(path: &Path, first: &Metadata, second: &Metadata) -> Result<(), PlatformError> {
@@ -625,8 +648,7 @@ impl PrivateFs {
 
         let target = target.primary;
         if expect_dir {
-            let directory = open_directory(&target)?;
-            check_inode(path, &original, &fd_metadata(&target, &directory)?)?;
+            check_inode(path, &original, &searchable_directory_metadata(&target)?)?;
         } else {
             let (_file, metadata) = open_regular_file(&target)?;
             check_inode(path, &original, &metadata)?;
@@ -639,8 +661,7 @@ impl PrivateFs {
             let parent = target
                 .parent()
                 .ok_or_else(|| invalid_path(&target, "expected a parent directory"))?;
-            let directory = open_directory(parent)?;
-            let metadata = fd_metadata(parent, &directory)?;
+            let metadata = searchable_directory_metadata(parent)?;
             check_mode(
                 parent,
                 &metadata,

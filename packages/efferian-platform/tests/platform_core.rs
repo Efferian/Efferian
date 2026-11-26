@@ -428,6 +428,36 @@ fn validates_component_boundaries_and_both_directions_of_forbidden_overlap() -> 
 }
 
 #[test]
+fn path_validation_checks_directory_search_permission() -> TestResult {
+    let dir = TestDir::new()?;
+    let root = dir.path().to_path_buf();
+    let allowed = std::slice::from_ref(&root);
+    let cwd = PrivateFs::ensure_private_dir(&root.join("work"))?;
+    let file = cwd.join("known_hosts");
+    fs::write(&file, b"entry")?;
+    set_mode(&file, 0o400)?;
+
+    set_mode(&cwd, 0o100)?;
+    let searchable = PrivateFs::validate_path_within_roots(&cwd, allowed, &[], true);
+    let readable_file = PrivateFs::validate_path_within_roots(&file, allowed, &[], false);
+
+    set_mode(&cwd, 0o400)?;
+    let list_only = PrivateFs::validate_path_within_roots(&cwd, allowed, &[], true);
+    // A privileged service may bypass the mode bits. Compare against the kernel.
+    let can_enter = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .current_dir(&cwd)
+        .status()
+        .is_ok_and(|status| status.success());
+    set_mode(&cwd, 0o700)?;
+
+    assert_eq!(searchable?, cwd);
+    assert_eq!(readable_file?, file);
+    assert_eq!(list_only.is_ok(), can_enter);
+    Ok(())
+}
+
+#[test]
 fn validates_regular_files_and_their_parent_permissions() -> TestResult {
     let dir = TestDir::new()?;
     let parent = PrivateFs::ensure_private_dir(&dir.path().join("ssh"))?;

@@ -21,6 +21,13 @@ pub struct FileLock {
 
 impl FileLock {
     pub fn acquire_exclusive(lock_path: &Path) -> Result<Self, PlatformError> {
+        Self::acquire_with_verification(lock_path, verified_lock_path)
+    }
+
+    fn acquire_with_verification(
+        lock_path: &Path,
+        verify: impl FnOnce(&Path, &Metadata) -> Result<PathBuf, PlatformError>,
+    ) -> Result<Self, PlatformError> {
         let invalid = || PlatformError::InvalidLockTarget {
             path: lock_path.to_path_buf(),
             reason: "expected a sidecar filename with a nonempty stem and .lock suffix",
@@ -85,16 +92,20 @@ impl FileLock {
             path: path.to_path_buf(),
             owner_pid: std::process::id(),
         };
-        verify_lock_entry(path, &opened)?;
-        let canonical = fs::canonicalize(path).map_err(|error| lock_entry_error(path, error))?;
-        verify_lock_entry(&canonical, &opened)?;
-        lock.path = canonical;
+        lock.path = verify(path, &opened)?;
         Ok(lock)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn verified_lock_path(path: &Path, opened: &Metadata) -> Result<PathBuf, PlatformError> {
+    verify_lock_entry(path, opened)?;
+    let canonical = fs::canonicalize(path).map_err(|error| lock_entry_error(path, error))?;
+    verify_lock_entry(&canonical, opened)?;
+    Ok(canonical)
 }
 
 fn lock_entry_error(path: &Path, error: io::Error) -> PlatformError {
@@ -136,23 +147,30 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = TestDir::new()?;
         let path = dir.path().join("hub.lock");
-        let lock = FileLock::acquire_exclusive(&path)?;
-        let opened = lock.file.metadata()?;
+        drop(FileLock::acquire_exclusive(&path)?);
+        let contender = OpenOptions::new().read(true).write(true).open(&path)?;
         let renamed = dir.path().join("renamed");
         let alias = dir.path().join("alias");
-        fs::hard_link(&path, &alias)?;
-        assert!(matches!(
-            verify_lock_entry(&path, &opened),
-            Err(PlatformError::LockFileChanged { .. })
-        ));
-        fs::remove_file(alias)?;
-        fs::rename(&path, &renamed)?;
-        fs::write(&path, b"replacement")?;
-        assert!(matches!(
-            verify_lock_entry(&path, &opened),
-            Err(PlatformError::LockFileChanged { .. })
-        ));
-        assert!(verify_lock_entry(&renamed, &opened).is_ok());
+        for replace in [false, true] {
+            let result = FileLock::acquire_with_verification(&path, |path, opened| {
+                assert!(matches!(
+                    contender.try_lock(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                if replace {
+                    fs::rename(path, &renamed).and_then(|()| fs::write(path, b"replacement"))
+                } else {
+                    fs::hard_link(path, &alias)
+                }
+                .map_err(|error| PlatformError::io("change_test_entry", path, error))?;
+                verified_lock_path(path, opened)
+            });
+            assert!(matches!(result, Err(PlatformError::LockFileChanged { .. })));
+            if !replace {
+                fs::remove_file(&alias)?;
+            }
+        }
+        contender.try_lock()?;
         Ok(())
     }
 

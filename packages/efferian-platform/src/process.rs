@@ -19,7 +19,6 @@ pub enum TerminateOutcome {
 #[derive(Debug)]
 enum Cleanup {
     Waiting,
-    TermSent(Duration),
     Grace {
         started: MonoInstant,
         duration: Duration,
@@ -33,8 +32,10 @@ enum Cleanup {
 
 /// Owns an isolated POSIX process group through cleanup and leader collection.
 ///
-/// Keep the handle until cleanup succeeds, and service any extracted pipes
-/// separately. Other code must leave collection of the leader to this handle.
+/// Keep the handle until cleanup succeeds. Take every piped stdout and stderr
+/// and drain them concurrently with waiting, so the child can finish writing.
+/// Use inherited or null output for streams the caller does not need to read.
+/// Other code must leave collection of the leader to this handle.
 /// Cleanup covers signalable members of the original group while Node is alive.
 ///
 /// Spawn on a thread with SIGCHLD unblocked in a Tokio runtime with its I/O
@@ -173,6 +174,8 @@ impl ProcessHandle {
     /// A zero grace period escalates immediately. The deadline bounds the time
     /// until escalation. Collecting the leader may take longer. An interrupted
     /// call resumes its recorded phase and deadline on the next cleanup call.
+    /// If reading the clock just after TERM fails, the call reports the error
+    /// and a retry uses the timestamp taken immediately before the signal.
     ///
     /// # Panics
     ///
@@ -184,25 +187,35 @@ impl ProcessHandle {
     ) -> Result<TerminateOutcome, PlatformError> {
         self.stdin.take();
         if matches!(self.cleanup, Cleanup::Waiting) {
-            self.cleanup = if grace.is_zero() {
-                Cleanup::Escalating
+            if grace.is_zero() {
+                self.cleanup = Cleanup::Escalating;
             } else {
-                self.leader_exited()?;
-                self.signal_group(libc::SIGTERM)?;
-                Cleanup::TermSent(grace)
-            };
+                self.begin_grace(grace, MonotonicClock::now)?;
+            }
         }
         let (_, outcome) = self.finish_cleanup().await?;
         Ok(outcome)
     }
 
+    fn begin_grace(
+        &mut self,
+        duration: Duration,
+        mut now: impl FnMut() -> Result<MonoInstant, PlatformError>,
+    ) -> Result<(), PlatformError> {
+        self.leader_exited()?;
+        let before_term = now()?;
+        self.signal_group(libc::SIGTERM)?;
+        // Prefer the post-signal sample to give the group its full window.
+        // If the clock fails here, retries can still use the pre-signal sample.
+        let after_term = now();
+        self.cleanup = Cleanup::Grace {
+            started: after_term.as_ref().copied().unwrap_or(before_term),
+            duration,
+        };
+        after_term.map(|_| ())
+    }
+
     async fn finish_cleanup(&mut self) -> Result<(ExitStatus, TerminateOutcome), PlatformError> {
-        if let Cleanup::TermSent(grace) = self.cleanup {
-            self.cleanup = Cleanup::Grace {
-                started: MonotonicClock::now()?,
-                duration: grace,
-            };
-        }
         if let Cleanup::Grace { started, duration } = self.cleanup {
             loop {
                 let remaining = duration.saturating_sub(started.elapsed()?);
@@ -358,6 +371,33 @@ fn is_exit_event(code: libc::c_int) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clock_failure_does_not_restart_a_term_window() -> Result<(), PlatformError> {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("2");
+        let mut handle = ProcessHandle::spawn_isolated_group(&mut cmd)?;
+        let grace = Duration::from_millis(10);
+        assert!(
+            handle
+                .begin_grace(grace, || Err(PlatformError::ClockOverflow))
+                .is_err()
+        );
+        assert!(matches!(handle.cleanup, Cleanup::Waiting));
+
+        let before = MonotonicClock::now()?;
+        let mut sample = Some(before);
+        assert!(matches!(
+            handle.begin_grace(grace, || sample.take().ok_or(PlatformError::ClockOverflow)),
+            Err(PlatformError::ClockOverflow)
+        ));
+        assert!(
+            matches!(handle.cleanup, Cleanup::Grace { started, duration }
+            if started == before && duration == grace)
+        );
+        handle.wait_and_cleanup().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn termination_collects_an_exited_solitary_leader() -> Result<(), PlatformError> {
