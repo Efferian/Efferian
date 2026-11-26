@@ -1,4 +1,4 @@
-use std::ffi::{CString, OsStr};
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
@@ -264,9 +264,42 @@ fn set_mode(path: &Path, file: &File, mode: u32) -> Result<(), PlatformError> {
         .map_err(|error| PlatformError::io("set_permissions", path, error))
 }
 
-// The caller owns this directory entry exclusively during creation or cleanup.
-// AT_SYMLINK_NOFOLLOW also protects a final symlink on the chmod path.
 fn restore_owned_directory_mode(path: &Path) -> Result<(), PlatformError> {
+    match open_directory(path) {
+        Ok(directory) => {
+            check_owner(path, &fd_metadata(path, &directory)?, current_euid())?;
+            set_mode(path, &directory, PRIVATE_DIR_MODE)
+        }
+        Err(PlatformError::Io { source, .. })
+            if source.kind() == io::ErrorKind::PermissionDenied =>
+        {
+            restore_unreadable_directory(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_unreadable_directory(path: &Path) -> Result<(), PlatformError> {
+    use std::os::fd::AsRawFd;
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| PlatformError::io("pin_unreadable_directory", path, error))?;
+    check_owner(path, &fd_metadata(path, &directory)?, current_euid())?;
+    // O_PATH pins the inode but does not support fchmod. The procfs descriptor
+    // entry addresses that same directory while this File is alive.
+    let fd_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
+    fs::set_permissions(fd_path, Permissions::from_mode(PRIVATE_DIR_MODE))
+        .map_err(|error| PlatformError::io("restore_directory_mode", path, error))
+}
+
+#[cfg(target_os = "macos")]
+fn restore_unreadable_directory(path: &Path) -> Result<(), PlatformError> {
+    use std::ffi::CString;
+    // Creation and startup cleanup have exclusive ownership of this entry.
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| PlatformError::io("inspect_directory_mode", path, error))?;
     check_type(path, &metadata, true)?;

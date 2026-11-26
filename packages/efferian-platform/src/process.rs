@@ -267,7 +267,7 @@ impl ProcessHandle {
         Ok(())
     }
 
-    fn signal_group(&self, signal: libc::c_int) -> Result<(), PlatformError> {
+    fn signal_group(&mut self, signal: libc::c_int) -> Result<(), PlatformError> {
         // SAFETY: pid > 1, so -pid addresses only the original process group.
         // The preceding WNOWAIT probe confirmed our unreaped child pins the
         // group ID. Callers pass only SIGTERM or SIGKILL.
@@ -276,6 +276,12 @@ impl ProcessHandle {
         }
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        // XNU excludes zombies from group-signal recipients. A group whose
+        // only remaining member is its unreaped leader can report EPERM.
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EPERM) && self.leader_exited()? {
             return Ok(());
         }
         Err(PlatformError::process_io("signal_process_group", error))
@@ -328,10 +334,13 @@ fn check_child_signal_environment() -> io::Result<()> {
         if libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) != 0 {
             return Err(io::Error::last_os_error());
         }
-        let action = action.assume_init();
+        // Some libcs only initialize the kernel-sized part of sa_mask. Read
+        // the two reported fields without constructing the whole sigaction.
+        let flags = (*action.as_ptr()).sa_flags;
+        let handler = (*action.as_ptr()).sa_sigaction;
         if libc::sigismember(mask.as_ptr(), libc::SIGCHLD) != 0
-            || action.sa_flags & libc::SA_NOCLDWAIT != 0
-            || matches!(action.sa_sigaction, libc::SIG_IGN | libc::SIG_DFL)
+            || flags & libc::SA_NOCLDWAIT != 0
+            || matches!(handler, libc::SIG_IGN | libc::SIG_DFL)
         {
             return Err(io::Error::other(
                 "SIGCHLD must be deliverable and child status retained",
@@ -349,6 +358,20 @@ fn is_exit_event(code: libc::c_int) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn termination_collects_an_exited_solitary_leader() -> Result<(), PlatformError> {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 23"]);
+        let mut handle = ProcessHandle::spawn_isolated_group(&mut command)?;
+        handle.observe_exit().await?;
+        assert_eq!(
+            handle.terminate_group(Duration::from_millis(1)).await?,
+            TerminateOutcome::LeaderExitedBeforeKill
+        );
+        assert_eq!(handle.wait_and_cleanup().await?.code(), Some(23));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn failed_registration_cleans_up_the_spawned_group()
