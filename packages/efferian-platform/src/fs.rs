@@ -191,54 +191,56 @@ fn canonicalize(path: &Path) -> Result<PathBuf, PlatformError> {
 
 struct CanonicalPaths {
     primary: PathBuf,
-    data_alias: Option<PathBuf>,
+    volume_alias: Option<PathBuf>,
 }
 
 impl CanonicalPaths {
     fn new(primary: PathBuf, metadata: &Metadata) -> Result<Self, PlatformError> {
         #[cfg(target_os = "macos")]
-        let data_alias = data_volume_alias(&primary, metadata, Path::new("/System/Volumes/Data"))?;
+        let volume_alias =
+            startup_volume_alias(&primary, metadata, Path::new("/System/Volumes/Data"))?;
         #[cfg(target_os = "linux")]
-        let data_alias = {
+        let volume_alias = {
             let _ = metadata;
             None
         };
         Ok(Self {
             primary,
-            data_alias,
+            volume_alias,
         })
     }
 
     fn iter(&self) -> impl Iterator<Item = &Path> {
-        std::iter::once(self.primary.as_path()).chain(self.data_alias.as_deref())
+        std::iter::once(self.primary.as_path()).chain(self.volume_alias.as_deref())
     }
 
     fn append_missing(&mut self, suffix: &[&OsStr]) {
-        for path in std::iter::once(&mut self.primary).chain(self.data_alias.as_mut()) {
+        for path in std::iter::once(&mut self.primary).chain(self.volume_alias.as_mut()) {
             path.extend(suffix.iter().rev());
         }
     }
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn data_volume_alias(
+fn startup_volume_alias(
     path: &Path,
     metadata: &Metadata,
     data_volume: &Path,
 ) -> Result<Option<PathBuf>, PlatformError> {
-    if path.starts_with(data_volume) {
-        return Ok(None);
-    }
-    let relative = path
-        .strip_prefix("/")
-        .map_err(|_| invalid_path(path, "expected a canonical path"))?;
-    let candidate = data_volume.join(relative);
     // macOS realpath can retain either spelling of an APFS firmlink. The
-    // Data-volume spelling counts only when it names the very same inode.
+    // other spelling counts only when it names the very same inode.
+    let (candidate, candidate_on_data) = if let Ok(relative) = path.strip_prefix(data_volume) {
+        (Path::new("/").join(relative), false)
+    } else {
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|_| invalid_path(path, "expected a canonical path"))?;
+        (data_volume.join(relative), true)
+    };
     match fs::metadata(&candidate) {
         Ok(alias) if same_inode(metadata, &alias) => {
             let canonical = canonicalize(&candidate)?;
-            Ok(canonical.starts_with(data_volume).then_some(canonical))
+            Ok((canonical.starts_with(data_volume) == candidate_on_data).then_some(canonical))
         }
         Ok(_) => Ok(None),
         Err(error)
@@ -250,7 +252,7 @@ fn data_volume_alias(
             Ok(None)
         }
         Err(error) => Err(PlatformError::io(
-            "inspect_data_volume_alias",
+            "inspect_startup_volume_alias",
             &candidate,
             error,
         )),
@@ -698,7 +700,7 @@ mod tests {
     use crate::test_support::TestDir;
 
     #[test]
-    fn data_volume_form_requires_the_same_inode_and_keeps_the_future_suffix()
+    fn startup_volume_forms_require_the_same_inode_and_keep_the_future_suffix()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = TestDir::new()?;
         let original = dir.path().join("original");
@@ -708,27 +710,35 @@ mod tests {
         let alias = data.join(original.strip_prefix("/")?);
         let parent = alias.parent().ok_or("missing alias parent")?;
 
-        assert_eq!(data_volume_alias(&original, &metadata, &data)?, None);
+        assert_eq!(startup_volume_alias(&original, &metadata, &data)?, None);
         fs::create_dir_all(parent)?;
         fs::write(&alias, b"other inode")?;
-        assert_eq!(data_volume_alias(&original, &metadata, &data)?, None);
+        assert_eq!(startup_volume_alias(&original, &metadata, &data)?, None);
+        assert_eq!(
+            startup_volume_alias(&alias, &fs::metadata(&alias)?, &data)?,
+            None
+        );
         fs::remove_file(&alias)?;
         std::os::unix::fs::symlink(&original, &alias)?;
-        assert_eq!(data_volume_alias(&original, &metadata, &data)?, None);
+        assert_eq!(startup_volume_alias(&original, &metadata, &data)?, None);
         fs::remove_file(&alias)?;
         fs::hard_link(&original, &alias)?;
 
-        let mut paths = CanonicalPaths {
-            data_alias: data_volume_alias(&original, &metadata, &data)?,
-            primary: original,
-        };
-        assert_eq!(paths.data_alias.as_deref(), Some(alias.as_path()));
-        paths.append_missing(&[OsStr::new("leaf"), OsStr::new("future")]);
-        assert!(
-            paths
-                .iter()
-                .eq([paths.primary.as_path(), alias.join("future/leaf").as_path()])
+        let physical_metadata = fs::metadata(&alias)?;
+        assert_eq!(
+            startup_volume_alias(&alias, &physical_metadata, &data)?.as_deref(),
+            Some(original.as_path())
         );
+        let mut paths = CanonicalPaths {
+            volume_alias: startup_volume_alias(&original, &metadata, &data)?,
+            primary: original.clone(),
+        };
+        assert_eq!(paths.volume_alias.as_deref(), Some(alias.as_path()));
+        paths.append_missing(&[OsStr::new("leaf"), OsStr::new("future")]);
+        assert!(paths.iter().eq([
+            original.join("future/leaf").as_path(),
+            alias.join("future/leaf").as_path()
+        ]));
         assert!(paths.iter().any(|path| path.starts_with(&data)));
         Ok(())
     }

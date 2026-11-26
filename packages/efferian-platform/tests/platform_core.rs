@@ -449,8 +449,10 @@ fn macos_firmlink_spellings_share_the_root_policy() -> TestResult {
         return Ok(());
     }
     let physical = data.join(logical.strip_prefix("/")?);
-    let logical_inode = fs::metadata(logical)?.ino();
-    if !fs::metadata(&physical).is_ok_and(|metadata| metadata.ino() == logical_inode) {
+    let logical_metadata = fs::metadata(logical)?;
+    if !fs::metadata(&physical).is_ok_and(|metadata| {
+        metadata.ino() == logical_metadata.ino() && metadata.dev() == logical_metadata.dev()
+    }) {
         // A test directory on a separate volume has no startup Data alias.
         return Ok(());
     }
@@ -482,6 +484,38 @@ fn macos_firmlink_spellings_share_the_root_policy() -> TestResult {
                 &[forbidden],
                 true
             ),
+            Err(PlatformError::ForbiddenRoot { .. })
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_system_parent_sees_a_physically_spelled_firmlink() -> TestResult {
+    let system = Path::new("/usr");
+    let logical = system.join("local");
+    let physical = PathBuf::from("/System/Volumes/Data/usr/local");
+    let Ok(logical_metadata) = fs::metadata(&logical) else {
+        return Ok(());
+    };
+    if !fs::metadata(&physical).is_ok_and(|metadata| {
+        metadata.ino() == logical_metadata.ino() && metadata.dev() == logical_metadata.dev()
+    }) {
+        return Ok(());
+    }
+
+    let allowed = [system.to_path_buf()];
+    assert_eq!(
+        PrivateFs::validate_path_within_roots(&physical, &allowed, &[], true)?,
+        fs::canonicalize(&physical)?
+    );
+    for forbidden in [
+        physical.clone(),
+        physical.join("efferian-test-future/state"),
+    ] {
+        assert!(matches!(
+            PrivateFs::validate_path_within_roots(system, &allowed, &[forbidden], true),
             Err(PlatformError::ForbiddenRoot { .. })
         ));
     }
