@@ -189,6 +189,74 @@ fn canonicalize(path: &Path) -> Result<PathBuf, PlatformError> {
     fs::canonicalize(path).map_err(|error| PlatformError::io("canonicalize", path, error))
 }
 
+struct CanonicalPaths {
+    primary: PathBuf,
+    data_alias: Option<PathBuf>,
+}
+
+impl CanonicalPaths {
+    fn new(primary: PathBuf, metadata: &Metadata) -> Result<Self, PlatformError> {
+        #[cfg(target_os = "macos")]
+        let data_alias = data_volume_alias(&primary, metadata, Path::new("/System/Volumes/Data"))?;
+        #[cfg(target_os = "linux")]
+        let data_alias = {
+            let _ = metadata;
+            None
+        };
+        Ok(Self {
+            primary,
+            data_alias,
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.primary.as_path()).chain(self.data_alias.as_deref())
+    }
+
+    fn append_missing(&mut self, suffix: &[&OsStr]) {
+        for path in std::iter::once(&mut self.primary).chain(self.data_alias.as_mut()) {
+            path.extend(suffix.iter().rev());
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn data_volume_alias(
+    path: &Path,
+    metadata: &Metadata,
+    data_volume: &Path,
+) -> Result<Option<PathBuf>, PlatformError> {
+    if path.starts_with(data_volume) {
+        return Ok(None);
+    }
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| invalid_path(path, "expected a canonical path"))?;
+    let candidate = data_volume.join(relative);
+    // macOS realpath can retain either spelling of an APFS firmlink. The
+    // Data-volume spelling counts only when it names the very same inode.
+    match fs::metadata(&candidate) {
+        Ok(alias) if same_inode(metadata, &alias) => {
+            let canonical = canonicalize(&candidate)?;
+            Ok(canonical.starts_with(data_volume).then_some(canonical))
+        }
+        Ok(_) => Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(PlatformError::io(
+            "inspect_data_volume_alias",
+            &candidate,
+            error,
+        )),
+    }
+}
+
 fn set_mode(path: &Path, file: &File, mode: u32) -> Result<(), PlatformError> {
     file.set_permissions(Permissions::from_mode(mode))
         .map_err(|error| PlatformError::io("set_permissions", path, error))
@@ -424,6 +492,8 @@ impl PrivateFs {
     ///
     /// The returned path is checked at the time of the call. Trusted ownership
     /// and ACLs must keep the path entries and sensitive files stable during use.
+    /// macOS root comparisons include verified aliases on the startup Data
+    /// volume.
     pub fn validate_path_within_roots(
         path: &Path,
         canonical_roots: &[PathBuf],
@@ -434,7 +504,7 @@ impl PrivateFs {
         let original = fs::symlink_metadata(path)
             .map_err(|error| PlatformError::io("inspect_target", path, error))?;
         check_type(path, &original, expect_dir)?;
-        let target = canonicalize(path)?;
+        let target = CanonicalPaths::new(canonicalize(path)?, &original)?;
 
         let mut allowed = false;
         for root in canonical_roots {
@@ -442,24 +512,32 @@ impl PrivateFs {
             let metadata = fs::symlink_metadata(&canonical)
                 .map_err(|error| PlatformError::io("inspect_allowed_root", &canonical, error))?;
             check_type(&canonical, &metadata, true)?;
-            allowed |= target.starts_with(&canonical);
+            let root = CanonicalPaths::new(canonical, &metadata)?;
+            allowed |= target
+                .iter()
+                .any(|path| root.iter().any(|root| path.starts_with(root)));
         }
         if !allowed {
-            return Err(PlatformError::OutsideAllowedRoots { path: target });
+            return Err(PlatformError::OutsideAllowedRoots {
+                path: target.primary,
+            });
         }
 
         for forbidden in forbidden_roots {
             let raw = checked_absolute_path(forbidden, true)?;
-            let canonical = resolve_forbidden_root(raw)?;
-            if [path, target.as_path()].into_iter().any(|candidate| {
-                [raw, canonical.as_path()].into_iter().any(|root| {
+            let forbidden = resolve_forbidden_root(raw)?;
+            if std::iter::once(path).chain(target.iter()).any(|candidate| {
+                std::iter::once(raw).chain(forbidden.iter()).any(|root| {
                     candidate.starts_with(root) || (expect_dir && root.starts_with(candidate))
                 })
             }) {
-                return Err(PlatformError::ForbiddenRoot { path: target });
+                return Err(PlatformError::ForbiddenRoot {
+                    path: target.primary,
+                });
             }
         }
 
+        let target = target.primary;
         if expect_dir {
             let directory = open_directory(&target)?;
             check_inode(path, &original, &fd_metadata(&target, &directory)?)?;
@@ -488,16 +566,17 @@ impl PrivateFs {
     }
 }
 
-fn resolve_forbidden_root(path: &Path) -> Result<PathBuf, PlatformError> {
+fn resolve_forbidden_root(path: &Path) -> Result<CanonicalPaths, PlatformError> {
     let mut missing = Vec::new();
     for ancestor in path.ancestors() {
         if entry_metadata(ancestor)?.is_some() {
-            let mut canonical = canonicalize(ancestor)?;
+            let canonical = canonicalize(ancestor)?;
             let metadata = fs::symlink_metadata(&canonical)
                 .map_err(|error| PlatformError::io("inspect_forbidden_root", &canonical, error))?;
             check_type(&canonical, &metadata, true)?;
-            canonical.extend(missing.into_iter().rev());
-            return Ok(canonical);
+            let mut paths = CanonicalPaths::new(canonical, &metadata)?;
+            paths.append_missing(&missing);
+            return Ok(paths);
         }
         let name = ancestor
             .file_name()
@@ -617,6 +696,42 @@ fn wipe_contents(dir: &Path) -> Result<(), PlatformError> {
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
+
+    #[test]
+    fn data_volume_form_requires_the_same_inode_and_keeps_the_future_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TestDir::new()?;
+        let original = dir.path().join("original");
+        fs::write(&original, b"original")?;
+        let metadata = fs::metadata(&original)?;
+        let data = dir.path().join("Data");
+        let alias = data.join(original.strip_prefix("/")?);
+        let parent = alias.parent().ok_or("missing alias parent")?;
+
+        assert_eq!(data_volume_alias(&original, &metadata, &data)?, None);
+        fs::create_dir_all(parent)?;
+        fs::write(&alias, b"other inode")?;
+        assert_eq!(data_volume_alias(&original, &metadata, &data)?, None);
+        fs::remove_file(&alias)?;
+        std::os::unix::fs::symlink(&original, &alias)?;
+        assert_eq!(data_volume_alias(&original, &metadata, &data)?, None);
+        fs::remove_file(&alias)?;
+        fs::hard_link(&original, &alias)?;
+
+        let mut paths = CanonicalPaths {
+            data_alias: data_volume_alias(&original, &metadata, &data)?,
+            primary: original,
+        };
+        assert_eq!(paths.data_alias.as_deref(), Some(alias.as_path()));
+        paths.append_missing(&[OsStr::new("leaf"), OsStr::new("future")]);
+        assert!(
+            paths
+                .iter()
+                .eq([paths.primary.as_path(), alias.join("future/leaf").as_path()])
+        );
+        assert!(paths.iter().any(|path| path.starts_with(&data)));
+        Ok(())
+    }
 
     #[test]
     fn owner_check_has_explicit_expected_and_actual_uids() -> Result<(), Box<dyn std::error::Error>>

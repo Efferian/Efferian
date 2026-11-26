@@ -439,6 +439,55 @@ fn validates_regular_files_and_their_parent_permissions() -> TestResult {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_firmlink_spellings_share_the_root_policy() -> TestResult {
+    let dir = TestDir::new()?;
+    let logical = dir.path();
+    let data = Path::new("/System/Volumes/Data");
+    if logical.starts_with(data) {
+        return Ok(());
+    }
+    let physical = data.join(logical.strip_prefix("/")?);
+    let logical_inode = fs::metadata(logical)?.ino();
+    if !fs::metadata(&physical).is_ok_and(|metadata| metadata.ino() == logical_inode) {
+        // A test directory on a separate volume has no startup Data alias.
+        return Ok(());
+    }
+
+    let target = PrivateFs::ensure_private_dir(&logical.join("work"))?;
+    let physical_target = physical.join("work");
+    assert_eq!(
+        PrivateFs::validate_path_within_roots(&target, std::slice::from_ref(&physical), &[], true)?,
+        target
+    );
+    assert_eq!(
+        PrivateFs::validate_path_within_roots(
+            &physical_target,
+            &[logical.to_path_buf()],
+            &[],
+            true
+        )?,
+        physical_target
+    );
+    for forbidden in [
+        data.to_path_buf(),
+        physical_target.clone(),
+        physical_target.join("future/state"),
+    ] {
+        assert!(matches!(
+            PrivateFs::validate_path_within_roots(
+                &target,
+                &[logical.to_path_buf()],
+                &[forbidden],
+                true
+            ),
+            Err(PlatformError::ForbiddenRoot { .. })
+        ));
+    }
+    Ok(())
+}
+
 #[test]
 fn monotonic_clock_arithmetic_and_safe_path() -> TestResult {
     let start = MonotonicClock::now()?;

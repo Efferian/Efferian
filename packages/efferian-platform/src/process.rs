@@ -36,6 +36,8 @@ enum Cleanup {
 /// Keep the handle until cleanup succeeds, and service any extracted pipes
 /// separately. Other code must leave collection of the leader to this handle.
 /// Cleanup covers signalable members of the original group while Node is alive.
+///
+/// Use a Tokio runtime with its I/O and time drivers enabled.
 #[derive(Debug)]
 pub struct ProcessHandle {
     child: Child,
@@ -44,6 +46,11 @@ pub struct ProcessHandle {
 }
 
 impl ProcessHandle {
+    /// Spawn the command as the leader of a new POSIX process group.
+    ///
+    /// # Panics
+    ///
+    /// May panic outside a Tokio runtime with an enabled I/O driver.
     pub fn spawn_isolated_group(cmd: &mut Command) -> Result<Self, PlatformError> {
         let mut child = cmd
             .process_group(0)
@@ -77,6 +84,11 @@ impl ProcessHandle {
     /// Wait for the leader, clean up its original group, and return its status.
     ///
     /// Dropping the pending future leaves the handle available for later cleanup.
+    ///
+    /// # Panics
+    ///
+    /// May panic outside a Tokio runtime with I/O enabled. Resuming an
+    /// interrupted grace period also requires the time driver.
     pub async fn wait_and_cleanup(&mut self) -> Result<ExitStatus, PlatformError> {
         self.child.stdin.take();
         if matches!(self.cleanup, Cleanup::Waiting) {
@@ -103,6 +115,11 @@ impl ProcessHandle {
     /// A zero grace period escalates immediately. The deadline bounds the time
     /// until escalation. Collecting the leader may take longer. An interrupted
     /// call resumes its recorded phase and deadline on the next cleanup call.
+    ///
+    /// # Panics
+    ///
+    /// May panic without an enabled Tokio time driver when waiting out a
+    /// grace period. The TERM signal can already have been sent.
     pub async fn terminate_group(
         &mut self,
         grace: Duration,
@@ -199,19 +216,22 @@ impl ProcessHandle {
             let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
             // SAFETY: info is aligned writable storage. A zeroed siginfo_t
             // allows a zero PID even on systems that leave it untouched when
-            // no exit is ready. A successful waitid supplies SIGCHLD data
-            // when the child has exited. WNOWAIT leaves the child unreaped.
-            let exited = unsafe {
+            // no event is ready. A successful waitid supplies SIGCHLD data
+            // for a ready event. WNOWAIT leaves the child unreaped.
+            let event = unsafe {
                 let result = libc::waitid(
                     libc::P_PID,
                     self.pid as libc::id_t,
                     info.as_mut_ptr(),
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 );
-                (result == 0).then(|| info.assume_init().si_pid() != 0)
+                (result == 0).then(|| {
+                    let info = info.assume_init();
+                    (info.si_pid(), info.si_code)
+                })
             };
-            if let Some(exited) = exited {
-                return Ok(exited);
+            if let Some((pid, code)) = event {
+                return Ok(pid == self.pid && is_exit_event(code));
             }
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -225,9 +245,24 @@ impl ProcessHandle {
     }
 }
 
+fn is_exit_event(code: libc::c_int) -> bool {
+    // Linux can report a ptrace stop even when waitid requests only WEXITED.
+    matches!(code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_exit_events_indicate_leader_completion() {
+        for code in [libc::CLD_EXITED, libc::CLD_KILLED, libc::CLD_DUMPED] {
+            assert!(is_exit_event(code));
+        }
+        for code in [0, libc::CLD_TRAPPED, libc::CLD_STOPPED, libc::CLD_CONTINUED] {
+            assert!(!is_exit_event(code));
+        }
+    }
 
     #[tokio::test]
     async fn losing_wait_ownership_disables_group_signaling() -> Result<(), PlatformError> {
