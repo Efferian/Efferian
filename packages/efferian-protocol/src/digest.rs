@@ -58,11 +58,15 @@ fn encode_hex_lower(bytes: &[u8; 32]) -> String {
 pub struct RequestDigestInput<'a> {
     pub invoke_kind: InvokeKind,
     pub profile_id: Option<ProfileId>,
+    /// Tool from the recorded binding on replay, even if the alias now points elsewhere.
     pub tool_id: ToolId,
     pub public_name: &'a str,
+    /// The client's normalized target selector before resolution to an available node.
     pub requested_target: Option<&'a str>,
+    /// Fixed node in the original profile binding, independent of the node chosen to run the call.
     pub fixed_node_id: Option<NodeId>,
     pub arguments: &'a Map<String, Value>,
+    /// Explicit tool-test version pin. An unpinned retry stays unpinned after publication.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_tool_version: Option<NonZeroU64>,
 }

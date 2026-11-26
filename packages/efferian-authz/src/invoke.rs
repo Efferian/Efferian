@@ -4,7 +4,7 @@ use efferian_protocol::{
 };
 
 use crate::{
-    AuthContext, AuthzError, BindingView, NodeAuthTarget,
+    AuthContext, AuthzError, InvokeBindingView, NodeAuthTarget,
     account::resolve_caller_bound_account,
     policy::{ActiveContext, CheckedContext, Phase, guard, verify_context},
 };
@@ -69,7 +69,7 @@ pub fn authorize_profile_invoke(
     ctx: &AuthContext,
     published_profile: Option<ProfileId>,
     target: Option<ExecutionTarget<'_>>,
-    bindings: &[BindingView],
+    bindings: &[InvokeBindingView],
 ) -> Result<Option<AccountId>, AuthzError> {
     let (active, target) = profile_invoke_gate(ctx, published_profile, target)?;
     resolve_target_account(active, target, bindings)
@@ -121,7 +121,7 @@ pub fn check_archived_invoke_metadata(
 pub fn authorize_tool_test(
     ctx: &AuthContext,
     target: ExecutionTarget<'_>,
-    bindings: &[BindingView],
+    bindings: &[InvokeBindingView],
 ) -> Result<Option<AccountId>, AuthzError> {
     let active = guard(ctx)?;
     active.require_admin()?;
@@ -225,7 +225,7 @@ fn disabled_owner_invoke_error(
 fn resolve_target_account(
     active: ActiveContext<'_>,
     target: ExecutionTarget<'_>,
-    bindings: &[BindingView],
+    bindings: &[InvokeBindingView],
 ) -> Result<Option<AccountId>, AuthzError> {
     if let ExecutionTarget::Upstream {
         upstream_id,

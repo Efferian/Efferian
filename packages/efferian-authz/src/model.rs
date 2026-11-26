@@ -129,6 +129,14 @@ pub struct AccountView {
     pub upstream_id: Option<UpstreamId>,
 }
 
+/// An exact binding and its current account from the same authorization snapshot.
+/// Keep the binding row even when its account is missing or no longer applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvokeBindingView {
+    pub binding: BindingView,
+    pub account: Option<AccountView>,
+}
+
 /// Existing upstream and the published profiles with a live caller-bound tool
 /// from that upstream.
 #[derive(Clone, Copy, Debug)]

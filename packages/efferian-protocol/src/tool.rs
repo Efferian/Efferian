@@ -228,20 +228,20 @@ pub struct ManagedAccount<'a> {
     pub payload: &'a AccountSecretPayload,
 }
 
+fn validate_definition_size(definition: &impl serde::Serialize) -> Result<(), ValidationError> {
+    bounded_json_len(MAX_TOOL_DEFINITION_BYTES, |writer| {
+        serde_json::to_writer(writer, definition)
+    })
+    .map_err(|error| match error {
+        BoundedJsonError::TooLarge => ValidationError::DefinitionLimit,
+        BoundedJsonError::Serialization => ValidationError::InvalidJson,
+    })?;
+    Ok(())
+}
+
 impl ToolDefinition {
     pub const fn kind(&self) -> ToolKind {
         self.spec.kind()
-    }
-
-    fn validate_size(&self) -> Result<(), ValidationError> {
-        bounded_json_len(MAX_TOOL_DEFINITION_BYTES, |writer| {
-            serde_json::to_writer(writer, self)
-        })
-        .map_err(|error| match error {
-            BoundedJsonError::TooLarge => ValidationError::DefinitionLimit,
-            BoundedJsonError::Serialization => ValidationError::InvalidJson,
-        })?;
-        Ok(())
     }
 
     /// Validate an authored definition. Upstream schema snapshots are created by freeze_revision.
@@ -251,7 +251,7 @@ impl ToolDefinition {
         upstream_hard_timeout_ms: u64,
         policy: &EgressPolicy,
     ) -> Result<(), ValidationError> {
-        self.validate_size()?;
+        validate_definition_size(self)?;
 
         if let ToolSpec::UpstreamRef {
             upstream_tool_name,
@@ -397,14 +397,41 @@ impl ToolDefinition {
                     tool.upstream_id == *upstream_id && tool.tool_name == *upstream_tool_name
                 })
                 .ok_or(ValidationError::MissingUpstreamTool)?;
-            definition.input_schema = Some(discovered.input_schema.clone());
-            if definition.description.is_none() {
-                definition.description.clone_from(&discovered.description);
+            if !discovered.input_schema.is_object() {
+                return Err(ValidationError::InvalidField("discovered input schema"));
             }
-            if definition.annotations.is_none() {
-                definition.annotations.clone_from(&discovered.annotations);
+            // Measure the authored object plus precisely the fields discovery supplies
+            // before allocating owned copies of any upstream-controlled material.
+            #[derive(serde::Serialize)]
+            struct Snapshot<'a> {
+                #[serde(flatten)]
+                authored: &'a ToolDefinition,
+                input_schema: &'a Value,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                description: Option<&'a str>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                annotations: Option<&'a ToolAnnotations>,
             }
-            definition.validate_size()?;
+            let snapshot = Snapshot {
+                authored: self,
+                input_schema: &discovered.input_schema,
+                description: discovered
+                    .description
+                    .as_deref()
+                    .filter(|_| self.description.is_none()),
+                annotations: discovered
+                    .annotations
+                    .as_ref()
+                    .filter(|_| self.annotations.is_none()),
+            };
+            validate_definition_size(&snapshot)?;
+            definition.input_schema = Some(snapshot.input_schema.clone());
+            if let Some(description) = snapshot.description {
+                definition.description = Some(description.to_owned());
+            }
+            if let Some(annotations) = snapshot.annotations {
+                definition.annotations = Some(annotations.clone());
+            }
         }
         let schema = definition
             .input_schema

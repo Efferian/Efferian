@@ -117,11 +117,7 @@ fn managed_agent_discovery_and_invoke_use_the_nodes_current_manager() {
     verify(&agent, managed(&foreign), Err(AuthzError::ScopeNarrowedOut));
     let upstream_id = UpstreamId::new();
     let upstream = upstream(upstream_id, UpstreamAccountMode::CallerBound);
-    let binding = BindingView {
-        principal_id: agent.caller.principal_id,
-        upstream_id,
-        account_id: AccountId::new(),
-    };
+    let binding = invoke_binding(&agent.caller, upstream_id);
     denied(
         authorize_profile_invoke(&agent, Some(profile), Some(upstream), &[binding]),
         AuthzError::ScopeNarrowedOut,
@@ -138,7 +134,7 @@ fn managed_agent_discovery_and_invoke_use_the_nodes_current_manager() {
     );
     assert_eq!(
         authorize_profile_invoke(&agent, Some(profile), Some(upstream), &[binding]),
-        Ok(Some(binding.account_id))
+        Ok(Some(binding.binding.account_id))
     );
     denied(
         authorize_profile_invoke(&agent, Some(profile), Some(upstream), &[]),

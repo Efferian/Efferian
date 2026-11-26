@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, fmt};
+use std::{borrow::Cow, collections::BTreeMap, fmt};
 
 use serde::{
     Deserialize, Deserializer,
-    de::{MapAccess, Visitor, value::MapAccessDeserializer},
+    de::{DeserializeSeed, IntoDeserializer, MapAccess, Visitor, value::MapAccessDeserializer},
 };
 
 /// Serde's default struct decoder also accepts positional sequences.
@@ -11,22 +11,115 @@ where
     T: Deserialize<'de>,
     D: Deserializer<'de>,
 {
-    struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+    deserializer.deserialize_map(ObjectVisitor {
+        tag: None,
+        target: std::marker::PhantomData,
+    })
+}
 
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
-        type Value = T;
+pub(crate) fn deserialize_tagged_object<'de, T, D>(
+    deserializer: D,
+    tag: &'static str,
+) -> Result<T, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_map(ObjectVisitor {
+        tag: Some(tag),
+        target: std::marker::PhantomData,
+    })
+}
 
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("an object")
-        }
+struct ObjectVisitor<T> {
+    tag: Option<&'static str>,
+    target: std::marker::PhantomData<T>,
+}
 
-        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
-            T::deserialize(MapAccessDeserializer::new(map))
-        }
+impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an object")
     }
 
-    deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+        match self.tag {
+            Some(tag) => T::deserialize(MapAccessDeserializer::new(TaggedMap {
+                map,
+                tag,
+                reading_tag: false,
+            })),
+            None => T::deserialize(MapAccessDeserializer::new(map)),
+        }
+    }
 }
+
+#[derive(Deserialize)]
+pub(crate) struct WireString<'a>(#[serde(borrow)] pub(crate) Cow<'a, str>);
+
+// Internally tagged enums may be nested inside Serde's buffered content, where
+// numeric identifiers can mean variant indexes. Enforce text at the tag field
+// before handing it to the derive, preserving duplicate fields and key order.
+struct TaggedMap<A> {
+    map: A,
+    tag: &'static str,
+    reading_tag: bool,
+}
+
+impl<'de, A: MapAccess<'de>> MapAccess<'de> for TaggedMap<A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        let Some(WireString(key)) = self.map.next_key()? else {
+            return Ok(None);
+        };
+        self.reading_tag = key == self.tag;
+        seed.deserialize(key.into_deserializer()).map(Some)
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, Self::Error> {
+        if self.reading_tag {
+            let WireString(tag) = self.map.next_value()?;
+            seed.deserialize(tag.into_deserializer())
+        } else {
+            self.map.next_value_seed(seed)
+        }
+    }
+}
+
+/// Unit variants have a single JSON representation: their declared string.
+macro_rules! string_enum {
+    (
+        $(#[$attr:meta])* $vis:vis enum $name:ident {
+            $($(#[$variant_attr:meta])* $variant:ident => $wire:tt),+ $(,)?
+        }
+    ) => {
+        $(#[$attr])*
+        #[derive(serde::Serialize)]
+        $vis enum $name {
+            $($(#[$variant_attr])* #[serde(rename = $wire)] $variant),+
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let $crate::wire::WireString(tag) = serde::Deserialize::deserialize(d)?;
+                match tag.as_ref() {
+                    $($wire => Ok(Self::$variant),)+
+                    _ => Err(serde::de::Error::unknown_variant(&tag, &[$($wire),+])),
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use string_enum;
 
 pub(crate) fn deserialize_unique_map<'de, V, D>(
     deserializer: D,
@@ -130,7 +223,7 @@ macro_rules! strict_enum {
                 $($variant { $($(#[$field_attr])* $field: $type),* }),+
             }
 
-            $crate::wire::strict_enum!(@decode $decode $name { $($variant { $($field),* }),+ });
+            $crate::wire::strict_enum!(@decode $decode $tag $name { $($variant { $($field),* }),+ });
 
             #[cfg(feature = "openapi")]
             impl utoipa::PartialSchema for $name {
@@ -148,12 +241,12 @@ macro_rules! strict_enum {
         };
     };
 
-    (@decode custom $name:ident { $($fields:tt)* }) => {};
+    (@decode custom $tag:tt $name:ident { $($fields:tt)* }) => {};
 
-    (@decode object $name:ident { $($variant:ident { $($field:ident),* }),+ }) => {
+    (@decode object $tag:tt $name:ident { $($variant:ident { $($field:ident),* }),+ }) => {
         impl<'de> serde::Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let wire: Wire = $crate::wire::deserialize_object(deserializer)?;
+                let wire: Wire = $crate::wire::deserialize_tagged_object(deserializer, $tag)?;
                 Ok(match wire {
                     $(Wire::$variant { $($field),* } => Self::$variant { $($field),* }),+
                 })

@@ -18,9 +18,9 @@ fn caller_bound_uses_both_keys_and_never_falls_back_to_other_accounts() {
     let b = context(principal(PrincipalKind::Member), vec![grant]);
     let upstream_id = UpstreamId::new();
     let target = upstream(upstream_id, UpstreamAccountMode::CallerBound);
-    let same = binding(&a.caller, upstream_id);
-    let different_caller = binding(&b.caller, upstream_id);
-    let different_upstream = binding(&a.caller, UpstreamId::new());
+    let same = invoke_binding(&a.caller, upstream_id);
+    let different_caller = invoke_binding(&b.caller, upstream_id);
+    let different_upstream = invoke_binding(&a.caller, UpstreamId::new());
     let all = [different_caller, different_upstream, same];
     assert_eq!(
         check_profile_invoke_metadata(&a, Some(profile), Some(target)),
@@ -28,11 +28,11 @@ fn caller_bound_uses_both_keys_and_never_falls_back_to_other_accounts() {
     );
     assert_eq!(
         authorize_profile_invoke(&a, Some(profile), Some(target), &all),
-        Ok(Some(same.account_id))
+        Ok(Some(same.binding.account_id))
     );
     assert_eq!(
         authorize_profile_invoke(&b, Some(profile), Some(target), &all),
-        Ok(Some(different_caller.account_id))
+        Ok(Some(different_caller.binding.account_id))
     );
 
     let missing = AuthzError::AccountNotBound {
@@ -57,10 +57,10 @@ fn caller_bound_uses_both_keys_and_never_falls_back_to_other_accounts() {
         403,
         "account_not_bound",
     );
-    let bound_to_admin = binding(&admin.caller, upstream_id);
+    let bound_to_admin = invoke_binding(&admin.caller, upstream_id);
     assert_eq!(
         authorize_tool_test(&admin, target, &[same, bound_to_admin]),
-        Ok(Some(bound_to_admin.account_id))
+        Ok(Some(bound_to_admin.binding.account_id))
     );
 
     let manager = context(orchestrator(), vec![grant]);
@@ -73,7 +73,7 @@ fn caller_bound_uses_both_keys_and_never_falls_back_to_other_accounts() {
     );
 
     let mut agent = child_context(Some(&a), Some(&a), vec![grant]);
-    let own = binding(&agent.caller, upstream_id);
+    let own = invoke_binding(&agent.caller, upstream_id);
     denied(
         authorize_profile_invoke(&agent, Some(profile), Some(target), &all),
         AuthzError::AccountNotBound {
@@ -84,16 +84,16 @@ fn caller_bound_uses_both_keys_and_never_falls_back_to_other_accounts() {
     );
     assert_eq!(
         authorize_profile_invoke(&agent, Some(profile), Some(target), &[same, own]),
-        Ok(Some(own.account_id))
+        Ok(Some(own.binding.account_id))
     );
     agent.caller.inherit_owner_bindings = true;
     assert_eq!(
         authorize_profile_invoke(&agent, Some(profile), Some(target), &all),
-        Ok(Some(same.account_id))
+        Ok(Some(same.binding.account_id))
     );
     assert_eq!(
         authorize_profile_invoke(&agent, Some(profile), Some(target), &[same, own]),
-        Ok(Some(own.account_id))
+        Ok(Some(own.binding.account_id))
     );
     denied(
         authorize_tool_test(&agent, target, &all),
@@ -101,6 +101,68 @@ fn caller_bound_uses_both_keys_and_never_falls_back_to_other_accounts() {
         403,
         "admin_human_required",
     );
+}
+
+#[test]
+fn final_invoke_requires_the_current_account_for_the_exact_binding() {
+    let profile = ProfileId::new();
+    let grants = vec![grant(profile, Capability::Invoke)];
+    let owner = context(principal(PrincipalKind::Member), grants.clone());
+    let mut agent = child_context(Some(&owner), Some(&owner), grants);
+    agent.caller.inherit_owner_bindings = true;
+    let upstream_id = UpstreamId::new();
+    let target = Some(upstream(upstream_id, UpstreamAccountMode::CallerBound));
+    let inherited = invoke_binding(&owner.caller, upstream_id);
+    let own = invoke_binding(&agent.caller, upstream_id);
+    let account = own.account.expect("account fixture");
+    let missing = AuthzError::AccountNotBound {
+        reason: AccountNotBoundReason::MissingBinding,
+    };
+    for (current, expected) in [
+        (
+            Some(AccountView {
+                upstream_id: Some(UpstreamId::new()),
+                ..account
+            }),
+            missing.clone(),
+        ),
+        (
+            Some(AccountView {
+                kind: AccountKind::SecretKv,
+                upstream_id: None,
+                ..account
+            }),
+            missing,
+        ),
+        (None, AuthzError::InvalidAuthContext),
+        (
+            Some(AccountView {
+                account_id: AccountId::new(),
+                ..account
+            }),
+            AuthzError::InvalidAuthContext,
+        ),
+    ] {
+        let stale = InvokeBindingView {
+            account: current,
+            ..own
+        };
+        assert_eq!(
+            authorize_profile_invoke(&agent, Some(profile), target, &[stale, inherited]),
+            Err(expected.clone())
+        );
+        let stale_owner = InvokeBindingView {
+            binding: BindingView {
+                principal_id: owner.caller.principal_id,
+                ..own.binding
+            },
+            account: current,
+        };
+        assert_eq!(
+            authorize_profile_invoke(&agent, Some(profile), target, &[stale_owner]),
+            Err(expected)
+        );
+    }
 }
 
 #[test]
@@ -115,10 +177,10 @@ fn repeated_activity_check_only_discloses_owner_disabled_for_visible_authorized_
     let upstream_id = UpstreamId::new();
     let bound = upstream(upstream_id, UpstreamAccountMode::CallerBound);
     let plain = upstream(upstream_id, UpstreamAccountMode::None);
-    let own = binding(&agent.caller, upstream_id);
-    let owner_binding = binding(&owner.caller, upstream_id);
+    let own = invoke_binding(&agent.caller, upstream_id);
+    let owner_binding = invoke_binding(&owner.caller, upstream_id);
     let lookups = Cell::new(0);
-    let invoke_fake = |ctx: &AuthContext, profile, target, rows: &[BindingView]| {
+    let invoke_fake = |ctx: &AuthContext, profile, target, rows: &[InvokeBindingView]| {
         check_profile_invoke_metadata(ctx, profile, target)?;
         lookups.set(lookups.get() + 1);
         authorize_profile_invoke(ctx, profile, target, rows)
@@ -126,11 +188,11 @@ fn repeated_activity_check_only_discloses_owner_disabled_for_visible_authorized_
     assert_eq!(check_active(&agent), Ok(()));
     assert_eq!(
         invoke_fake(&agent, Some(profile), Some(bound), &[own]),
-        Ok(Some(own.account_id))
+        Ok(Some(own.binding.account_id))
     );
     assert_eq!(
         invoke_fake(&agent, Some(profile), Some(bound), &[owner_binding]),
-        Ok(Some(owner_binding.account_id))
+        Ok(Some(owner_binding.binding.account_id))
     );
     assert_eq!(lookups.replace(0), 2);
 

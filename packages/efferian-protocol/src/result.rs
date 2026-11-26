@@ -100,11 +100,10 @@ impl fmt::Debug for StoredResult {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub enum UpstreamMcpResultType {
-    Complete,
+crate::wire::string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    pub enum UpstreamMcpResultType { Complete => "complete" }
 }
 
 /// Compatibility contract for the CallToolResult value produced by the MCP SDK.

@@ -236,17 +236,18 @@ strict_struct! {
     pub struct SyncCompletePayload {}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BridgeKind {
-    HelloAck,
-    ExecuteReq,
-    CancelReq,
-    ReceiptAck,
-    RosterSync,
-    ExecuteAck,
-    ExecuteRes,
-    SyncComplete,
+crate::wire::string_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BridgeKind {
+        HelloAck => "hello_ack",
+        ExecuteReq => "execute_req",
+        CancelReq => "cancel_req",
+        ReceiptAck => "receipt_ack",
+        RosterSync => "roster_sync",
+        ExecuteAck => "execute_ack",
+        ExecuteRes => "execute_res",
+        SyncComplete => "sync_complete",
+    }
 }
 
 impl BridgeKind {

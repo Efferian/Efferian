@@ -7,7 +7,9 @@
 //! Use [`authorize_discovery_target`] for each candidate and
 //! [`authorize_profile_invoke`] for the selected target. For a caller-bound tool,
 //! [`check_profile_invoke_metadata`] can guard the lookup of account bindings.
-//! Open the account only after the final authorization returns its ID.
+//! Supply each matching binding with its current account metadata from that
+//! snapshot, including stale bindings. Open the account only after the final
+//! authorization verifies its identity, credential kind and upstream.
 //!
 //! Execution access and stream visibility use the recorded ownership and target
 //! attributes together with the reading token's current scope. Use

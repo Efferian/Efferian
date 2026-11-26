@@ -123,10 +123,7 @@ fn platform_has_at_most_ten_unsafe_blocks_across_all_sources() -> Result<(), Box
 #[test]
 fn clippy_checks_the_opt_in_library_features() -> Result<(), Box<dyn Error>> {
     // Default component checks lint each library without its opt-in features.
-    for (package, targets) in [
-        ("efferian-platform", "--all-targets"),
-        ("efferian-protocol", "--lib"),
-    ] {
+    for package in ["efferian-platform", "efferian-protocol"] {
         let status = Command::new(env!("CARGO"))
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .args([
@@ -134,7 +131,7 @@ fn clippy_checks_the_opt_in_library_features() -> Result<(), Box<dyn Error>> {
                 "-p",
                 package,
                 "--all-features",
-                targets,
+                "--all-targets",
                 "--locked",
                 "--offline",
                 "--",

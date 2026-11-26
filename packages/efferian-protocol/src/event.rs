@@ -10,10 +10,10 @@ use crate::{
 
 macro_rules! event_kinds {
     ($($variant:ident => $wire:tt),+ $(,)?) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
-        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-        pub enum EventKind {
-            $(#[serde(rename = $wire)] $variant),+
+        crate::wire::string_enum! {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+            #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+            pub enum EventKind { $($variant => $wire),+ }
         }
 
         impl EventKind {
@@ -113,10 +113,9 @@ pub struct EventEnvelope {
     pub event: Event,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum SourceKind {
-    Hub,
+crate::wire::string_enum! {
+    #[derive(Clone, Copy)]
+    enum SourceKind { Hub => "hub" }
 }
 
 #[derive(Deserialize, Serialize)]

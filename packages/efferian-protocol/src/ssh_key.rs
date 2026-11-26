@@ -312,7 +312,7 @@ fn valid_openssh(bytes: &[u8]) -> Option<()> {
     openssh_fields(&mut private, kind, true)?;
     private.ssh_string()?; // Comment.
     let padding = private.0;
-    (padding.len() < 8 && padding.iter().copied().eq(1..=padding.len() as u8)).then_some(())
+    (padding.len() <= 8 && padding.iter().copied().eq(1..=padding.len() as u8)).then_some(())
 }
 
 fn openssh_fields(fields: &mut Bytes<'_>, kind: SshKey, private: bool) -> Option<()> {

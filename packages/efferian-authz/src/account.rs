@@ -4,8 +4,8 @@ use efferian_protocol::{
 };
 
 use crate::{
-    AccountView, AuthContext, AuthzError, BindingUpstream, BindingView, PrincipalView,
-    SubjectMetadata,
+    AccountView, AuthContext, AuthzError, BindingUpstream, BindingView, InvokeBindingView,
+    PrincipalView, SubjectMetadata,
     policy::{ActiveContext, guard},
     principal::check_subject_metadata,
 };
@@ -64,9 +64,7 @@ pub fn authorize_binding_mutation(
     let upstream = visible_binding_upstream(active, upstream)?;
     subject.validate()?;
     let matches_operation = match mutation {
-        BindingMutation::Set => {
-            account.kind == AccountKind::HttpAuth && account.upstream_id == Some(upstream)
-        }
+        BindingMutation::Set => is_http_account_for(account, upstream),
         BindingMutation::Remove { existing } => {
             existing.upstream_id == upstream
                 && existing.principal_id == subject.principal_id
@@ -82,6 +80,10 @@ pub fn authorize_binding_mutation(
         return Err(AuthzError::Forbidden);
     }
     active.require_unrestricted()
+}
+
+fn is_http_account_for(account: &AccountView, upstream: UpstreamId) -> bool {
+    account.kind == AccountKind::HttpAuth && account.upstream_id == Some(upstream)
 }
 
 fn owns_private_account(active: ActiveContext<'_>, account: &AccountView) -> bool {
@@ -110,18 +112,29 @@ fn visible_binding_upstream(
 pub(crate) fn resolve_caller_bound_account(
     active: ActiveContext<'_>,
     upstream_id: UpstreamId,
-    bindings: &[BindingView],
+    bindings: &[InvokeBindingView],
 ) -> Result<AccountId, AuthzError> {
     let ctx = active.context();
     let explicit = |principal_id| {
-        let mut matches = bindings.iter().filter(|binding| {
-            binding.principal_id == principal_id && binding.upstream_id == upstream_id
+        let mut matches = bindings.iter().filter(|row| {
+            row.binding.principal_id == principal_id && row.binding.upstream_id == upstream_id
         });
-        let account_id = matches.next().map(|binding| binding.account_id);
+        let Some(row) = matches.next() else {
+            return Ok(None);
+        };
         if matches.next().is_some() {
             return Err(AuthzError::InvalidAuthContext);
         }
-        Ok(account_id)
+        let account = row.account.ok_or(AuthzError::InvalidAuthContext)?;
+        if account.account_id != row.binding.account_id {
+            return Err(AuthzError::InvalidAuthContext);
+        }
+        if !is_http_account_for(&account, upstream_id) {
+            return Err(AuthzError::AccountNotBound {
+                reason: AccountNotBoundReason::MissingBinding,
+            });
+        }
+        Ok(Some(account.account_id))
     };
 
     if let Some(account) = explicit(ctx.caller.principal_id)? {

@@ -257,9 +257,27 @@ fn canonical_digests_retain_client_intent() -> Result<(), Box<dyn std::error::Er
         "9d26c4de2196821eb0adc54e5dba470bd3f2a4ea98e2b0ff8dd22c7a1462102c"
     );
 
-    let replay = request.clone();
-    let baseline = compute_request_digest(&replay)?;
-    assert_eq!(compute_request_digest(&request)?, baseline);
+    // A later publication changes both the tool and fixed node behind the alias.
+    // A retry combines the client's selector with its recorded binding.
+    let recorded = (tool_id, Some(NodeId::new()));
+    let published = (ToolId::new(), Some(NodeId::new()));
+    let with_binding = |(tool_id, fixed_node_id)| RequestDigestInput {
+        tool_id,
+        fixed_node_id,
+        requested_target: Some("build-node"),
+        ..request.clone()
+    };
+    let baseline = compute_request_digest(&with_binding(recorded))?;
+    assert_ne!(compute_request_digest(&with_binding(published))?, baseline);
+    assert_ne!(
+        compute_request_digest(&with_binding((published.0, recorded.1)))?,
+        baseline
+    );
+    assert_ne!(
+        compute_request_digest(&with_binding((recorded.0, published.1)))?,
+        baseline
+    );
+    let request = with_binding(recorded);
     for changed in [
         RequestDigestInput {
             public_name: "another-alias",

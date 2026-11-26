@@ -3,23 +3,31 @@ use serde::{Deserialize, Serialize};
 use crate::ProfileId;
 
 macro_rules! wire_enum {
-    ($(#[$attr:meta])* pub enum $name:ident { $($variants:tt)* }) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-        $(#[$attr])*
-        pub enum $name { $($variants)* }
+    ($($definition:tt)*) => {
+        crate::wire::string_enum! {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+            #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+            $($definition)*
+        }
     };
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum PrincipalKind { Admin, Member, Agent, Service }
+    pub enum PrincipalKind {
+        Admin => "admin",
+        Member => "member",
+        Agent => "agent",
+        Service => "service",
+    }
 }
 
 wire_enum! {
     #[derive(PartialOrd, Ord)]
-    #[serde(rename_all = "snake_case")]
-    pub enum Capability { Discover, Invoke, Admin }
+    pub enum Capability {
+        Discover => "discover",
+        Invoke => "invoke",
+        Admin => "admin",
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -80,72 +88,114 @@ impl<'de> Deserialize<'de> for GrantScope {
             Profile { scope_id: ProfileId },
         }
 
-        Ok(match crate::wire::deserialize_object(deserializer)? {
-            Scope::Global {} => Self::Global,
-            Scope::Profile { scope_id } => Self::Profile(scope_id),
-        })
+        Ok(
+            match crate::wire::deserialize_tagged_object(deserializer, "scope_kind")? {
+                Scope::Global {} => Self::Global,
+                Scope::Profile { scope_id } => Self::Profile(scope_id),
+            },
+        )
     }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum DiscoveryMode { Full, Curated, Search }
+    pub enum DiscoveryMode {
+        Full => "full",
+        Curated => "curated",
+        Search => "search",
+    }
 }
 
 wire_enum! {
     #[derive(Default)]
-    #[serde(rename_all = "snake_case")]
-    pub enum ExecutionMode { #[default] Auto, Async }
+    pub enum ExecutionMode {
+        #[default] Auto => "auto",
+        Async => "async",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum InvokeKind { Profile, ToolTest }
+    pub enum InvokeKind {
+        Profile => "profile",
+        ToolTest => "tool_test",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum ExecutorKind { Node, Upstream }
+    pub enum ExecutorKind {
+        Node => "node",
+        Upstream => "upstream",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum PlatformOs { Linux, Macos }
+    pub enum PlatformOs {
+        Linux => "linux",
+        Macos => "macos",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum AccountVisibility { Private, Shared }
+    pub enum AccountVisibility {
+        Private => "private",
+        Shared => "shared",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum AccountKind { HttpAuth, SshKey, SecretKv }
+    pub enum AccountKind {
+        HttpAuth => "http_auth",
+        SshKey => "ssh_key",
+        SecretKv => "secret_kv",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum UpstreamAccountMode { None, SharedAccount, CallerBound }
+    pub enum UpstreamAccountMode {
+        None => "none",
+        SharedAccount => "shared_account",
+        CallerBound => "caller_bound",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum AccountNotBoundReason { MissingBinding, OwnerDisabled, InheritDisabled }
+    pub enum AccountNotBoundReason {
+        MissingBinding => "missing_binding",
+        OwnerDisabled => "owner_disabled",
+        InheritDisabled => "inherit_disabled",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum ToolKind { Command, Script, Http, Ssh, UpstreamRef }
+    pub enum ToolKind {
+        Command => "command",
+        Script => "script",
+        Http => "http",
+        Ssh => "ssh",
+        UpstreamRef => "upstream_ref",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "UPPERCASE")]
-    pub enum HttpMethod { Get, Post, Put, Patch, Delete, Head }
+    pub enum HttpMethod {
+        Get => "GET",
+        Post => "POST",
+        Put => "PUT",
+        Patch => "PATCH",
+        Delete => "DELETE",
+        Head => "HEAD",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum ExecutionState { Accepted, Running, Succeeded, Failed, Cancelled, TimedOut, Unknown }
+    pub enum ExecutionState {
+        Accepted => "accepted",
+        Running => "running",
+        Succeeded => "succeeded",
+        Failed => "failed",
+        Cancelled => "cancelled",
+        TimedOut => "timed_out",
+        Unknown => "unknown",
+    }
 }
 
 impl ExecutionState {
@@ -155,8 +205,13 @@ impl ExecutionState {
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum TerminalExecutionState { Succeeded, Failed, Cancelled, TimedOut, Unknown }
+    pub enum TerminalExecutionState {
+        Succeeded => "succeeded",
+        Failed => "failed",
+        Cancelled => "cancelled",
+        TimedOut => "timed_out",
+        Unknown => "unknown",
+    }
 }
 
 impl From<TerminalExecutionState> for ExecutionState {
@@ -172,11 +227,17 @@ impl From<TerminalExecutionState> for ExecutionState {
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum OutputDiscardedReason { RamCap }
+    pub enum OutputDiscardedReason {
+        RamCap => "ram_cap",
+    }
 }
 
 wire_enum! {
-    #[serde(rename_all = "snake_case")]
-    pub enum AggregateType { Execution, Node, Profile, Principal, Token }
+    pub enum AggregateType {
+        Execution => "execution",
+        Node => "node",
+        Profile => "profile",
+        Principal => "principal",
+        Token => "token",
+    }
 }

@@ -136,6 +136,26 @@ fn openssh(
     include_private: bool,
     valid_padding: bool,
 ) -> Vec<u8> {
+    openssh_with_comment(
+        cipher,
+        kdf,
+        matching_checkints,
+        include_private,
+        valid_padding,
+        b"fixture",
+        false,
+    )
+}
+
+fn openssh_with_comment(
+    cipher: &[u8],
+    kdf: &[u8],
+    matching_checkints: bool,
+    include_private: bool,
+    valid_padding: bool,
+    comment: &[u8],
+    full_block: bool,
+) -> Vec<u8> {
     let kind = b"ssh-ed25519";
     let public_key = [0; 32];
     let fake_private_key = [0; 64];
@@ -149,8 +169,9 @@ fn openssh(
     if include_private {
         private.extend(ssh_string(&fake_private_key));
     }
-    private.extend(ssh_string(b"fixture"));
-    let padding = (8 - private.len() % 8) % 8;
+    private.extend(ssh_string(comment));
+    let padding = 8 - private.len() % 8;
+    let padding = if full_block { padding } else { padding % 8 };
     private.extend(1..=padding as u8);
     if !valid_padding && let Some(last) = private.last_mut() {
         *last ^= 0x80;
@@ -165,6 +186,22 @@ fn openssh(
         ssh_string(&private),
     ]
     .concat()
+}
+
+#[test]
+fn openssh_accepts_both_padding_conventions_on_an_aligned_private_block() -> Result {
+    // An empty Ed25519 comment consumes 131 bytes including the private fields.
+    let comment = b"12345";
+    for full_block in [false, true] {
+        let key = openssh_with_comment(b"none", b"none", true, true, true, comment, full_block);
+        if full_block {
+            assert!(key.ends_with(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        } else {
+            assert!(key.ends_with(comment));
+        }
+        validate_ssh_private_key_pem(&pem("OPENSSH PRIVATE KEY", &key))?;
+    }
+    Ok(())
 }
 
 #[test]

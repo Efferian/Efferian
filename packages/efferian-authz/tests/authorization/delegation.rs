@@ -348,6 +348,16 @@ fn orchestrator_mint_is_monotonic_in_each_dimension() {
         authorize_token_mint(&ctx, &target, request, &policy, &managed)
     };
     assert_eq!(check(&valid), Ok(()));
+    let mut narrower_parent = ctx.clone();
+    narrower_parent.token.max_capability = Some(Capability::Discover);
+    let wider_child = TokenMintRequest {
+        max_capability: Some(Capability::Invoke),
+        ..valid.clone()
+    };
+    assert_eq!(
+        authorize_token_mint(&narrower_parent, &target, &wider_child, &policy, &managed),
+        Err(AuthzError::TokenAmplification("max_capability"))
+    );
     for (request, field) in [
         (
             TokenMintRequest {
@@ -656,4 +666,44 @@ fn managed_nodes_have_distinct_read_and_mutation_scope() {
         "forbidden",
     );
     assert_eq!(authorize_node_revoke_or_delete(&admin(), &foreign), Ok(()));
+}
+
+#[test]
+fn member_token_operations_require_ownership_and_an_unrestricted_token() {
+    let member = context(principal(PrincipalKind::Member), vec![]);
+    let other = principal(PrincipalKind::Member);
+    let owned = child(Some(&member.caller), Some(&other));
+    let foreign = child(Some(&other), Some(&member.caller));
+    let mint = |ctx: &AuthContext, subject: &PrincipalView| {
+        authorize_token_mint(
+            ctx,
+            subject,
+            &TokenMintRequest::default(),
+            &OrchestratorLimits::default(),
+            &BTreeSet::new(),
+        )
+    };
+    for subject in [&member.caller, &owned] {
+        assert_eq!(mint(&member, subject), Ok(()));
+        assert_eq!(authorize_token_revoke(&member, subject), Ok(()));
+        for token in narrowed_tokens(&member.token) {
+            let ctx = AuthContext {
+                token,
+                ..member.clone()
+            };
+            assert_eq!(
+                mint(&ctx, subject),
+                Err(AuthzError::UnrestrictedTokenRequired)
+            );
+            assert_eq!(
+                authorize_token_revoke(&ctx, subject),
+                Err(AuthzError::UnrestrictedTokenRequired)
+            );
+        }
+    }
+    assert_eq!(mint(&member, &foreign), Err(AuthzError::Forbidden));
+    assert_eq!(
+        authorize_token_revoke(&member, &foreign),
+        Err(AuthzError::Forbidden)
+    );
 }

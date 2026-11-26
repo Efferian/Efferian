@@ -88,6 +88,24 @@ fn child_context(
     }
 }
 
+fn invoke_binding(subject: &PrincipalView, upstream_id: UpstreamId) -> InvokeBindingView {
+    let account = AccountView {
+        account_id: AccountId::new(),
+        owner_principal_id: subject.principal_id,
+        visibility: AccountVisibility::Private,
+        kind: AccountKind::HttpAuth,
+        upstream_id: Some(upstream_id),
+    };
+    InvokeBindingView {
+        binding: BindingView {
+            principal_id: subject.principal_id,
+            upstream_id,
+            account_id: account.account_id,
+        },
+        account: Some(account),
+    }
+}
+
 fn global(capability: Capability) -> GrantView {
     GrantView {
         scope: GrantScope::Global,

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use efferian_protocol::*;
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 #[cfg(feature = "openapi")]
 mod support;
@@ -228,10 +228,24 @@ fn upstream_revision_captures_exact_discovery_schema_and_uses_both_deadlines() -
         tool.freeze_revision(Some(&wrong), 200, 200, &policy),
         Err(ValidationError::MissingUpstreamTool)
     );
+    for schema in [Value::Null, json!(false), json!([])] {
+        let invalid = DiscoveredUpstreamTool {
+            input_schema: schema,
+            ..discovered.clone()
+        };
+        assert_eq!(
+            tool.freeze_revision(Some(&invalid), 200, 200, &policy),
+            Err(ValidationError::InvalidField("discovered input schema"))
+        );
+    }
     let snapshot = tool.freeze_revision(Some(&discovered), 200, 200, &policy)?;
     assert_eq!(
         snapshot.definition.description.as_deref(),
         Some("Run remotely")
+    );
+    assert_eq!(
+        serde_json::from_slice::<ToolDefinition>(&serde_json::to_vec(&snapshot.definition)?)?,
+        snapshot.definition
     );
     assert_eq!(snapshot.definition.annotations, discovered.annotations);
     assert_eq!(snapshot.definition.input_schema.as_ref(), Some(&schema));
@@ -288,6 +302,17 @@ fn upstream_revision_applies_the_definition_budget_after_inheriting_metadata() -
     assert_eq!(
         tool.freeze_revision(Some(&discovered), 1, 1, &policy),
         Err(ValidationError::DefinitionLimit)
+    );
+    let overridden = ToolDefinition {
+        description: Some("local".into()),
+        ..tool
+    };
+    assert_eq!(
+        overridden
+            .freeze_revision(Some(&discovered), 1, 1, &policy)?
+            .definition
+            .description,
+        overridden.description
     );
     Ok(())
 }

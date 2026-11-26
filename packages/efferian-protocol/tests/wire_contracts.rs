@@ -501,6 +501,31 @@ fn grant_scope_rejects_extra_members_even_if_null() -> Result {
 }
 
 #[test]
+fn wire_discriminators_require_json_strings() -> Result {
+    let sync = BridgeEnvelope {
+        epoch: 7,
+        message: BridgeMessage::SyncComplete(SyncCompletePayload {}),
+    };
+    let mut frame: Value = serde_json::from_slice(&encode_bridge_frame(&sync)?)?;
+    frame["kind"] = json!({"sync_complete":null});
+    assert!(decode_bridge_frame(&serde_json::to_vec(&frame)?, BridgeReceiver::Hub).is_err());
+    assert!(
+        serde_json::from_value::<UpstreamMcpResult>(
+            json!({"resultType":{"complete":null}, "content":[]})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<AccountSecretPayload>(
+            json!({"kind":"http_auth","auth":{"kind":0,"token":"fixture"}})
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_value::<TerminalExecutionState>(json!({"succeeded":null})).is_err());
+    Ok(())
+}
+
+#[test]
 fn tagged_wire_objects_reject_positional_arrays() -> Result {
     assert!(serde_json::from_str::<EventStreamFrame>(r#"["ping"]"#).is_err());
     assert!(serde_json::from_str::<GrantScope>(r#"["global"]"#).is_err());
