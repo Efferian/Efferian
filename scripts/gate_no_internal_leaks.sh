@@ -5,7 +5,8 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 
 # Match machine-specific home paths and private-key headers. Report paths only.
-home='(^|file://|[^[:alnum:]_.~/])(/(home|Users|root)/[^/[:space:]]|[[:alpha:]]:[/\\]+Users[/\\]+[^/\\[:space:]])'
+# Compiler response files can attach the path directly to a flag such as -I.
+home='(^|file://|[^[:alnum:]_.~/])(-[[:alpha:]]+)?(/(home|Users|root)/[^/[:space:]]|[[:alpha:]]:[/\\]+Users[/\\]+[^/\\[:space:]])'
 key='-{5}BEGIN ([[:upper:][:digit:]]+ )*PRIVATE KEY( BLOCK)?-{5}'
 pattern="$home|$key"
 if git --no-pager grep -IlE -e "$pattern" -- .; then

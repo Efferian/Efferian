@@ -4,7 +4,7 @@ Efferian is a distributed agent tools platform. The Rust workspace currently pro
 
 ## Build from a clean checkout
 
-Use Linux with Git, GNU Make, a local Docker Engine and Docker Compose 5 or newer. The repository pins DevKit 0.6.0 and its Rust toolchain. From the repository root, run:
+Use Linux on x86-64 or ARM64 with Git, GNU Make, GNU coreutils, curl, a local Docker Engine and Docker Compose 5 or newer. The repository pins DevKit 0.6.0 and its Rust toolchain. From the repository root, run:
 
 ```sh
 make setup

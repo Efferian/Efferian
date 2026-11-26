@@ -13,6 +13,7 @@ gate_unsafe_and_clippy: $(call devkit_targets,check) test/packages/efferian-plat
 
 gate_no_internal_leaks:
 	@sh scripts/gate_no_internal_leaks.sh
+	@sh scripts/test_no_internal_leaks.sh
 
 report_loc_stats:
 	-@sh scripts/report_loc_stats.sh
