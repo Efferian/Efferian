@@ -104,7 +104,7 @@ fn caller_bound_uses_both_keys_and_never_falls_back_to_other_accounts() {
 }
 
 #[test]
-fn final_invoke_requires_the_current_account_for_the_exact_binding() {
+fn final_invoke_requires_the_current_account_for_the_exact_binding() -> Result<(), AuthzError> {
     let profile = ProfileId::new();
     let grants = vec![grant(profile, Capability::Invoke)];
     let owner = context(principal(PrincipalKind::Member), grants.clone());
@@ -114,7 +114,7 @@ fn final_invoke_requires_the_current_account_for_the_exact_binding() {
     let target = Some(upstream(upstream_id, UpstreamAccountMode::CallerBound));
     let inherited = invoke_binding(&owner.caller, upstream_id);
     let own = invoke_binding(&agent.caller, upstream_id);
-    let account = own.account.expect("account fixture");
+    let account = own.account.ok_or(AuthzError::InvalidAuthContext)?;
     let missing = AuthzError::AccountNotBound {
         reason: AccountNotBoundReason::MissingBinding,
     };
@@ -163,6 +163,7 @@ fn final_invoke_requires_the_current_account_for_the_exact_binding() {
             Err(expected)
         );
     }
+    Ok(())
 }
 
 #[test]
