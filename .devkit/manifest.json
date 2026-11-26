@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "version": "0.6.0",
   "releaseIdentity": "1e3a61daf9a5a1527dd049d9f04f84a42ec22aaba783b66d16cbc95af285914c",
-  "generation": "fc189e23-2b2d-4800-a935-a689615f9ef1",
+  "generation": "eb4fe846-b188-4773-bf76-1aab7e3a8953",
   "packageMode": "registry",
   "managed": {
     ".devkit/compose.apps.yaml": {
@@ -172,13 +172,13 @@
     "version": 1,
     "lock": "458befd4a99c980215d33d925ba00f29ebf6a3fa34978829dbf9e128875569b3",
     "inputs": {
-      "digest": "baf45bf851214a0a2960bae0703ab9297b78f84c883807e6457977aee2112dc7",
+      "digest": "732ad4574b7fc3f362c7120f728e76fbc158d6bd00a6243ed1d4443c4a3177e3",
       "policy": "058040da9ad8fa2d8a8a95b19ae4104dc0834604a64226de1d33abbd71d6fa2c",
       "members": {
         "apps/cli": "224291444635a28a827e50ec8c5435b47140eaa629c08b41af4ce6b431ac7b14",
         "apps/hub": "d6e22bc9fbdf3830f09212c83498bad52a610c75dd7d7be957932873cbe378fa",
         "apps/node": "64abdaee4da48420e272d67999d0b347d9c67a98cc8f7fe8f23e68a7c066db62",
-        "packages/efferian-authz": "5dfc293ac5038f062caa944bc54283ff135f98c0b4cdb72dfd458ae3edda8747",
+        "packages/efferian-authz": "f5b96ac551f479ade753f97321f3d4e75c1f197f6cdd4fe91b480a55144a5b5b",
         "packages/efferian-client": "c2a1b2e7dec4ce7877e6f09891cae4b543f69d6c9e3c2be43d80abcda697de38",
         "packages/efferian-platform": "22849f36d25944975ad4362746f93b6e2756f36d5a75a19b0a10f658de3af44f",
         "packages/efferian-protocol": "7829e6e8a61d036a05d581bb36c0bb3a51f192a5e9682bc471030229d6b1cf89"
