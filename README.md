@@ -1,6 +1,6 @@
 # Efferian
 
-Efferian is a distributed agent tools platform. The Rust workspace currently provides the build foundation for the Hub, Node and CLI. Each executable installs the ring TLS provider at startup.
+Efferian is a distributed agent tools platform. The Rust workspace provides the build foundation and shared OS primitives for the Hub, Node and CLI. Each executable installs the ring TLS provider at startup.
 
 ## Build from a clean checkout
 
@@ -31,6 +31,12 @@ DevKit builds each application separately so Cargo resolves its production featu
 | `apps/cli` | Command-line executable | Protocol, Platform, Client |
 
 `make check` runs formatting and Clippy, checks dependency declarations, scans the entire lockfile and inspects the features Cargo actually compiled for each binary. It also checks tracked text for local home paths and private-key headers and enforces the ten-block unsafe budget in Platform. The Rust line-count report is informational. `make test` includes a fresh-process TLS check and a network-free MCP transport test using the locked SDK.
+
+## Platform primitives
+
+Use separate sidecar files such as `hub.lock` and `node.lock` for exclusive instance locks. `PrivateFs` manages private directories, bounded secret reads and atomic file replacement. If an atomic write reports `sync_published_parent`, the complete replacement is visible and its crash durability is unknown. Verify the visible state before retrying. Path validation assumes that operators keep the relevant directory entries, sensitive files and ACLs under trusted control throughout use. Configure every operator-created mount alias that exposes protected state under an allowed root as a forbidden root. Working directories and the parents of SSH files require directory search permission. Startup cleanup runs under the instance lock before any ephemeral guards are issued. Each guard owns its entry name through removal. On Linux, restoring owner permissions on an unreadable directory uses the service's mounted procfs at `/proc/self/fd`.
+
+Only Node enables the Platform `process` feature. Its `ProcessHandle` owns the group through cleanup and keeps the leader unreaped until the final group signal. Explicit termination gives signalable group members the full TERM grace period, then escalates and collects the leader. Callers retain the handle through cleanup. Take each piped stdout and stderr and read both concurrently with waiting, or select inherited or null output when a stream is unused. Spawn on a thread with SIGCHLD unblocked and keep signal delivery and child collection available to the handle. Pipe registration errors after OS spawn trigger group cleanup and leader collection. The command may already have performed work when such an error is returned. The guarantee covers the original process group while Node is running.
 
 ## License
 

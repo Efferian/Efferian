@@ -122,28 +122,30 @@ fn platform_has_at_most_ten_unsafe_blocks_across_all_sources() -> Result<(), Box
 
 #[test]
 fn clippy_checks_the_opt_in_library_features() -> Result<(), Box<dyn Error>> {
-    // The component checks lint each library as a primary package with defaults.
-    // Re-run the two feature owners as primary packages to lint their opt-in code.
-    let status = Command::new(env!("CARGO"))
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args([
-            "clippy",
-            "-p",
-            "efferian-platform",
-            "-p",
-            "efferian-protocol",
-            "--all-features",
-            "--lib",
-            "--locked",
-            "--offline",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .status()?;
-    assert!(
-        status.success(),
-        "Clippy failed on opt-in features: {status}"
-    );
+    // Default component checks lint each library without its opt-in features.
+    for (package, targets) in [
+        ("efferian-platform", "--all-targets"),
+        ("efferian-protocol", "--lib"),
+    ] {
+        let status = Command::new(env!("CARGO"))
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args([
+                "clippy",
+                "-p",
+                package,
+                "--all-features",
+                targets,
+                "--locked",
+                "--offline",
+                "--",
+                "-D",
+                "warnings",
+            ])
+            .status()?;
+        assert!(
+            status.success(),
+            "Clippy failed on {package} opt-in features: {status}"
+        );
+    }
     Ok(())
 }

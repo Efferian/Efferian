@@ -11,11 +11,19 @@ default = []
 process = ["dep:tokio"]
 
 [dependencies]
-tokio = { workspace = true, optional = true, features = ["process"] }
+getrandom = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["process", "time", "signal"] }
 
 [dev-dependencies]
 proc-macro2 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "process", "time", "signal", "io-util"] }
 toml = { workspace = true }
+
+[[test]]
+name = "process_group"
+required-features = ["process"]
 
 [lints.rust]
 unsafe_code = "allow"
