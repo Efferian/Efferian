@@ -24,11 +24,36 @@ wire_enum! {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "scope_kind", content = "scope_id", rename_all = "snake_case")]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum GrantScope {
     Global,
     Profile(ProfileId),
 }
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for GrantScope {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use crate::wire::schema::{closed_object, string_tag};
+        use utoipa::openapi::schema::OneOfBuilder;
+
+        OneOfBuilder::new()
+            .item(
+                closed_object()
+                    .property("scope_kind", string_tag("global"))
+                    .required("scope_kind"),
+            )
+            .item(
+                closed_object()
+                    .property("scope_kind", string_tag("profile"))
+                    .required("scope_kind")
+                    .property("scope_id", ProfileId::schema())
+                    .required("scope_id"),
+            )
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for GrantScope {}
 
 impl GrantScope {
     pub const fn scope_kind_str(self) -> &'static str {
