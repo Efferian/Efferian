@@ -205,6 +205,25 @@ async fn interrupted_grace_can_resume_with_either_cleanup_method() -> TestResult
 }
 
 #[tokio::test]
+async fn resuming_after_the_original_deadline_escalates_promptly() -> TestResult {
+    let mut group = RunningGroup::start(TERM_HANDLING_LEADER, TERM_IGNORING_WORKER).await?;
+    let grace = Duration::from_secs(2);
+    assert!(
+        timeout(
+            Duration::from_millis(50),
+            group.handle.terminate_group(grace)
+        )
+        .await
+        .is_err()
+    );
+    tokio::time::sleep(grace).await;
+    let status = timeout(Duration::from_secs(1), group.handle.wait_and_cleanup()).await??;
+    assert_eq!(status.code(), Some(23));
+    assert_eq!(group.drain_until_eof().await?, "");
+    Ok(())
+}
+
+#[tokio::test]
 async fn unclaimed_piped_stdin_is_closed_when_waiting() -> TestResult {
     let mut command = Command::new("/bin/sh");
     command
@@ -224,10 +243,12 @@ async fn unclaimed_piped_stdin_is_closed_when_waiting() -> TestResult {
 async fn spawn_failure_is_returned_without_a_handle() -> TestResult {
     let dir = TestDir::new()?;
     let mut command = Command::new(dir.path().join("missing-command"));
+    command.kill_on_drop(true);
     assert!(matches!(
         ProcessHandle::spawn_isolated_group(&mut command),
         Err(efferian_platform::PlatformError::Io { operation: "spawn_process_group", source, .. })
             if source.kind() == io::ErrorKind::NotFound
     ));
+    assert!(command.get_kill_on_drop());
     Ok(())
 }

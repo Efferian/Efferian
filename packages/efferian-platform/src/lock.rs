@@ -1,7 +1,7 @@
 use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::fs::{
@@ -12,6 +12,7 @@ use crate::{PlatformError, current_euid};
 
 /// An exclusive lock on a persistent sidecar file.
 #[derive(Debug)]
+#[must_use = "retain the lock for the lifetime of the instance"]
 pub struct FileLock {
     file: File,
     path: PathBuf,
@@ -36,15 +37,24 @@ impl FileLock {
         if let Some(metadata) = entry_metadata(path)? {
             check_type(path, &metadata, false)?;
         }
-        let file = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
             .mode(PRIVATE_FILE_MODE)
-            .custom_flags(FILE_FLAGS)
-            .open(path)
-            .map_err(|error| open_file_error(path, "open_lock", error))?;
+            .custom_flags(FILE_FLAGS);
+        let file = match options.create_new(true).open(path) {
+            Ok(file) => {
+                file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                    .map_err(|error| PlatformError::io("set_lock_permissions", path, error))?;
+                file
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => options
+                .create_new(false)
+                .open(path)
+                .map_err(|error| open_file_error(path, "open_lock", error))?,
+            Err(error) => return Err(open_file_error(path, "open_lock", error)),
+        };
         let opened = file
             .metadata()
             .map_err(|error| PlatformError::io("inspect_lock", path, error))?;
@@ -164,7 +174,7 @@ mod tests {
         ));
         drop(owner);
         assert!(path.is_file());
-        FileLock::acquire_exclusive(&path)?;
+        drop(FileLock::acquire_exclusive(&path)?);
         Ok(())
     }
 }

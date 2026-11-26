@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
@@ -264,12 +264,38 @@ fn set_mode(path: &Path, file: &File, mode: u32) -> Result<(), PlatformError> {
         .map_err(|error| PlatformError::io("set_permissions", path, error))
 }
 
-fn verified_dir(path: &Path, created: bool) -> Result<(PathBuf, File), PlatformError> {
+// The caller owns this directory entry exclusively during creation or cleanup.
+// AT_SYMLINK_NOFOLLOW also protects a final symlink on the chmod path.
+fn restore_owned_directory_mode(path: &Path) -> Result<(), PlatformError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| PlatformError::io("inspect_directory_mode", path, error))?;
+    check_type(path, &metadata, true)?;
+    check_owner(path, &metadata, current_euid())?;
+    let name = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| invalid_path(path, "path contains NUL"))?;
+    // SAFETY: name is a live NUL-terminated pathname. fchmodat reads the name
+    // during the call and does not retain the pointer.
+    if unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            PRIVATE_DIR_MODE as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(PlatformError::io(
+            "restore_directory_mode",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+fn verified_dir(path: &Path) -> Result<(PathBuf, File), PlatformError> {
     let path = checked_path(path, true)?;
     let file = open_directory(path)?;
-    if created {
-        set_mode(path, &file, PRIVATE_DIR_MODE)?;
-    }
     let metadata = fd_metadata(path, &file)?;
     check_owner(path, &metadata, current_euid())?;
     check_mode(
@@ -286,11 +312,8 @@ fn verified_dir(path: &Path, created: bool) -> Result<(PathBuf, File), PlatformE
     Ok((canonical, file))
 }
 
-fn create_dir(path: &Path, recursive: bool) -> io::Result<()> {
-    DirBuilder::new()
-        .mode(PRIVATE_DIR_MODE)
-        .recursive(recursive)
-        .create(path)
+fn mkdir_private(path: &Path) -> io::Result<()> {
+    DirBuilder::new().mode(PRIVATE_DIR_MODE).create(path)
 }
 
 fn open_regular_file(path: &Path) -> Result<(File, Metadata), PlatformError> {
@@ -306,6 +329,22 @@ fn open_regular_file(path: &Path) -> Result<(File, Metadata), PlatformError> {
     let metadata = fd_metadata(path, &file)?;
     check_type(path, &metadata, false)?;
     Ok((file, metadata))
+}
+
+fn open_linked_file(
+    path: &Path,
+    mut open: impl FnMut() -> Result<(File, Metadata), PlatformError>,
+) -> Result<(File, Metadata), PlatformError> {
+    let mut opened = open()?;
+    // Atomic publication may unlink the previous file between open and fstat.
+    for _ in 0..3 {
+        if opened.1.nlink() != 0 {
+            break;
+        }
+        opened = open()?;
+    }
+    check_single_link(path, &opened.1)?;
+    Ok(opened)
 }
 
 fn create_unique_file(
@@ -357,7 +396,7 @@ fn write_atomic(
     sync_parent: impl FnOnce(&File) -> io::Result<()>,
 ) -> Result<(), PlatformError> {
     check_name(name)?;
-    let (dir, directory) = verified_dir(dir, false)?;
+    let (dir, directory) = verified_dir(dir)?;
     let target = dir.join(name);
     if let Some(metadata) = entry_metadata(&target)? {
         check_type(&target, &metadata, false)?;
@@ -382,36 +421,35 @@ impl PrivateFs {
     /// Create a private directory and return its canonical path.
     pub fn ensure_private_dir(path: &Path) -> Result<PathBuf, PlatformError> {
         let path = checked_path(path, true)?;
-        let mut created = false;
-        if let Some(metadata) = entry_metadata(path)? {
-            check_type(path, &metadata, true)?;
-        } else {
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                create_dir(parent, true).map_err(|error| {
-                    PlatformError::io("create_private_ancestors", parent, error)
-                })?;
+        let mut missing = Vec::new();
+        for ancestor in path.ancestors() {
+            if ancestor.as_os_str().is_empty() || entry_metadata(ancestor)?.is_some() {
+                break;
             }
-            match create_dir(path, false) {
-                Ok(()) => created = true,
+            missing.push(ancestor);
+        }
+        for directory in missing.into_iter().rev() {
+            match mkdir_private(directory) {
+                Ok(()) => restore_owned_directory_mode(directory)?,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
-                    return Err(PlatformError::io("create_private_directory", path, error));
+                    return Err(PlatformError::io(
+                        "create_private_directory",
+                        directory,
+                        error,
+                    ));
                 }
             }
         }
-        let (canonical, _) = verified_dir(path, created)?;
+        let (canonical, _) = verified_dir(path)?;
         Ok(canonical)
     }
 
     /// Read at most `max_bytes` from an owned, single-link file with mode 0400 or 0600.
     pub fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, PlatformError> {
         let path = checked_path(path, false)?;
-        let (file, metadata) = open_regular_file(path)?;
+        let (file, metadata) = open_linked_file(path, || open_regular_file(path))?;
         check_owner(path, &metadata, current_euid())?;
-        check_single_link(path, &metadata)?;
         check_mode(
             path,
             &metadata,
@@ -465,7 +503,7 @@ impl PrivateFs {
         {
             return Err(invalid_path(dir, "invalid ephemeral file prefix"));
         }
-        let (dir, _) = verified_dir(dir, false)?;
+        let (dir, _) = verified_dir(dir)?;
         let (temp, mut file) = create_unique_file(&dir, prefix, None)?;
         write_contents(&temp.path, &mut file, bytes)?;
         file.flush()
@@ -475,18 +513,21 @@ impl PrivateFs {
 
     pub fn create_ephemeral_dir(parent: &Path, name: &str) -> Result<EphemeralDir, PlatformError> {
         check_name(name)?;
-        let (parent, _) = verified_dir(parent, false)?;
+        let (parent, _) = verified_dir(parent)?;
         let path = parent.join(name);
-        create_dir(&path, false)
+        mkdir_private(&path)
             .map_err(|error| PlatformError::io("create_ephemeral_directory", &path, error))?;
         let mut directory = EphemeralDir { path, active: true };
-        let (canonical, _) = verified_dir(&directory.path, true)?;
+        restore_owned_directory_mode(&directory.path)?;
+        let (canonical, _) = verified_dir(&directory.path)?;
         directory.path = canonical;
         Ok(directory)
     }
 
+    /// Wipe during startup under the exclusive instance lock, before issuing any
+    /// ephemeral guards. Each guard owns its entry name until cleanup completes.
     pub fn wipe_private_dir_contents(dir: &Path) -> Result<(), PlatformError> {
-        let (dir, _) = verified_dir(dir, false)?;
+        let (dir, _) = verified_dir(dir)?;
         wipe_contents(&dir)
     }
 
@@ -525,14 +566,24 @@ impl PrivateFs {
             });
         }
 
+        let target_ancestors = if forbidden_roots.is_empty() {
+            Vec::new()
+        } else {
+            ancestor_ids(&target.primary)?
+        };
         for forbidden in forbidden_roots {
             let raw = checked_absolute_path(forbidden, true)?;
             let forbidden = resolve_forbidden_root(raw)?;
-            if std::iter::once(path).chain(target.iter()).any(|candidate| {
-                std::iter::once(raw).chain(forbidden.iter()).any(|root| {
-                    candidate.starts_with(root) || (expect_dir && root.starts_with(candidate))
-                })
-            }) {
+            let lexical_overlap = std::iter::once(path).chain(target.iter()).any(|candidate| {
+                std::iter::once(raw)
+                    .chain(forbidden.paths.iter())
+                    .any(|root| {
+                        candidate.starts_with(root) || (expect_dir && root.starts_with(candidate))
+                    })
+            });
+            if lexical_overlap
+                || forbidden.overlaps_by_identity(&target_ancestors, &original, expect_dir)?
+            {
                 return Err(PlatformError::ForbiddenRoot {
                     path: target.primary,
                 });
@@ -568,7 +619,40 @@ impl PrivateFs {
     }
 }
 
-fn resolve_forbidden_root(path: &Path) -> Result<CanonicalPaths, PlatformError> {
+// Unix realpath can preserve alternate spellings of a case-folded directory.
+// Compare existing directory identities as well as component-wise path forms.
+fn ancestor_ids(path: &Path) -> Result<Vec<(u64, u64)>, PlatformError> {
+    path.ancestors()
+        .map(|ancestor| {
+            let metadata = fs::metadata(ancestor)
+                .map_err(|error| PlatformError::io("inspect_ancestor", ancestor, error))?;
+            Ok((metadata.dev(), metadata.ino()))
+        })
+        .collect()
+}
+
+struct ForbiddenRoot {
+    paths: CanonicalPaths,
+    anchor: PathBuf,
+    anchor_id: (u64, u64),
+    planned: bool,
+}
+
+impl ForbiddenRoot {
+    fn overlaps_by_identity(
+        &self,
+        target_ancestors: &[(u64, u64)],
+        target: &Metadata,
+        directory: bool,
+    ) -> Result<bool, PlatformError> {
+        if !self.planned && target_ancestors.contains(&self.anchor_id) {
+            return Ok(true);
+        }
+        Ok(directory && ancestor_ids(&self.anchor)?.contains(&(target.dev(), target.ino())))
+    }
+}
+
+fn resolve_forbidden_root(path: &Path) -> Result<ForbiddenRoot, PlatformError> {
     let mut missing = Vec::new();
     for ancestor in path.ancestors() {
         if entry_metadata(ancestor)?.is_some() {
@@ -576,9 +660,14 @@ fn resolve_forbidden_root(path: &Path) -> Result<CanonicalPaths, PlatformError> 
             let metadata = fs::symlink_metadata(&canonical)
                 .map_err(|error| PlatformError::io("inspect_forbidden_root", &canonical, error))?;
             check_type(&canonical, &metadata, true)?;
-            let mut paths = CanonicalPaths::new(canonical, &metadata)?;
+            let mut paths = CanonicalPaths::new(canonical.clone(), &metadata)?;
             paths.append_missing(&missing);
-            return Ok(paths);
+            return Ok(ForbiddenRoot {
+                paths,
+                anchor: canonical,
+                anchor_id: (metadata.dev(), metadata.ino()),
+                planned: !missing.is_empty(),
+            });
         }
         let name = ancestor
             .file_name()
@@ -590,6 +679,7 @@ fn resolve_forbidden_root(path: &Path) -> Result<CanonicalPaths, PlatformError> 
 
 /// An owned temporary secret file. Dropping it attempts to unlink it.
 #[derive(Debug)]
+#[must_use = "keep the guard until the secret file can be removed"]
 pub struct EphemeralSecretFile {
     path: PathBuf,
     active: bool,
@@ -623,6 +713,7 @@ impl Drop for EphemeralSecretFile {
 
 /// An owned temporary directory. Dropping it attempts to remove the tree.
 #[derive(Debug)]
+#[must_use = "keep the guard until the directory can be removed"]
 pub struct EphemeralDir {
     path: PathBuf,
     active: bool,
@@ -664,9 +755,7 @@ fn remove_directory_tree(path: &Path) -> Result<(), PlatformError> {
     match ignore_missing(fs::remove_dir_all(path)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            let directory = open_directory(path)?;
-            check_owner(path, &fd_metadata(path, &directory)?, current_euid())?;
-            set_mode(path, &directory, PRIVATE_DIR_MODE)?;
+            restore_owned_directory_mode(path)?;
             wipe_contents(path)?;
             ignore_missing(fs::remove_dir(path))
                 .map_err(|error| PlatformError::io("remove_directory", path, error))
@@ -698,6 +787,49 @@ fn wipe_contents(dir: &Path) -> Result<(), PlatformError> {
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
+
+    #[test]
+    fn root_identity_checks_existing_and_planned_directories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TestDir::new()?;
+        let work = dir.path().join("work");
+        let state = work.join("state");
+        fs::create_dir_all(&state)?;
+        let existing = resolve_forbidden_root(&state)?;
+        let planned = resolve_forbidden_root(&state.join("future"))?;
+        let state_ids = ancestor_ids(&state)?;
+        assert!(existing.overlaps_by_identity(&state_ids, &fs::metadata(&state)?, false)?);
+        assert!(planned.overlaps_by_identity(
+            &ancestor_ids(&work)?,
+            &fs::metadata(&work)?,
+            true
+        )?);
+        assert!(!planned.overlaps_by_identity(&state_ids, &fs::metadata(&state)?, false)?);
+        Ok(())
+    }
+
+    #[test]
+    fn read_reopens_an_inode_unlinked_during_publication() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = TestDir::new()?;
+        let path = dir.path().join("config");
+        PrivateFs::write_private_file_atomic(dir.path(), "config", b"old")?;
+        let mut old = Some(File::open(&path)?);
+        PrivateFs::write_private_file_atomic(dir.path(), "config", b"new")?;
+        let (mut file, _) = open_linked_file(&path, || {
+            if let Some(file) = old.take() {
+                let metadata = fd_metadata(&path, &file)?;
+                assert_eq!(metadata.nlink(), 0);
+                Ok((file, metadata))
+            } else {
+                open_regular_file(&path)
+            }
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"new");
+        Ok(())
+    }
 
     #[test]
     fn startup_volume_forms_require_the_same_inode_and_keep_the_future_suffix()

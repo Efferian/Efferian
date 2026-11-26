@@ -1,10 +1,10 @@
 use std::io;
 use std::mem::MaybeUninit;
-use std::process::ExitStatus;
+use std::process::{Child, ExitStatus};
 use std::time::Duration;
 
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::{MonoInstant, MonotonicClock, PlatformError};
 
@@ -37,10 +37,17 @@ enum Cleanup {
 /// separately. Other code must leave collection of the leader to this handle.
 /// Cleanup covers signalable members of the original group while Node is alive.
 ///
-/// Use a Tokio runtime with its I/O and time drivers enabled.
+/// Spawn on a thread with SIGCHLD unblocked in a Tokio runtime with its I/O
+/// and time drivers enabled. Keep SIGCHLD deliverable to the process and leave
+/// its handler and leader collection under runtime and handle ownership.
 #[derive(Debug)]
+#[must_use = "retain the handle until the process group has been cleaned up"]
 pub struct ProcessHandle {
     child: Child,
+    exits: Signal,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
     pid: libc::pid_t,
     cleanup: Cleanup,
 }
@@ -52,33 +59,95 @@ impl ProcessHandle {
     ///
     /// May panic outside a Tokio runtime with an enabled I/O driver.
     pub fn spawn_isolated_group(cmd: &mut Command) -> Result<Self, PlatformError> {
+        Self::spawn_with_registration(cmd, Self::register_pipes)
+    }
+
+    fn spawn_with_registration(
+        cmd: &mut Command,
+        register: impl FnOnce(&mut Self) -> io::Result<()>,
+    ) -> Result<Self, PlatformError> {
+        let exits = signal(SignalKind::child())
+            .map_err(|error| PlatformError::process_io("subscribe_child_exit", error))?;
+        check_child_signal_environment()
+            .map_err(|error| PlatformError::process_io("check_child_signal", error))?;
         let mut child = cmd
             .process_group(0)
-            .kill_on_drop(false)
+            .as_std_mut()
             .spawn()
             .map_err(|error| PlatformError::process_io("spawn_process_group", error))?;
-        let id = child.id().unwrap_or(0);
+        let id = child.id();
         let Some(pid) = libc::pid_t::try_from(id).ok().filter(|&pid| pid > 1) else {
-            let _ = child.start_kill();
+            child
+                .kill()
+                .and_then(|()| child.wait())
+                .map_err(|error| PlatformError::process_io("rollback_process_leader", error))?;
             return Err(PlatformError::InvalidProcessGroup { pid: id });
         };
-        Ok(Self {
+        let mut handle = Self {
             child,
             pid,
+            exits,
+            stdin: None,
+            stdout: None,
+            stderr: None,
             cleanup: Cleanup::Waiting,
-        })
+        };
+        if let Err(error) = register(&mut handle) {
+            // The kernel has already started the command. Keep ownership until
+            // the group is signalled and the leader is collected on rollback.
+            let exited = handle.leader_exited()?;
+            let group = handle.signal_group(libc::SIGKILL);
+            if !exited {
+                handle
+                    .child
+                    .kill()
+                    .map_err(|error| PlatformError::process_io("rollback_kill", error))?;
+            }
+            handle
+                .child
+                .wait()
+                .map_err(|error| PlatformError::process_io("rollback_wait", error))?;
+            group?;
+            return Err(PlatformError::process_io(
+                "register_process_pipes_after_spawn",
+                error,
+            ));
+        }
+        Ok(handle)
+    }
+
+    fn register_pipes(&mut self) -> io::Result<()> {
+        self.stdin = self
+            .child
+            .stdin
+            .take()
+            .map(ChildStdin::from_std)
+            .transpose()?;
+        self.stdout = self
+            .child
+            .stdout
+            .take()
+            .map(ChildStdout::from_std)
+            .transpose()?;
+        self.stderr = self
+            .child
+            .stderr
+            .take()
+            .map(ChildStderr::from_std)
+            .transpose()?;
+        Ok(())
     }
 
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
-        self.child.stdin.take()
+        self.stdin.take()
     }
 
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.child.stdout.take()
+        self.stdout.take()
     }
 
     pub fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.child.stderr.take()
+        self.stderr.take()
     }
 
     /// Wait for the leader, clean up its original group, and return its status.
@@ -90,20 +159,9 @@ impl ProcessHandle {
     /// May panic outside a Tokio runtime with I/O enabled. Resuming an
     /// interrupted grace period also requires the time driver.
     pub async fn wait_and_cleanup(&mut self) -> Result<ExitStatus, PlatformError> {
-        self.child.stdin.take();
+        self.stdin.take();
         if matches!(self.cleanup, Cleanup::Waiting) {
-            let mut exits = signal(SignalKind::child())
-                .map_err(|error| PlatformError::process_io("subscribe_child_exit", error))?;
-            // Subscribe before the first probe so an exit between probing and
-            // awaiting the signal still wakes this method.
-            while !self.leader_exited()? {
-                if exits.recv().await.is_none() {
-                    return Err(PlatformError::process_io(
-                        "receive_child_exit",
-                        io::ErrorKind::BrokenPipe.into(),
-                    ));
-                }
-            }
+            self.observe_exit().await?;
             self.cleanup = Cleanup::Escalating;
         }
         let (status, _) = self.finish_cleanup().await?;
@@ -124,7 +182,7 @@ impl ProcessHandle {
         &mut self,
         grace: Duration,
     ) -> Result<TerminateOutcome, PlatformError> {
-        self.child.stdin.take();
+        self.stdin.take();
         if matches!(self.cleanup, Cleanup::Waiting) {
             self.cleanup = if grace.is_zero() {
                 Cleanup::Escalating
@@ -170,17 +228,17 @@ impl ProcessHandle {
             // The direct child is still our responsibility even if it moved.
             if !self.leader_exited()? {
                 self.child
-                    .start_kill()
+                    .kill()
                     .map_err(|error| PlatformError::process_io("kill_process_leader", error))?;
             }
             self.cleanup = Cleanup::Reaping(TerminateOutcome::LeaderPendingAtKill);
         }
         match self.cleanup {
             Cleanup::Reaping(outcome) => {
+                self.observe_exit().await?;
                 let status = self
                     .child
                     .wait()
-                    .await
                     .map_err(|error| PlatformError::process_io("reap_process_leader", error))?;
                 self.cleanup = Cleanup::Cleaned(status);
                 Ok((status, outcome))
@@ -195,6 +253,18 @@ impl ProcessHandle {
                 io::Error::other("cleanup was never started"),
             )),
         }
+    }
+
+    async fn observe_exit(&mut self) -> Result<(), PlatformError> {
+        while !self.leader_exited()? {
+            if self.exits.recv().await.is_none() {
+                return Err(PlatformError::process_io(
+                    "receive_child_exit",
+                    io::ErrorKind::BrokenPipe.into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn signal_group(&self, signal: libc::c_int) -> Result<(), PlatformError> {
@@ -245,6 +315,32 @@ impl ProcessHandle {
     }
 }
 
+fn check_child_signal_environment() -> io::Result<()> {
+    let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
+    let mut action = MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: null input pointers query the current mask and disposition. The
+    // output storage is aligned and only inspected after the call succeeds.
+    unsafe {
+        let err = libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), mask.as_mut_ptr());
+        if err != 0 {
+            return Err(io::Error::from_raw_os_error(err));
+        }
+        if libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let action = action.assume_init();
+        if libc::sigismember(mask.as_ptr(), libc::SIGCHLD) != 0
+            || action.sa_flags & libc::SA_NOCLDWAIT != 0
+            || matches!(action.sa_sigaction, libc::SIG_IGN | libc::SIG_DFL)
+        {
+            return Err(io::Error::other(
+                "SIGCHLD must be deliverable and child status retained",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn is_exit_event(code: libc::c_int) -> bool {
     // Linux can report a ptrace stop even when waitid requests only WEXITED.
     matches!(code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED)
@@ -253,6 +349,84 @@ fn is_exit_event(code: libc::c_int) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_registration_cleans_up_the_spawned_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Read;
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30 & printf x; wait"])
+            .stdout(Stdio::piped());
+        cmd.kill_on_drop(true);
+        let mut pipe = None;
+        let error = ProcessHandle::spawn_with_registration(&mut cmd, |handle| {
+            let mut out = handle
+                .child
+                .stdout
+                .take()
+                .ok_or(io::Error::other("missing pipe"))?;
+            // The worker already inherited the write end when the leader prints x.
+            let mut ready = [0];
+            out.read_exact(&mut ready)?;
+            assert_eq!(ready, [b'x']);
+            pipe = Some(ChildStdout::from_std(out)?);
+            Err(io::Error::other("injected registration failure"))
+        });
+        assert!(matches!(
+            error,
+            Err(PlatformError::Io {
+                operation: "register_process_pipes_after_spawn",
+                ..
+            })
+        ));
+        assert!(cmd.get_kill_on_drop());
+        let mut pipe = pipe.ok_or("missing worker pipe")?;
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), pipe.read_to_end(&mut output)).await??;
+        assert!(output.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_sigchld_is_reported_before_spawn() -> Result<(), Box<dyn std::error::Error>> {
+        // A dedicated test thread owns its signal mask until it exits.
+        std::thread::spawn(|| -> io::Result<()> {
+            let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: sigemptyset initializes the mask used by the next two calls.
+            // pthread_sigmask changes only this test thread and retains no pointer.
+            unsafe {
+                if libc::sigemptyset(mask.as_mut_ptr()) != 0
+                    || libc::sigaddset(mask.as_mut_ptr(), libc::SIGCHLD) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                let error =
+                    libc::pthread_sigmask(libc::SIG_BLOCK, mask.as_ptr(), std::ptr::null_mut());
+                if error != 0 {
+                    return Err(io::Error::from_raw_os_error(error));
+                }
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let _entered = runtime.enter();
+            let result = ProcessHandle::spawn_isolated_group(&mut Command::new("/bin/true"));
+            assert!(matches!(
+                result,
+                Err(PlatformError::Io {
+                    operation: "check_child_signal",
+                    ..
+                })
+            ));
+            Ok(())
+        })
+        .join()
+        .map_err(|_| "test thread failed")??;
+        Ok(())
+    }
 
     #[test]
     fn only_exit_events_indicate_leader_completion() {
@@ -272,7 +446,6 @@ mod tests {
         handle
             .child
             .wait()
-            .await
             .map_err(|error| PlatformError::process_io("test_reap", error))?;
 
         assert!(matches!(

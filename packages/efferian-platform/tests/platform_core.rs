@@ -68,10 +68,10 @@ fn sidecar_names_and_contention() -> TestResult {
         FileLock::acquire_exclusive(&path),
         Err(PlatformError::LockContended { .. })
     ));
-    FileLock::acquire_exclusive(&dir.path().join("node.lock"))?;
+    drop(FileLock::acquire_exclusive(&dir.path().join("node.lock"))?);
     drop(lock);
     assert!(path.is_file());
-    FileLock::acquire_exclusive(&path)?;
+    drop(FileLock::acquire_exclusive(&path)?);
     Ok(())
 }
 
@@ -79,7 +79,7 @@ fn sidecar_names_and_contention() -> TestResult {
 fn sidecar_rejects_aliases_non_regular_files_and_wide_permissions() -> TestResult {
     let dir = TestDir::new()?;
     let path = dir.path().join("hub.lock");
-    FileLock::acquire_exclusive(&path)?;
+    drop(FileLock::acquire_exclusive(&path)?);
     let alias = dir.path().join("alias.lock");
 
     symlink(&path, &alias)?;
@@ -147,6 +147,36 @@ fn private_directories_check_the_raw_leaf_and_allow_an_ancestor_alias() -> TestR
         Err(PlatformError::InsecurePermissions { mode: 0o755, .. })
     ));
     assert_eq!(mode(&wide)?, 0o755);
+    Ok(())
+}
+
+#[test]
+fn created_objects_have_exact_modes_under_restrictive_umask() -> TestResult {
+    const BASE: &str = "EFFERIAN_TEST_UMASK_DIR";
+    if let Some(base) = std::env::var_os(BASE) {
+        let base = PathBuf::from(base);
+        let parent = base.join("ancestor");
+        let leaf = PrivateFs::ensure_private_dir(&parent.join("leaf"))?;
+        assert_eq!(mode(&parent)?, 0o700);
+        assert_eq!(mode(&leaf)?, 0o700);
+        let lock = FileLock::acquire_exclusive(&leaf.join("hub.lock"))?;
+        assert_eq!(mode(lock.path())?, 0o600);
+        let ephemeral = PrivateFs::create_ephemeral_dir(&leaf, "temporary")?;
+        assert_eq!(mode(ephemeral.path())?, 0o700);
+        return Ok(());
+    }
+    let dir = TestDir::new()?;
+    set_mode(dir.path(), 0o2700)?;
+    let status = Command::new("/bin/sh")
+        .args(["-c", "umask 0777; exec \"$@\"", "sh"])
+        .arg(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "created_objects_have_exact_modes_under_restrictive_umask",
+        ])
+        .env(BASE, dir.path())
+        .status()?;
+    assert!(status.success());
     Ok(())
 }
 
@@ -287,7 +317,7 @@ fn ephemeral_resources_clean_up_on_drop_and_on_explicit_removal() -> TestResult 
     assert!(PrivateFs::create_ephemeral_dir(dir.path(), "execution").is_err());
     let nested = PrivateFs::ensure_private_dir(&path.join("nested"))?;
     fs::write(nested.join("script"), b"script")?;
-    set_mode(&nested, 0o500)?;
+    set_mode(&nested, 0o000)?;
     drop(eph);
     assert!(!path.exists());
 
@@ -306,6 +336,10 @@ fn wiping_preserves_the_private_root_and_does_not_follow_symlinks() -> TestResul
     let nested = PrivateFs::ensure_private_dir(&root.join("nested/readonly"))?;
     fs::write(nested.join("remove"), b"remove")?;
     symlink(&outside, nested.join("link"))?;
+    let unreadable = nested.join("private");
+    fs::create_dir(&unreadable)?;
+    fs::write(unreadable.join("remove"), b"remove")?;
+    set_mode(&unreadable, 0o000)?;
     set_mode(&nested, 0o500)?;
     symlink(&outside, root.join("link"))?;
     fs::write(root.join("file"), b"remove")?;
