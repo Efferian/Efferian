@@ -1,6 +1,6 @@
 # Efferian
 
-Efferian is a distributed agent tools platform. The Rust workspace provides the build foundation and shared OS primitives for the Hub, Node and CLI. Each executable installs the ring TLS provider at startup.
+Efferian is a distributed agent tools platform. The Hub, Node and CLI share a Rust workspace with protocol contracts, authorization rules and OS primitives. Each executable installs the ring TLS provider at startup.
 
 ## Build from a clean checkout
 
@@ -30,7 +30,7 @@ DevKit builds each application separately so Cargo resolves its production featu
 | `apps/node` | Node executable | Protocol, Platform with `process` |
 | `apps/cli` | Command-line executable | Protocol, Platform, Client |
 
-`make check` runs formatting and Clippy, checks dependency declarations, scans the entire lockfile and inspects the features Cargo actually compiled for each binary. It also checks tracked text for local home paths and private-key headers and enforces the ten-block unsafe budget in Platform. The Rust line-count report is informational. `make test` includes a fresh-process TLS check and a network-free MCP transport test using the locked SDK.
+`make check` runs formatting and Clippy, checks dependency declarations, scans the entire lockfile and inspects the features Cargo actually compiled for each binary. It also checks tracked text for local home paths and private-key headers and enforces the ten-block unsafe budget in Platform. The Rust line-count report is informational. `make test` includes a fresh-process TLS check and a network-free MCP transport test using the locked SDK. Protocol integration tests also run with the Hub’s optional `openapi` feature to check the generated schemas against their wire representations.
 
 ## Platform primitives
 

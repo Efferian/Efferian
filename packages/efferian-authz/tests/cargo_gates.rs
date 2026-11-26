@@ -232,6 +232,9 @@ fn gate_crate_dag() -> Result {
             return Err(format!("{name}/{feature} must default off").into());
         }
     }
+    let pure_crate_exclusions = &["tokio", "rusqlite", "axum", "reqwest", "rmcp", "jsonschema"];
+    check_runtime_graph(PROTOCOL, pure_crate_exclusions)?;
+    check_runtime_graph(AUTHZ, pure_crate_exclusions)?;
     check_runtime_graph(CLIENT, &["rusqlite", "axum", "rmcp"])?;
     check_runtime_graph(NODE, &["axum", "rmcp", AUTHZ, "chacha20poly1305"])?;
     check_runtime_graph(CLI, &["rusqlite", "axum", "rmcp", "chacha20poly1305"])?;
