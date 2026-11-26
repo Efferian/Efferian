@@ -101,7 +101,7 @@ impl<'a> Bytes<'a> {
     fn tlv(&mut self) -> Option<(u8, &'a [u8])> {
         let tag = self.byte()?;
         // All tags in the supported containers use the low-tag-number form.
-        if tag & 0x1f == 0x1f {
+        if tag == 0 || tag & 0x1f == 0x1f {
             return None;
         }
         let first = self.byte()?;
@@ -168,14 +168,17 @@ fn valid_der(bytes: &[u8], container: Container) -> Option<()> {
             let mut algorithm = Bytes(fields.field(0x30)?);
             valid_oid(algorithm.nonempty(0x06)?)?;
             if !algorithm.0.is_empty() {
-                algorithm.tlv()?;
+                let (tag, value) = algorithm.tlv()?;
+                if tag & 0x20 != 0 {
+                    valid_der_fields(value)?;
+                }
             }
             algorithm.end()?;
             fields.nonempty(0x04)?;
             if fields.next_tag() == Some(0xa0) {
                 let mut attributes = Bytes(fields.field(0xa0)?);
                 while !attributes.0.is_empty() {
-                    attributes.nonempty(0x30)?;
+                    valid_der_fields(attributes.nonempty(0x30)?)?;
                 }
             }
             let has_public_key = fields.next_tag() == Some(0x81);
@@ -207,9 +210,7 @@ fn valid_der(bytes: &[u8], container: Container) -> Option<()> {
                 let mut params = Bytes(fields.field(0xa0)?);
                 match params.tlv()? {
                     (0x06, oid) => valid_oid(oid)?,
-                    (0x30, sequence) => {
-                        nonempty(sequence)?;
-                    }
+                    (0x30, sequence) => valid_der_fields(nonempty(sequence)?)?,
                     _ => return None,
                 }
                 params.end()?;
@@ -223,6 +224,19 @@ fn valid_der(bytes: &[u8], container: Container) -> Option<()> {
         _ => return None,
     }
     fields.end()
+}
+
+fn valid_der_fields(bytes: &[u8]) -> Option<()> {
+    let mut pending = vec![Bytes(bytes)];
+    while let Some(mut fields) = pending.pop() {
+        while !fields.0.is_empty() {
+            let (tag, value) = fields.tlv()?;
+            if tag & 0x20 != 0 {
+                pending.push(Bytes(value));
+            }
+        }
+    }
+    Some(())
 }
 
 fn valid_oid(oid: &[u8]) -> Option<()> {

@@ -1,29 +1,30 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::TraceId;
+use crate::{TraceId, wire::wire_struct};
 
 pub const PROBLEM_JSON_MEDIA_TYPE: &str = "application/problem+json";
 
-/// RFC 9457 response emitted by Efferian. Readers ignore unknown top-level extensions.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct ProblemDetails {
-    #[serde(rename = "type")]
-    pub problem_type: String,
-    pub title: String,
-    pub status: u16,
-    pub code: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<String>,
-    pub retryable: bool,
-    pub trace_id: TraceId,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub extensions: BTreeMap<String, Value>,
+wire_struct! {
+    []
+    /// RFC 9457 response emitted by Efferian. Readers ignore unknown top-level extensions.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct ProblemDetails {
+        #[serde(rename = "type")]
+        pub problem_type: String,
+        pub title: String,
+        pub status: u16,
+        pub code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub instance: Option<String>,
+        pub retryable: bool,
+        pub trace_id: TraceId,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub extensions: BTreeMap<String, Value>,
+    }
 }
 
 impl ProblemDetails {

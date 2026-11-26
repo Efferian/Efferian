@@ -5,8 +5,6 @@ use std::{
     fmt,
 };
 
-use serde::Deserialize;
-
 use crate::{
     EgressPolicy, ExecuteReqPayload, HttpMethod, MAX_OUTPUT_BYTES, ToolKind, ValidationError,
     validate::*, validate_egress_url, validate_ssh_private_key_pem,
@@ -16,7 +14,8 @@ pub const MAX_RESOLVED_ACTION_BYTES: usize = 256 * 1024;
 
 strict_enum! {
     tag = "kind",
-    #[derive(Clone, PartialEq, Eq, Deserialize)]
+    decode = object,
+    #[derive(Clone, PartialEq, Eq)]
     pub enum ResolvedAction {
         Command {
             program: String,

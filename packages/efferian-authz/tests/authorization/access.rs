@@ -171,41 +171,126 @@ fn archived_bindings_require_visibility_and_evidence_for_a_narrowed_target() {
         vec![grant(profile, Capability::Invoke)],
     );
     let target = node(None);
+    let removed = ArchivedDependency::Tool {
+        target_evidence: None,
+    };
     assert_eq!(
-        check_archived_invoke_metadata(&member, Some(profile), None),
+        check_archived_invoke_metadata(&member, Some(profile), removed),
         Ok(())
     );
     member.token.allowed_nodes = Some(BTreeSet::from([target.node_id]));
     denied(
-        check_archived_invoke_metadata(&member, Some(profile), None),
+        check_archived_invoke_metadata(&member, Some(profile), removed),
         AuthzError::ResourceNotFound,
         404,
         "not_found",
     );
-    assert_eq!(
-        check_archived_invoke_metadata(&member, Some(profile), Some(managed(&target))),
-        Ok(())
-    );
+    let account_removed = ArchivedDependency::Account {
+        target: managed(&target),
+    };
+    let tool_removed_with_evidence = ArchivedDependency::Tool {
+        target_evidence: Some(managed(&target)),
+    };
+    for archived in [account_removed, tool_removed_with_evidence] {
+        assert_eq!(
+            check_archived_invoke_metadata(&member, Some(profile), archived),
+            Ok(())
+        );
+    }
     let other = node(None);
     denied(
-        check_archived_invoke_metadata(&member, Some(profile), Some(managed(&other))),
+        check_archived_invoke_metadata(
+            &member,
+            Some(profile),
+            ArchivedDependency::Account {
+                target: managed(&other),
+            },
+        ),
         AuthzError::ResourceNotFound,
         404,
         "not_found",
     );
     denied(
-        check_archived_invoke_metadata(&member, None, Some(managed(&target))),
+        check_archived_invoke_metadata(&member, None, account_removed),
         AuthzError::ResourceNotFound,
         404,
         "not_found",
     );
     member.caller_grants = vec![grant(profile, Capability::Discover)];
     denied(
-        check_archived_invoke_metadata(&member, Some(profile), Some(managed(&target))),
+        check_archived_invoke_metadata(&member, Some(profile), account_removed),
         AuthzError::InsufficientCapability,
         403,
         "forbidden",
     );
+}
+
+#[test]
+fn disabled_owner_cannot_distinguish_missing_tool_from_unknown_alias() {
+    let profile = ProfileId::new();
+    let mut owner = context(
+        principal(PrincipalKind::Member),
+        vec![grant(profile, Capability::Invoke)],
+    );
+    let target = node(None);
+    owner.caller.disabled_at_ms = Some(owner.now_ms);
+    for capability in [Capability::Discover, Capability::Invoke] {
+        let ctx = child_context(Some(&owner), None, vec![grant(profile, capability)]);
+        let unknown = check_profile_invoke_metadata(&ctx, Some(profile), None);
+        denied(
+            unknown.clone(),
+            AuthzError::ResourceNotFound,
+            404,
+            "not_found",
+        );
+        for target_evidence in [None, Some(managed(&target))] {
+            let missing = ArchivedDependency::Tool { target_evidence };
+            assert_eq!(
+                check_archived_invoke_metadata(&ctx, Some(profile), missing),
+                unknown
+            );
+        }
+        // The same archived binding with a live tool retains its ordinary visibility rules.
+        let deleted_account = ArchivedDependency::Account {
+            target: managed(&target),
+        };
+        assert_eq!(
+            check_archived_invoke_metadata(&ctx, Some(profile), deleted_account),
+            check_profile_invoke_metadata(&ctx, Some(profile), Some(managed(&target)))
+        );
+    }
+}
+
+#[test]
+fn an_agents_owner_sees_recorded_event_metadata_within_token_scope() {
+    let mut owner = context(principal(PrincipalKind::Member), vec![]);
+    let agent = child_context(Some(&owner), None, vec![]);
+    let event = EventAuthTarget {
+        kind: EventKind::ExecutionFinished,
+        owner_principal_id: Some(agent.caller.principal_id),
+        agent_owner_principal_id: Some(owner.caller.principal_id),
+        node_id: Some(NodeId::new()),
+        profile_id: Some(ProfileId::new()),
+    };
+    assert!(can_observe_event(&owner, &event));
+    assert!(can_observe_event(&agent, &event));
+    assert!(!can_observe_event(
+        &context(principal(PrincipalKind::Member), vec![]),
+        &event
+    ));
+    assert!(!can_observe_event(
+        &agent,
+        &EventAuthTarget {
+            owner_principal_id: Some(owner.caller.principal_id),
+            agent_owner_principal_id: None,
+            ..event
+        }
+    ));
+    owner.token.allowed_nodes = Some(BTreeSet::new());
+    assert!(!can_observe_event(&owner, &event));
+    owner.token.allowed_nodes = None;
+    owner.token.allowed_profiles = Some(BTreeSet::new());
+    assert!(!can_observe_event(&owner, &event));
 }
 
 #[test]

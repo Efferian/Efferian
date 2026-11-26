@@ -74,7 +74,8 @@ impl utoipa::ToSchema for SecretString {}
 
 strict_enum! {
     tag = "kind",
-    #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+    decode = object,
+    #[derive(Clone, PartialEq, Eq)]
     pub enum HttpAuthSecret {
         Bearer {
             token: SecretString,
@@ -87,6 +88,17 @@ strict_enum! {
             username: String,
             password: SecretString,
         },
+    }
+}
+
+impl fmt::Debug for HttpAuthSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Bearer { .. } => "HttpAuthSecret::Bearer",
+            Self::Header { .. } => "HttpAuthSecret::Header",
+            Self::Basic { .. } => "HttpAuthSecret::Basic",
+        };
+        f.debug_struct(variant).finish_non_exhaustive()
     }
 }
 
@@ -189,7 +201,8 @@ pub const MAX_SECRET_KV_ENTRIES: usize = 128;
 
 strict_enum! {
     tag = "kind",
-    #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+    decode = object,
+    #[derive(Clone, PartialEq, Eq)]
     pub enum AccountSecretPayload {
         HttpAuth {
             auth: HttpAuthSecret,
@@ -201,6 +214,14 @@ strict_enum! {
             #[serde(deserialize_with = "crate::wire::deserialize_unique_map")]
             entries: BTreeMap<String, SecretString>,
         },
+    }
+}
+
+impl fmt::Debug for AccountSecretPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccountSecretPayload")
+            .field("kind", &self.kind())
+            .finish_non_exhaustive()
     }
 }
 

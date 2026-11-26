@@ -54,7 +54,8 @@ pub(crate) fn validate_error_message(message: Option<&str>) -> Result<(), Valida
 
 strict_enum! {
     tag = "kind",
-    #[derive(Clone, PartialEq, Deserialize)]
+    decode = object,
+    #[derive(Clone, PartialEq)]
     pub enum StoredResult {
         Managed {
             stdout: String,

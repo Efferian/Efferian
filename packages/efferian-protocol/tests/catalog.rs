@@ -249,6 +249,50 @@ fn upstream_revision_captures_exact_discovery_schema_and_uses_both_deadlines() -
 }
 
 #[test]
+fn upstream_revision_applies_the_definition_budget_after_inheriting_metadata() -> Result {
+    let policy = EgressPolicy::default();
+    let upstream_id = UpstreamId::new();
+    let tool = ToolDefinition {
+        spec: ToolSpec::UpstreamRef {
+            upstream_id,
+            upstream_tool_name: "run".into(),
+            account_mode: UpstreamAccountMode::None,
+            shared_account_id: None,
+            runtime_ms: 1,
+        },
+        description: None,
+        input_schema: None,
+        annotations: None,
+    };
+    let mut discovered = DiscoveredUpstreamTool {
+        upstream_id,
+        tool_name: "run".into(),
+        description: Some(String::new()),
+        input_schema: json!({"type":"object"}),
+        annotations: Some(ToolAnnotations::default()),
+    };
+    let minimal = tool.freeze_revision(Some(&discovered), 1, 1, &policy)?;
+    let overhead = serde_json::to_vec(&minimal.definition)?.len();
+    discovered.description = Some("x".repeat(MAX_TOOL_DEFINITION_BYTES - overhead));
+    let boundary = tool.freeze_revision(Some(&discovered), 1, 1, &policy)?;
+    assert_eq!(
+        serde_json::to_vec(&boundary.definition)?.len(),
+        MAX_TOOL_DEFINITION_BYTES
+    );
+
+    discovered
+        .description
+        .as_mut()
+        .ok_or("description fixture")?
+        .push('x');
+    assert_eq!(
+        tool.freeze_revision(Some(&discovered), 1, 1, &policy),
+        Err(ValidationError::DefinitionLimit)
+    );
+    Ok(())
+}
+
+#[test]
 fn http_resolution_and_node_validation_share_the_credential_boundary() -> Result {
     let default = EgressPolicy::default();
     let id = AccountId::new();

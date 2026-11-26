@@ -152,6 +152,18 @@ fn problem_has_known_emission_fields_and_accepts_future_extensions() -> serde_js
         "trace_id": format!("req_{V7}"),
         "extensions": {"oldest_available_seq": 3, "latest_seq": 8}
     });
+    let positional = json!([
+        problem.problem_type,
+        problem.title,
+        problem.status,
+        problem.code,
+        null,
+        null,
+        problem.retryable,
+        trace_id,
+        problem.extensions,
+    ]);
+    assert!(serde_json::from_value::<ProblemDetails>(positional).is_err());
     assert_eq!(serde_json::to_value(&problem)?, expected);
     let mut newer = expected.clone();
     newer["extra"] = json!(1);

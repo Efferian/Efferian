@@ -63,14 +63,17 @@ pub fn authorize_binding_mutation(
     let active = guard(ctx)?;
     let upstream = visible_binding_upstream(active, upstream)?;
     subject.validate()?;
-    if account.kind != AccountKind::HttpAuth || account.upstream_id != Some(upstream) {
-        return Err(AuthzError::Forbidden);
-    }
-    if let BindingMutation::Remove { existing } = mutation
-        && (existing.upstream_id != upstream
-            || existing.principal_id != subject.principal_id
-            || existing.account_id != account.account_id)
-    {
+    let matches_operation = match mutation {
+        BindingMutation::Set => {
+            account.kind == AccountKind::HttpAuth && account.upstream_id == Some(upstream)
+        }
+        BindingMutation::Remove { existing } => {
+            existing.upstream_id == upstream
+                && existing.principal_id == subject.principal_id
+                && existing.account_id == account.account_id
+        }
+    };
+    if !matches_operation {
         return Err(AuthzError::Forbidden);
     }
     let member = owns_private_account(active, account)

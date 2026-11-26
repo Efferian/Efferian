@@ -36,7 +36,8 @@ fn secret_values_round_trip_with_redacted_debug() -> Result {
     };
     kv.validate()?;
     assert!(kv.ct_eq(&kv.clone()));
-    assert!(!format!("{kv:?}").contains("fake-secret"));
+    let debug = format!("{kv:?}");
+    assert!(!debug.contains("fake-secret") && !debug.contains("ssh_key"));
     Ok(())
 }
 
@@ -61,6 +62,10 @@ fn authentication_headers_use_the_secret_specific_rules() -> Result {
     ] {
         good.validate()?;
         assert!(good.ct_eq(&good.clone()));
+        let debug = format!("{good:?}");
+        for value in ["token", "Authorization", "X-Api-Key", "user"] {
+            assert!(!debug.contains(value));
+        }
     }
     for bad in [
         HttpAuthSecret::Bearer {
@@ -247,5 +252,29 @@ fn ssh_rejects_unsupported_encrypted_or_incomplete_keys() {
             validate_ssh_private_key_pem(&pem("OPENSSH PRIVATE KEY", &bad)),
             Err(SshKeyError::InvalidOpenSsh.into())
         );
+    }
+}
+
+#[test]
+fn ssh_rejects_truncated_fields_inside_constructed_der_parameters() {
+    let nested = tlv(0x30, &[0x06]); // Missing the OID length and value.
+    let sec1 = tlv(
+        0x30,
+        &[tlv(0x02, &[1]), tlv(0x04, &[1]), tlv(0xa0, &nested)].concat(),
+    );
+    let pkcs8 = tlv(
+        0x30,
+        &[
+            tlv(0x02, &[0]),
+            tlv(0x30, &[tlv(0x06, &[0x2b, 0x65, 0x70]), nested].concat()),
+            tlv(0x04, &[4, 1, 0]),
+        ]
+        .concat(),
+    );
+    for (label, bytes) in [("EC PRIVATE KEY", sec1), ("PRIVATE KEY", pkcs8)] {
+        let account = AccountSecretPayload::SshKey {
+            private_key_pem: SecretString::new(pem(label, &bytes)),
+        };
+        assert_eq!(account.validate(), Err(SshKeyError::InvalidDer.into()));
     }
 }

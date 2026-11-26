@@ -469,6 +469,29 @@ fn binding_management_checks_upstream_visibility_relationship_and_account_kind()
         authorize_binding_mutation(&admin(), missing, &owned, &shared, BindingMutation::Set),
         Ok(())
     );
+    // Historical binding cleanup still identifies the actual account by its ID.
+    let reassigned = AccountView {
+        upstream_id: Some(UpstreamId::new()),
+        ..account
+    };
+    for caller in [&member, &admin()] {
+        assert_eq!(
+            authorize_binding_mutation(
+                caller,
+                visible,
+                &owned,
+                &reassigned,
+                BindingMutation::Remove { existing: record }
+            ),
+            Ok(())
+        );
+        denied(
+            authorize_binding_mutation(caller, visible, &owned, &reassigned, BindingMutation::Set),
+            AuthzError::Forbidden,
+            403,
+            "forbidden",
+        );
+    }
     let other_binding = binding(&other, upstream_id);
     denied(
         authorize_binding_read(&member, visible, &other, &other_binding),

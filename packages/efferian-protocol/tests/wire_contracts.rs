@@ -488,6 +488,7 @@ fn grant_scope_rejects_extra_members_even_if_null() -> Result {
         assert_eq!(serde_json::from_value::<GrantScope>(expected)?, scope);
     }
     for bad in [
+        r#"["scope_kind","global"]"#,
         r#"{"scope_kind":"global","scope_id":null}"#,
         r#"{"scope_kind":"global","scope_kind":"global"}"#,
         r#"{"scope_kind":"global","extra":true}"#,
@@ -496,6 +497,23 @@ fn grant_scope_rejects_extra_members_even_if_null() -> Result {
     ] {
         assert!(serde_json::from_str::<GrantScope>(bad).is_err(), "{bad}");
     }
+    Ok(())
+}
+
+#[test]
+fn tagged_wire_objects_reject_positional_arrays() -> Result {
+    assert!(serde_json::from_str::<EventStreamFrame>(r#"["ping"]"#).is_err());
+    assert!(serde_json::from_str::<GrantScope>(r#"["global"]"#).is_err());
+    assert!(serde_json::from_str::<StoredResult>(r#"["managed","a","b",null,null]"#).is_err());
+    assert!(serde_json::from_str::<ArgBinding>(r#"["literal","value"]"#).is_err());
+    let mut payload = json!(request());
+    payload["action"] = json!(["command", "/bin/true", [], "/work", {}]);
+    let bytes =
+        serde_json::to_vec(&json!({"v":1, "epoch":7, "kind":"execute_req", "payload":payload}))?;
+    assert_eq!(
+        decode_bridge_frame(&bytes, BridgeReceiver::Node),
+        Err(BridgeCodecError::InvalidFrame)
+    );
     Ok(())
 }
 

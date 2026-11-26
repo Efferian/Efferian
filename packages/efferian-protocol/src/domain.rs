@@ -80,7 +80,7 @@ impl<'de> Deserialize<'de> for GrantScope {
             Profile { scope_id: ProfileId },
         }
 
-        Ok(match Scope::deserialize(deserializer)? {
+        Ok(match crate::wire::deserialize_object(deserializer)? {
             Scope::Global {} => Self::Global,
             Scope::Profile { scope_id } => Self::Profile(scope_id),
         })

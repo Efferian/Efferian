@@ -11,7 +11,8 @@ use crate::{
 
 strict_enum! {
     tag = "kind",
-    #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+    decode = object,
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum ValueBinding {
         Literal { value: String },
         Arg { name: String },
@@ -21,6 +22,7 @@ strict_enum! {
 
 strict_enum! {
     tag = "kind",
+    decode = custom,
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum ArgBinding {
         Literal { value: String },
@@ -73,6 +75,7 @@ impl ArgBinding {
 
 strict_enum! {
     tag = "kind",
+    decode = custom,
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum EnvBinding {
         Literal { value: String },
@@ -102,7 +105,8 @@ impl<'de> Deserialize<'de> for EnvBinding {
 
 strict_enum! {
     tag = "kind",
-    #[derive(Clone, Debug, PartialEq, Deserialize)]
+    decode = object,
+    #[derive(Clone, Debug, PartialEq)]
     pub enum HttpBodyBinding {
         LiteralText { value: String },
         LiteralJson { value: Value },

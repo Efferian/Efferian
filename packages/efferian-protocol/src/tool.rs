@@ -2,7 +2,6 @@ use crate::wire::strict_enum;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
@@ -22,7 +21,8 @@ pub const DEFAULT_UPSTREAM_HARD_TIMEOUT_MS: u64 = 300_000;
 
 strict_enum! {
     tag = "kind",
-    #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+    decode = object,
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum TargetSelector {
         Fixed { node_ids: Vec<NodeId> },
         Tag { tag: String },
@@ -76,7 +76,8 @@ strict_struct! {
 
 strict_enum! {
     tag = "kind",
-    #[derive(Clone, Debug, PartialEq, Deserialize)]
+    decode = object,
+    #[derive(Clone, Debug, PartialEq)]
     pub enum ToolSpec {
         Command {
             program: String,
@@ -232,13 +233,7 @@ impl ToolDefinition {
         self.spec.kind()
     }
 
-    /// Validate an authored definition. Upstream schema snapshots are created by freeze_revision.
-    pub fn validate(
-        &self,
-        max_runtime_ms: u64,
-        upstream_hard_timeout_ms: u64,
-        policy: &EgressPolicy,
-    ) -> Result<(), ValidationError> {
+    fn validate_size(&self) -> Result<(), ValidationError> {
         bounded_json_len(MAX_TOOL_DEFINITION_BYTES, |writer| {
             serde_json::to_writer(writer, self)
         })
@@ -246,6 +241,17 @@ impl ToolDefinition {
             BoundedJsonError::TooLarge => ValidationError::DefinitionLimit,
             BoundedJsonError::Serialization => ValidationError::InvalidJson,
         })?;
+        Ok(())
+    }
+
+    /// Validate an authored definition. Upstream schema snapshots are created by freeze_revision.
+    pub fn validate(
+        &self,
+        max_runtime_ms: u64,
+        upstream_hard_timeout_ms: u64,
+        policy: &EgressPolicy,
+    ) -> Result<(), ValidationError> {
+        self.validate_size()?;
 
         if let ToolSpec::UpstreamRef {
             upstream_tool_name,
@@ -392,14 +398,13 @@ impl ToolDefinition {
                 })
                 .ok_or(ValidationError::MissingUpstreamTool)?;
             definition.input_schema = Some(discovered.input_schema.clone());
-            definition.description = self
-                .description
-                .clone()
-                .or_else(|| discovered.description.clone());
-            definition.annotations = self
-                .annotations
-                .clone()
-                .or_else(|| discovered.annotations.clone());
+            if definition.description.is_none() {
+                definition.description.clone_from(&discovered.description);
+            }
+            if definition.annotations.is_none() {
+                definition.annotations.clone_from(&discovered.annotations);
+            }
+            definition.validate_size()?;
         }
         let schema = definition
             .input_schema

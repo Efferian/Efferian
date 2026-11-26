@@ -234,9 +234,10 @@ impl<'de> Deserialize<'de> for EventEnvelope {
 
 strict_enum! {
     tag = "type",
+    decode = object,
     // Inline storage avoids an extra allocation for each event in the stream.
     #[allow(clippy::large_enum_variant)]
-    #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum EventStreamFrame {
         Event {
             event: EventEnvelope,

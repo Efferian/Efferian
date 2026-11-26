@@ -22,6 +22,19 @@ pub enum ExecutionTarget<'a> {
     },
 }
 
+/// The dependency missing from an exact retained binding. Target evidence from
+/// a deleted tool can establish scope for an active caller. Only a surviving
+/// tool can establish route visibility during an activity failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchivedDependency<'a> {
+    Tool {
+        target_evidence: Option<ExecutionTarget<'a>>,
+    },
+    Account {
+        target: ExecutionTarget<'a>,
+    },
+}
+
 pub fn authorize_profile_discover(
     ctx: &AuthContext,
     published_profile: Option<ProfileId>,
@@ -68,16 +81,29 @@ pub fn authorize_profile_invoke(
 pub fn check_archived_invoke_metadata(
     ctx: &AuthContext,
     published_profile: Option<ProfileId>,
-    target: Option<ExecutionTarget<'_>>,
+    missing: ArchivedDependency<'_>,
 ) -> Result<(), AuthzError> {
     let checked = verify_context(ctx)?;
-    let activity = checked.active(Phase::Invoke);
-    if let Err(error) = &activity
-        && *error != AuthzError::OwnerDisabled
-    {
-        return Err(error.clone());
+    if let Err(error) = checked.active(Phase::Invoke) {
+        if error == AuthzError::OwnerDisabled {
+            let live_target = match missing {
+                ArchivedDependency::Tool { .. } => None,
+                ArchivedDependency::Account { target } => Some(target),
+            };
+            return Err(disabled_owner_invoke_error(
+                checked,
+                published_profile,
+                live_target,
+            ));
+        }
+        return Err(error);
     }
+
     let capability = discover(checked, published_profile)?;
+    let target = match missing {
+        ArchivedDependency::Tool { target_evidence } => target_evidence,
+        ArchivedDependency::Account { target } => Some(target),
+    };
     match target {
         Some(target) => {
             check_target_scope(checked, target).map_err(|_| AuthzError::ResourceNotFound)?
@@ -89,8 +115,7 @@ pub fn check_archived_invoke_metadata(
         }
         None => {}
     }
-    require_invoke(capability)?;
-    activity.map(|_| ())
+    require_invoke(capability)
 }
 
 pub fn authorize_tool_test(
