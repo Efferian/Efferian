@@ -1,0 +1,187 @@
+{
+  "services": {
+    "cli": {
+      "image": "${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}",
+      "init": true,
+      "user": "${DEVKIT_UID:?}:${DEVKIT_GID:?}",
+      "working_dir": "/workspace/apps/cli",
+      "command": [
+        "cargo",
+        "run",
+        "--manifest-path",
+        "/workspace/Cargo.toml",
+        "--locked",
+        "--offline",
+        "-p",
+        "path+file:///workspace/apps/cli#efferian-cli@0.1.0"
+      ],
+      "environment": {
+        "HOME": "/tmp/devkit-home",
+        "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+        "CARGO_HOME": "/cache/cargo",
+        "CARGO_TARGET_DIR": "/workspace/target",
+        "RUSTUP_AUTO_INSTALL": "0"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}",
+          "target": "/workspace",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/target",
+          "target": "/workspace/target",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_CARGO_CACHE_DIR:?}",
+          "target": "/cache/cargo",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        }
+      ],
+      "env_file": [
+        ".devkit/runtime/api.env"
+      ],
+      "ports": [
+        "127.0.0.1:${DEVKIT_PORT_CLI:-0}:8080"
+      ]
+    },
+    "hub": {
+      "image": "${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}",
+      "init": true,
+      "user": "${DEVKIT_UID:?}:${DEVKIT_GID:?}",
+      "working_dir": "/workspace/apps/hub",
+      "command": [
+        "cargo",
+        "run",
+        "--manifest-path",
+        "/workspace/Cargo.toml",
+        "--locked",
+        "--offline",
+        "-p",
+        "path+file:///workspace/apps/hub#efferian-hub@0.1.0"
+      ],
+      "environment": {
+        "HOME": "/tmp/devkit-home",
+        "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+        "CARGO_HOME": "/cache/cargo",
+        "CARGO_TARGET_DIR": "/workspace/target",
+        "RUSTUP_AUTO_INSTALL": "0"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}",
+          "target": "/workspace",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/target",
+          "target": "/workspace/target",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_CARGO_CACHE_DIR:?}",
+          "target": "/cache/cargo",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        }
+      ],
+      "env_file": [
+        ".devkit/runtime/api.env"
+      ],
+      "ports": [
+        "127.0.0.1:${DEVKIT_PORT_HUB:-0}:8080"
+      ]
+    },
+    "node": {
+      "image": "${DEVKIT_RUST_IMAGE:-devkit-unprepared-rust}",
+      "init": true,
+      "user": "${DEVKIT_UID:?}:${DEVKIT_GID:?}",
+      "working_dir": "/workspace/apps/node",
+      "command": [
+        "cargo",
+        "run",
+        "--manifest-path",
+        "/workspace/Cargo.toml",
+        "--locked",
+        "--offline",
+        "-p",
+        "path+file:///workspace/apps/node#efferian-node@0.1.0"
+      ],
+      "environment": {
+        "HOME": "/tmp/devkit-home",
+        "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+        "CARGO_HOME": "/cache/cargo",
+        "CARGO_TARGET_DIR": "/workspace/target",
+        "RUSTUP_AUTO_INSTALL": "0"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}",
+          "target": "/workspace",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/target",
+          "target": "/workspace/target",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_CARGO_CACHE_DIR:?}",
+          "target": "/cache/cargo",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        }
+      ],
+      "env_file": [
+        ".devkit/runtime/api.env"
+      ],
+      "ports": [
+        "127.0.0.1:${DEVKIT_PORT_NODE:-0}:8080"
+      ]
+    }
+  }
+}

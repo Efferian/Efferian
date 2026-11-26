@@ -1,0 +1,29 @@
+[package]
+name = "efferian-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+efferian-authz = { workspace = true }
+efferian-platform = { workspace = true }
+efferian-protocol = { workspace = true, features = ["openapi"] }
+jsonschema = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+rusqlite = { workspace = true }
+rustls = { workspace = true }
+sse-stream = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+
+[dev-dependencies]
+efferian-client = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
