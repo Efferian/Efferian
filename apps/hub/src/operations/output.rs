@@ -63,14 +63,15 @@ impl FileOutput {
             .unwrap_or_else(|| Path::new("."));
         let parent = fs::canonicalize(parent)
             .map_err(|error| path_io("resolve output directory", parent, error))?;
-        // Opening a special file can block before its fd can be inspected.
-        let parent_meta = fs::metadata(&parent)
-            .map_err(|error| path_io("inspect output directory", &parent, error))?;
-        if !parent_meta.is_dir() {
-            return Err(invalid_output(path, "output parent is not a directory"));
-        }
-        let directory = File::open(&parent)
-            .map_err(|error| path_io("open output directory", &parent, error))?;
+        // A trailing /. requires a directory during pathname resolution, before
+        // opening a special file could block.
+        let directory = File::open(parent.join(".")).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotADirectory {
+                invalid_output(path, "output parent is not a directory")
+            } else {
+                path_io("open output directory", &parent, error)
+            }
+        })?;
         let parent_meta = directory
             .metadata()
             .map_err(|error| path_io("inspect output directory", &parent, error))?;

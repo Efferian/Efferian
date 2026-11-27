@@ -193,6 +193,26 @@ impl Fixture {
         ));
         Ok(())
     }
+
+    async fn mark_gc_purging(&self, id: PrincipalId) -> TestResult {
+        let id = id.to_string();
+        self.state
+            .storage
+            .execute_work(0, move |tx| {
+                tx.conn().execute(
+                "UPDATE principals SET name = '~purging:' || principal_id, disabled_at_ms = 1000
+                 WHERE principal_id = ?1",
+                [&id],
+            )?;
+                tx.conn().execute(
+                    "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1",
+                    [id],
+                )?;
+                Ok::<(), crate::storage::WriteTxError<ApiError>>(())
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -281,23 +301,7 @@ async fn delegated_replacement_quota_and_purging_visibility() -> TestResult {
         winner_id.to_string()
     );
 
-    let old_id = winner_id.to_string();
-    fixture
-        .state
-        .storage
-        .execute_work(0, move |tx| {
-            tx.conn().execute(
-                "UPDATE principals SET name = '~purging:' || principal_id, disabled_at_ms = 1000
-             WHERE principal_id = ?1",
-                [&old_id],
-            )?;
-            tx.conn().execute(
-                "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1",
-                [old_id],
-            )?;
-            Ok::<(), crate::storage::WriteTxError<ApiError>>(())
-        })
-        .await?;
+    fixture.mark_gc_purging(winner_id).await?;
 
     let (_, identity) = fixture.call(1, Method::GET, "/v1/me", None).await?;
     assert_eq!(identity["owned_agents"], json!([]));
@@ -316,6 +320,76 @@ async fn delegated_replacement_quota_and_purging_visibility() -> TestResult {
         .await?;
     assert_eq!(status, StatusCode::CREATED);
     assert_ne!(created["principal"]["principal_id"], winner_id.to_string());
+    fixture.stop().await
+}
+
+#[tokio::test]
+async fn promotion_checks_the_current_managed_agent_quota() -> TestResult {
+    let mut config = Config::default();
+    config.max_managed_agents_per_orchestrator = 1;
+    let fixture = Fixture::start(
+        config,
+        &[
+            ("operator", Admin, false),
+            ("owner", Member, false),
+            ("manager", Service, false),
+        ],
+        |_, _| Ok(()),
+    )?;
+    let owner = fixture.principals[1].id;
+    let manager = fixture.principals[2].id;
+    let create_agent = |name: &'static str| {
+        fixture.call(
+            0,
+            Method::PUT,
+            name,
+            Some(json!({
+                "kind": "agent",
+                "owner_principal_id": owner,
+                "managed_by_principal_id": manager,
+            })),
+        )
+    };
+    let (status, _) = create_agent("/v1/principals/first").await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, second) = create_agent("/v1/principals/second").await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let second: PrincipalId = serde_json::from_value(second["principal"]["principal_id"].clone())?;
+    let (status, _) = fixture
+        .call(
+            0,
+            Method::POST,
+            &format!("/v1/principals/{second}/disable"),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    fixture.clock.0.store(2_000, Ordering::Release);
+    let promote = || {
+        fixture.call(
+            0,
+            Method::PUT,
+            "/v1/principals/manager",
+            Some(json!({
+                "kind": "service", "is_orchestrator": true,
+            })),
+        )
+    };
+    let (status, problem) = promote().await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(problem["code"], "quota_exceeded");
+    let (status, read_back) = fixture
+        .call(0, Method::GET, "/v1/principals/manager", None)
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read_back["is_orchestrator"], false);
+    assert_eq!(read_back["updated_at_ms"], 1_000);
+
+    fixture.mark_gc_purging(second).await?;
+    let (status, promoted) = promote().await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(promoted["principal"]["is_orchestrator"], true);
     fixture.stop().await
 }
 

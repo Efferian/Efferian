@@ -336,13 +336,16 @@ pub(super) fn upsert_principal(
                 principal: existing,
             });
         }
+        if requested.is_orchestrator && !current.is_orchestrator {
+            check_managed_quota(tx.conn(), Some(&requested), config, 0)?;
+        }
         update_principal(tx, &current, &requested, now)?;
         Ok(PrincipalPutResponse {
             outcome: PutOutcome::Updated,
             principal: Principal::from_view(requested, name, existing.created_at_ms, now),
         })
     } else {
-        check_managed_quota(tx.conn(), manager.as_ref(), config)?;
+        check_managed_quota(tx.conn(), manager.as_ref(), config, 1)?;
         insert_principal(tx.conn(), &requested, &name, now)?;
         Ok(PrincipalPutResponse {
             outcome: PutOutcome::Created,
@@ -385,6 +388,7 @@ fn check_managed_quota(
     conn: &Connection,
     manager: Option<&PrincipalView>,
     config: &Config,
+    new_agents: usize,
 ) -> WriteResult<()> {
     let Some(manager) = manager else {
         return Ok(());
@@ -403,7 +407,7 @@ fn check_managed_quota(
                AND p.principal_id IS NOT h.gc_purging_principal_id",
         )?
         .query_row([manager.principal_id.to_string()], |row| row.get(0))?;
-    if count >= limit {
+    if count.saturating_add(new_agents) > limit {
         return Err(ApiError::conflict(code::QUOTA_EXCEEDED).into());
     }
     Ok(())
