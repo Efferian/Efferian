@@ -216,3 +216,36 @@ fn an_offline_commit_reports_incomplete_checkpoint_without_losing_its_value() ->
     );
     Ok(())
 }
+
+#[test]
+fn quota_preflight_preserves_larger_uncheckpointed_wal_without_a_wal_index() -> TestResult {
+    let db = TestDb::new(StorageConfig::default())?;
+    db.create(|_| Ok(()))?;
+    let conn = Connection::open(db.path())?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    conn.execute("INSERT INTO upstreams(upstream_id, slug, url, discovered_tools_json, created_at_ms, updated_at_ms)
+        VALUES ('a', 'a', 'https://example.test', hex(zeroblob(300000)), 0, 0)", [])?;
+    conn.close().map_err(|(_, e)| e)?;
+    fs::remove_file(db.dir.join("hub.sqlite3-shm"))?;
+    let wal = db.dir.join("hub.sqlite3-wal");
+    let before = (fs::read(db.path())?, fs::read(&wal)?);
+    let small = StorageConfig {
+        max_page_count: 64,
+        ..db.config.clone()
+    };
+    let result = open_existing(
+        acquire_state_lock(&db.dir)?,
+        OpenMode::ServeAutoMigrate,
+        db.expected(),
+        &small,
+        Arc::clone(&db.clock),
+    );
+    assert!(matches!(
+        result,
+        Err(StorageError::QuotaBelowCurrentPages { requested: 64, .. })
+    ));
+    assert_eq!((fs::read(db.path())?, fs::read(&wal)?), before);
+    assert_eq!(db.open(OpenMode::ServeAutoMigrate)?.hub_id(), &db.id);
+    Ok(())
+}

@@ -100,44 +100,66 @@ pub enum ReceiptOutcome {
 #[error("invalid terminal receipt metadata")]
 pub struct InvalidReceipt;
 
+impl InvokeWrite {
+    pub(crate) fn payload_bytes(&self) -> Result<usize, StorageError> {
+        Ok(serde_json::to_vec(&self.arguments)
+            .map_err(json_write_error)?
+            .len()
+            .saturating_add(self.public_name.len())
+            .saturating_add(self.requested_target.as_ref().map_or(0, String::len)))
+    }
+}
+
+pub(crate) struct PreparedReceipt {
+    receipt: ReceiptWrite,
+    summary_json: String,
+}
+
+impl PreparedReceipt {
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.summary_json
+            .len()
+            .saturating_add(self.receipt.sealed_result_blob.as_ref().map_or(0, Vec::len))
+    }
+}
+
+impl ReceiptWrite {
+    pub(crate) fn prepare(self) -> Result<PreparedReceipt, WriteError<InvalidReceipt>> {
+        if self.summary.effect_may_have_occurred.is_none()
+            || self
+                .summary
+                .error_message
+                .as_ref()
+                .is_some_and(|message| message.len() > MAX_EXECUTION_ERROR_MESSAGE_BYTES)
+            || self.sealed_result_blob.as_ref().is_some_and(Vec::is_empty)
+        {
+            return Err(WriteError::Domain(InvalidReceipt));
+        }
+        let summary_json = serde_json::to_string(&self.summary)
+            .map_err(json_write_error)
+            .map_err(StorageError::from)?;
+        Ok(PreparedReceipt {
+            receipt: self,
+            summary_json,
+        })
+    }
+}
+
 impl StorageHandle {
     pub async fn invoke(
         &self,
         request: InvokeWrite,
     ) -> Result<InvokeOutcome, WriteError<InvokeWriteError>> {
-        let bytes = serde_json::to_vec(&request.arguments)
-            .map_err(json_write_error)
-            .map_err(StorageError::from)?
-            .len()
-            .saturating_add(request.public_name.len())
-            .saturating_add(request.requested_target.as_ref().map_or(0, String::len));
-        self.execute_work(bytes, move |tx| tx.invoke(request)).await
+        self.execute_work(request.payload_bytes()?, move |tx| tx.invoke(request))
+            .await
     }
 
     pub async fn apply_receipt(
         &self,
         receipt: ReceiptWrite,
     ) -> Result<ReceiptOutcome, WriteError<InvalidReceipt>> {
-        if receipt.summary.effect_may_have_occurred.is_none()
-            || receipt
-                .summary
-                .error_message
-                .as_ref()
-                .is_some_and(|message| message.len() > MAX_EXECUTION_ERROR_MESSAGE_BYTES)
-            || receipt
-                .sealed_result_blob
-                .as_ref()
-                .is_some_and(Vec::is_empty)
-        {
-            return Err(WriteError::Domain(InvalidReceipt));
-        }
-        let summary = serde_json::to_string(&receipt.summary)
-            .map_err(json_write_error)
-            .map_err(StorageError::from)?;
-        let bytes = summary
-            .len()
-            .saturating_add(receipt.sealed_result_blob.as_ref().map_or(0, Vec::len));
-        self.execute_work(bytes, move |tx| tx.apply_receipt(receipt, summary))
+        let receipt = receipt.prepare()?;
+        self.execute_work(receipt.payload_bytes(), move |tx| tx.apply_receipt(receipt))
             .await
     }
 }
@@ -261,11 +283,14 @@ impl WriteTx<'_> {
         })
     }
 
-    fn apply_receipt(
+    pub(crate) fn apply_receipt(
         &mut self,
-        receipt: ReceiptWrite,
-        summary: String,
+        prepared: PreparedReceipt,
     ) -> Result<ReceiptOutcome, WriteTxError<InvalidReceipt>> {
+        let PreparedReceipt {
+            receipt,
+            summary_json,
+        } = prepared;
         let execution_id = receipt.execution_id.to_string();
         let node_id = receipt.node_id.to_string();
         let Some((old_state, profile, tool, public_name)) = self
@@ -317,11 +342,13 @@ impl WriteTx<'_> {
         }
 
         let bytes = receipt.sealed_result_blob.as_ref().map_or(0, Vec::len);
+        // A receipt can itself report Unknown. Record that it was seen so a
+        // retransmission does not look like the first late receipt.
         self.conn().execute(
             "UPDATE executions SET state = ?1, summary_json = ?2, sealed_result_blob = ?3, result_bytes = ?4,
                  result_truncated = ?5, finished_at_ms = ?6, late_receipt_at_ms = ?7
              WHERE execution_id = ?8",
-            params![scalar_text(state)?, summary, receipt.sealed_result_blob, bytes, receipt.result_truncated,
+            params![scalar_text(state)?, summary_json, receipt.sealed_result_blob, bytes, receipt.result_truncated,
                 receipt.finished_at_ms, (state == ExecutionState::Unknown).then_some(self.now_ms()),
                 execution_id],
         )?;

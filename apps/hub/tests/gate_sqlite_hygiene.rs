@@ -72,7 +72,7 @@ async fn gate_sqlite_hygiene() -> TestResult {
         assert_eq!(mode, "wal");
         let mut stmt = conn.prepare(
             "SELECT name FROM sqlite_schema
-            WHERE type = ?1 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            WHERE type = ?1 AND name NOT GLOB 'sqlite_*' ORDER BY name",
         )?;
         for (kind, expected) in [
             ("table", TABLES.as_slice()),

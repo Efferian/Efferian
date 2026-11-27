@@ -79,25 +79,9 @@ impl StorageHandle {
         token: TokenId,
     ) -> Result<bool, WriteError<std::convert::Infallible>> {
         self.execute_priority(PriorityKind::RevokeToken, move |tx| {
-            let changed = tx.conn().execute(
-                "UPDATE auth_tokens SET revoked_at_ms = ?1 WHERE token_id = ?2 AND revoked_at_ms IS NULL",
-                params![tx.now_ms(), token.to_string()],
-            )? == 1;
-            if changed {
-                tx.append_event(actor, Event::TokenRevoked(token))?;
-                let owner = tx.conn().query_row(
-                    "SELECT principal_id FROM auth_tokens WHERE token_id = ?1",
-                    [token.to_string()],
-                    |row| id(row, 0),
-                )?;
-                tx.stage_revocation(RevocationSignal {
-                    reason: RevocationReason::TokenRevoked(token),
-                    affected_principals: vec![owner],
-                    affected_nodes: Vec::new(),
-                });
-            }
-            Ok(changed)
-        }).await
+            Ok(tx.revoke_token(actor, token)?)
+        })
+        .await
     }
 
     pub async fn disable_principal(
@@ -106,21 +90,7 @@ impl StorageHandle {
         principal: PrincipalId,
     ) -> Result<bool, WriteError<std::convert::Infallible>> {
         self.execute_priority(PriorityKind::DisablePrincipal, move |tx| {
-            let changed = tx.conn().execute(
-                "UPDATE principals SET disabled_at_ms = ?1, updated_at_ms = ?1
-                 WHERE principal_id = ?2 AND disabled_at_ms IS NULL",
-                params![tx.now_ms(), principal.to_string()],
-            )? == 1;
-            if changed {
-                tx.append_event(actor, Event::PrincipalRevoked(principal))?;
-                stage_cascade(
-                    tx,
-                    principal,
-                    RevocationReason::PrincipalDisabled(principal),
-                    true,
-                )?;
-            }
-            Ok(changed)
+            Ok(tx.disable_principal(actor, principal)?)
         })
         .await
     }
@@ -130,18 +100,7 @@ impl StorageHandle {
         grant: GrantId,
     ) -> Result<bool, WriteError<std::convert::Infallible>> {
         self.execute_priority(PriorityKind::RevokeGrant, move |tx| {
-            let principal = tx
-                .conn()
-                .query_row(
-                    "DELETE FROM grants WHERE grant_id = ?1 RETURNING principal_id",
-                    [grant.to_string()],
-                    |row| id(row, 0),
-                )
-                .optional()?;
-            if let Some(principal) = principal {
-                stage_cascade(tx, principal, RevocationReason::GrantRevoked(grant), true)?;
-            }
-            Ok(principal.is_some())
+            Ok(tx.revoke_grant(grant)?)
         })
         .await
     }
@@ -152,15 +111,7 @@ impl StorageHandle {
         node: NodeId,
     ) -> Result<bool, WriteError<std::convert::Infallible>> {
         self.execute_priority(PriorityKind::RevokeNode, move |tx| {
-            let changed = tx.conn().execute(
-                "UPDATE nodes SET revoked_at_ms = ?1, updated_at_ms = ?1
-                 WHERE node_id = ?2 AND revoked_at_ms IS NULL",
-                params![tx.now_ms(), node.to_string()],
-            )? == 1;
-            if changed {
-                tx.append_event(actor, Event::NodeRevoked(node))?;
-            }
-            Ok(changed)
+            Ok(tx.revoke_node(actor, node)?)
         })
         .await
     }
@@ -171,22 +122,7 @@ impl StorageHandle {
         version: u64,
     ) -> Result<bool, WriteError<std::convert::Infallible>> {
         self.execute_priority(PriorityKind::DisableEdition, move |tx| {
-            let changed = tx.conn().execute(
-                "UPDATE profile_editions SET disabled_at_ms = ?1
-                 WHERE profile_id = ?2 AND version = ?3 AND disabled_at_ms IS NULL",
-                params![tx.now_ms(), profile.to_string(), version],
-            )? == 1;
-            if changed {
-                tx.stage_revocation(RevocationSignal {
-                    reason: RevocationReason::EditionDisabled {
-                        profile_id: profile,
-                        version,
-                    },
-                    affected_principals: Vec::new(),
-                    affected_nodes: Vec::new(),
-                });
-            }
-            Ok(changed)
+            Ok(tx.disable_edition(profile, version)?)
         })
         .await
     }
@@ -196,17 +132,118 @@ impl StorageHandle {
         execution: ExecutionId,
     ) -> Result<bool, WriteError<std::convert::Infallible>> {
         self.execute_priority(PriorityKind::CancelExecution, move |tx| {
-            Ok(tx.conn().execute(
-                "UPDATE executions SET cancel_requested_at_ms = ?1 WHERE execution_id = ?2
-                 AND state IN ('accepted', 'running') AND cancel_requested_at_ms IS NULL",
-                params![tx.now_ms(), execution.to_string()],
-            )? == 1)
+            Ok(tx.cancel_execution(execution)?)
         })
         .await
     }
 }
 
 impl WriteTx<'_> {
+    pub(crate) fn revoke_token(
+        &mut self,
+        actor: ActorId,
+        token: TokenId,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE auth_tokens SET revoked_at_ms = ?1 WHERE token_id = ?2 AND revoked_at_ms IS NULL",
+            params![self.now_ms(), token.to_string()],
+        )? == 1;
+        if changed {
+            self.append_event(actor, Event::TokenRevoked(token))?;
+            let owner = self.conn().query_row(
+                "SELECT principal_id FROM auth_tokens WHERE token_id = ?1",
+                [token.to_string()],
+                |row| id(row, 0),
+            )?;
+            self.stage_revocation(RevocationSignal {
+                reason: RevocationReason::TokenRevoked(token),
+                affected_principals: vec![owner],
+                affected_nodes: Vec::new(),
+            });
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn disable_principal(
+        &mut self,
+        actor: ActorId,
+        principal: PrincipalId,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE principals SET disabled_at_ms = ?1, updated_at_ms = ?1
+             WHERE principal_id = ?2 AND disabled_at_ms IS NULL",
+            params![self.now_ms(), principal.to_string()],
+        )? == 1;
+        if changed {
+            self.append_event(actor, Event::PrincipalRevoked(principal))?;
+            stage_cascade(
+                self,
+                principal,
+                RevocationReason::PrincipalDisabled(principal),
+                true,
+            )?;
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn revoke_grant(&mut self, grant: GrantId) -> rusqlite::Result<bool> {
+        let principal = self
+            .conn()
+            .query_row(
+                "DELETE FROM grants WHERE grant_id = ?1 RETURNING principal_id",
+                [grant.to_string()],
+                |row| id(row, 0),
+            )
+            .optional()?;
+        if let Some(principal) = principal {
+            stage_cascade(self, principal, RevocationReason::GrantRevoked(grant), true)?;
+        }
+        Ok(principal.is_some())
+    }
+
+    pub(crate) fn disable_edition(
+        &mut self,
+        profile: ProfileId,
+        version: u64,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE profile_editions SET disabled_at_ms = ?1
+             WHERE profile_id = ?2 AND version = ?3 AND disabled_at_ms IS NULL",
+            params![self.now_ms(), profile.to_string(), version],
+        )? == 1;
+        if changed {
+            self.stage_revocation(RevocationSignal {
+                reason: RevocationReason::EditionDisabled {
+                    profile_id: profile,
+                    version,
+                },
+                affected_principals: Vec::new(),
+                affected_nodes: Vec::new(),
+            });
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn revoke_node(&mut self, actor: ActorId, node: NodeId) -> rusqlite::Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE nodes SET revoked_at_ms = ?1, updated_at_ms = ?1
+             WHERE node_id = ?2 AND revoked_at_ms IS NULL",
+            params![self.now_ms(), node.to_string()],
+        )? == 1;
+        if changed {
+            self.append_event(actor, Event::NodeRevoked(node))?;
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn cancel_execution(&self, execution: ExecutionId) -> rusqlite::Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE executions SET cancel_requested_at_ms = ?1 WHERE execution_id = ?2
+             AND state IN ('accepted', 'running') AND cancel_requested_at_ms IS NULL",
+            params![self.now_ms(), execution.to_string()],
+        )? == 1)
+    }
+
     /// Use in the same transaction that reduces a principal's permissions.
     #[allow(dead_code, reason = "catalog and authorization write seam")]
     pub(crate) fn principal_permissions_reduced(

@@ -301,10 +301,14 @@ struct DbActor {
 
 impl DbActor {
     fn run(&mut self, db: &OpenedDb, mailbox: &Mailbox) -> Result<(), StorageError> {
-        self.maintenance.tick(db, db.clock.monotonic_now()?)?;
+        let mut timeout = Duration::ZERO;
         loop {
-            let now = db.clock.monotonic_now()?;
-            let Some(turn) = mailbox.next(self.maintenance.wait_for(db, now)) else {
+            let max_work_commands = if self.maintenance.near_event_cap(db, MAX_COMMANDS) {
+                MAX_COMMANDS / 2
+            } else {
+                MAX_COMMANDS
+            };
+            let Some(turn) = mailbox.next(timeout, max_work_commands) else {
                 return Ok(());
             };
             for (execution_id, reply) in turn.subscriptions {
@@ -318,7 +322,11 @@ impl DbActor {
                 self.execute_batch(db, turn.commands, turn.bytes)?;
             }
             if !mailbox.state().shutting_down {
-                self.maintenance.tick(db, db.clock.monotonic_now()?)?;
+                let now = db.clock.monotonic_now()?;
+                if !mailbox.state().shutting_down {
+                    self.maintenance.tick(db, now)?;
+                    timeout = self.maintenance.wait_for(db, now);
+                }
             }
         }
     }
@@ -749,7 +757,7 @@ impl Mailbox {
         state.subscriptions.clear();
     }
 
-    fn next(&self, timeout: Duration) -> Option<Turn> {
+    fn next(&self, timeout: Duration, max_work_commands: usize) -> Option<Turn> {
         let (mut state, _) = self
             .wake
             .wait_timeout_while(self.state(), timeout, |state| {
@@ -776,7 +784,7 @@ impl Mailbox {
         } else {
             state.priority_streak = 0;
             let mut remaining = MAX_WORK_BYTES;
-            while turn.commands.len() < MAX_COMMANDS
+            while turn.commands.len() < max_work_commands
                 && state
                     .work
                     .front()

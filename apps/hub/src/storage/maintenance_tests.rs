@@ -337,3 +337,35 @@ async fn agent_purge_checks_all_restrict_edges_and_resumes_after_reopen() -> Tes
     }
     Ok(())
 }
+
+#[test]
+fn later_ttl_passes_vacuum_an_existing_freelist_without_new_deletions() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let db = f.open(OpenMode::OfflineExactVersion)?;
+    let conn = &db.conn;
+    seed_execution(conn, &f, f.principal, "succeeded", 0, 9, 2_500_000)?;
+    assert_eq!(gc_transaction(conn, |tx| expire_results(tx, 0))?, 1);
+    incremental_vacuum(conn)?;
+    let before = Pages::read(conn)?;
+    assert!(before.free > 128);
+    drop(db);
+
+    let db = f.open(OpenMode::OfflineExactVersion)?;
+    let mut maintenance = Maintenance::new(&db)?;
+    for turn in 1..=2 {
+        let now = turn * db.config.gc_interval;
+        maintenance.tick(&db, now)?;
+        for _ in 0..16 {
+            if !maintenance.wait_for(&db, now).is_zero() {
+                break;
+            }
+            maintenance.tick(&db, now)?;
+        }
+        assert!(
+            !maintenance.wait_for(&db, now).is_zero(),
+            "GC did not finish its bounded pass"
+        );
+        assert_eq!(before.free - Pages::read(&db.conn)?.free, turn * 64);
+    }
+    Ok(())
+}

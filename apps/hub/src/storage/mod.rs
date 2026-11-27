@@ -3,7 +3,7 @@
 mod access;
 pub(crate) mod actor;
 mod events;
-mod executions;
+pub(crate) mod executions;
 mod lifecycle;
 mod maintenance;
 mod readers;

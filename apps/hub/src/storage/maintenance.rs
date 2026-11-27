@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use super::lifecycle::{OpenedDb, WAL_FILE, truncate_checkpoint};
 use super::{StorageError, StorageHandle};
 
 const GC_ROWS: usize = 32;
+const EVENT_PRUNE_BURST: u8 = 2;
 const SAMPLE_COMMITS: usize = 100;
 const SHORT_CHECKPOINT: Duration = Duration::from_millis(50);
 
@@ -106,14 +108,15 @@ pub(super) struct Maintenance {
     wal_path: PathBuf,
     next_wal_retry: Option<Duration>,
     next_gc: Duration,
-    next_step: Option<GcStep>,
+    scheduled_steps: VecDeque<GcStep>,
     hold_gc_until_tick: bool,
     purge_pending: bool,
     vacuum_pending: bool,
     soft_active: bool,
     soft_exhausted: bool,
     used_percent: u32,
-    pub(super) live_events_count: usize,
+    live_events_count: usize,
+    event_prune_streak: u8,
     unsampled_bytes: usize,
     unsampled_commits: usize,
 }
@@ -132,7 +135,7 @@ impl Maintenance {
                 .clock
                 .monotonic_now()?
                 .saturating_add(db.config.gc_interval),
-            next_step: None,
+            scheduled_steps: VecDeque::new(),
             hold_gc_until_tick: false,
             purge_pending,
             vacuum_pending: false,
@@ -140,6 +143,7 @@ impl Maintenance {
             soft_exhausted: false,
             used_percent,
             live_events_count,
+            event_prune_streak: 0,
             unsampled_bytes: 0,
             unsampled_commits: 0,
         })
@@ -147,6 +151,11 @@ impl Maintenance {
 
     pub(super) fn level(&self) -> StoragePressure {
         pressure(self.used_percent)
+    }
+
+    /// Slow event-producing bursts before they overtake bounded prefix pruning.
+    pub(super) fn near_event_cap(&self, db: &OpenedDb, next_batch: usize) -> bool {
+        self.live_events_count.saturating_add(next_batch) >= db.config.max_events_rows
     }
 
     pub(super) fn after_write(
@@ -188,7 +197,7 @@ impl Maintenance {
     }
 
     pub(super) fn wait_for(&self, db: &OpenedDb, now: Duration) -> Duration {
-        if self.next_step.is_some()
+        if !self.scheduled_steps.is_empty()
             || self.vacuum_pending
             || (!self.hold_gc_until_tick
                 && (self.purge_pending
@@ -206,23 +215,26 @@ impl Maintenance {
     pub(super) fn tick(&mut self, db: &OpenedDb, now: Duration) -> Result<(), StorageError> {
         if now >= self.next_gc {
             self.next_gc = now.saturating_add(db.config.gc_interval);
-            self.next_step.get_or_insert(GcStep::Results);
+            if self.scheduled_steps.is_empty() {
+                self.scheduled_steps.extend(GcStep::SCHEDULED);
+            }
+            self.vacuum_pending = true;
             self.hold_gc_until_tick = false;
             self.soft_exhausted = false;
             self.purge_pending = purging_principal(&db.conn)?.is_some();
             self.sample(db)?;
         }
-        if !self.hold_gc_until_tick {
-            if let Err(error) = self.gc_step(db) {
-                // FULL and failed FK checks must leave priority admission intact.
-                if !db.conn.is_autocommit() {
-                    return Err(error.into());
-                }
-                eprintln!("Hub SQLite garbage collection deferred: {error}");
-                self.hold_gc_until_tick = true;
-                self.next_step = None;
-                self.vacuum_pending = false;
+        if !self.hold_gc_until_tick
+            && let Err(error) = self.gc_step(db)
+        {
+            // FULL and failed FK checks must leave priority admission intact.
+            if !db.conn.is_autocommit() {
+                return Err(error.into());
             }
+            eprintln!("Hub SQLite garbage collection deferred: {error}");
+            self.hold_gc_until_tick = true;
+            self.scheduled_steps.clear();
+            self.vacuum_pending = false;
         }
         self.checkpoint_wal(db, now)
     }
@@ -235,29 +247,44 @@ impl Maintenance {
         let grace_cutoff = now.saturating_sub(db.config.token_gc_grace_ms);
         let conn = &db.conn;
 
+        let soft_pending = self.soft_active && !self.soft_exhausted;
+        let other_work_pending = self.purge_pending
+            || soft_pending
+            || !self.scheduled_steps.is_empty()
+            || self.vacuum_pending;
+        // At the cap, 16 normal single-event writes per turn leave room for
+        // two 31-event prunes and one slot for other GC every three turns.
+        if excess > 0 && (self.event_prune_streak < EVENT_PRUNE_BURST || !other_work_pending) {
+            self.event_prune_streak = self.event_prune_streak.saturating_add(1);
+            let deleted = gc_transaction(conn, |tx| prune_events(tx, now, excess))?;
+            if deleted == 0 {
+                self.live_events_count = 0;
+            } else {
+                self.record_prune(deleted);
+                self.sample(db)?;
+            }
+            return Ok(());
+        }
+        self.event_prune_streak = 0;
+
         if self.purge_pending {
             self.purge_pending = gc_transaction(conn, purge_agent_children)?;
             self.vacuum_pending = true;
             return self.sample(db);
         }
-        if self.soft_active && !self.soft_exhausted {
+        if soft_pending {
             let changed = gc_transaction(conn, |tx| expire_results(tx, i64::MAX))?;
             self.soft_exhausted = changed == 0;
             self.vacuum_pending |= changed != 0;
             return self.sample(db);
         }
 
-        let step = if excess > 0 {
-            Some(GcStep::Events)
-        } else {
-            self.next_step
-        };
-        if let Some(step) = step {
+        if let Some(step) = self.scheduled_steps.pop_front() {
             let changed = gc_transaction(conn, |tx| {
                 match step {
                 GcStep::Results => expire_results(tx, now),
                 GcStep::Executions => expire_executions(tx, now),
-                GcStep::Events => prune_events(tx, now, excess),
+                GcStep::Events => prune_events(tx, now, 0),
                 GcStep::Tokens => tx.execute(
                     "DELETE FROM auth_tokens WHERE token_id IN (
                         SELECT token_id FROM auth_tokens WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT 32)",
@@ -277,27 +304,30 @@ impl Maintenance {
             }
             })?;
             if step == GcStep::Events {
-                self.live_events_count = self.live_events_count.saturating_sub(changed);
-                if excess > 0 && changed == 0 {
-                    self.live_events_count = 0;
-                }
+                self.record_prune(changed);
             }
             if step == GcStep::Agent {
                 self.purge_pending = changed != 0;
             }
-            if self.next_step == Some(step) && changed == 0 {
-                self.next_step = step.next();
-            }
-            self.vacuum_pending |= changed != 0;
             if changed != 0 {
+                // A busy category yields to the rest of the current sweep.
+                self.scheduled_steps.push_back(step);
+                self.vacuum_pending = true;
                 self.sample(db)?;
             }
         } else if self.vacuum_pending {
             self.vacuum_pending = false;
-            incremental_vacuum(conn)?;
-            self.sample(db)?;
+            if Pages::read(conn)?.free != 0 {
+                incremental_vacuum(conn)?;
+                self.sample(db)?;
+            }
         }
         Ok(())
+    }
+
+    fn record_prune(&mut self, deleted: usize) {
+        self.live_events_count = self.live_events_count.saturating_sub(deleted);
+        self.vacuum_pending |= deleted != 0;
     }
 
     fn checkpoint_wal(&mut self, db: &OpenedDb, now: Duration) -> Result<(), StorageError> {
@@ -335,17 +365,15 @@ enum GcStep {
 }
 
 impl GcStep {
-    fn next(self) -> Option<Self> {
-        Some(match self {
-            Self::Results => Self::Executions,
-            Self::Executions => Self::Events,
-            Self::Events => Self::Tokens,
-            Self::Tokens => Self::RevokedTokens,
-            Self::RevokedTokens => Self::Enrollments,
-            Self::Enrollments => Self::Agent,
-            Self::Agent => return None,
-        })
-    }
+    const SCHEDULED: [Self; 7] = [
+        Self::Results,
+        Self::Executions,
+        Self::Events,
+        Self::Tokens,
+        Self::RevokedTokens,
+        Self::Enrollments,
+        Self::Agent,
+    ];
 }
 
 fn gc_transaction<T>(

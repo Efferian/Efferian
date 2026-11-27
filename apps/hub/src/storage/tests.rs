@@ -1147,3 +1147,285 @@ async fn online_vacuum_reads_a_consistent_snapshot_during_a_live_write_transacti
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }
+
+#[tokio::test]
+async fn priority_burst_yields_and_oversize_combination_keeps_strict_fifo() -> TestResult {
+    use super::actor::PriorityKind;
+    use std::sync::Mutex;
+
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let (release, anchor) = pause_writer(&handle).await?;
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut priority = Vec::new();
+    for n in 0..20 {
+        let order = order.clone();
+        let mut command = Box::pin(handle.execute_priority(
+            PriorityKind::CancelExecution,
+            move |_| {
+                order
+                    .lock()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?
+                    .push(n);
+                Ok::<_, WriteTxError<Infallible>>(())
+            },
+        ));
+        assert!(poll!(&mut command).is_pending());
+        priority.push(command);
+    }
+    let mut work = Vec::new();
+    let path = f.path();
+    for (n, bytes) in [(20, 3 << 20), (21, 2 << 20), (22, 1 << 20)] {
+        let path = path.clone();
+        let order = order.clone();
+        let mut command = Box::pin(handle.execute_work(bytes, move |tx| {
+            let independent = Connection::open(path)?;
+            let prev = independent.query_row("SELECT updated_at_ms FROM hub_meta", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            // Command 21 spills. Command 22 must follow it and share its next batch.
+            assert_eq!(prev, if n == 20 { 0 } else { 20 });
+            tx.conn()
+                .execute("UPDATE hub_meta SET updated_at_ms = ?1", [n])?;
+            order
+                .lock()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?
+                .push(n);
+            Ok::<_, WriteTxError<Infallible>>(())
+        }));
+        assert!(poll!(&mut command).is_pending());
+        work.push(command);
+    }
+    // Cancel the final future before execution and then close admission.
+    drop(work.pop());
+    let mut draining = Box::pin(runtime.shutdown());
+    assert!(poll!(&mut draining).is_pending());
+    release.send(()).map_err(|_| "writer stopped")?;
+    anchor.await?;
+    for command in priority {
+        command.await?;
+    }
+    for command in work {
+        command.await?;
+    }
+    assert!(matches!(
+        tokio::time::timeout(TIMEOUT, draining).await?,
+        ShutdownReport::Complete
+    ));
+    let actual = order.lock().map_err(|_| "order mutex poisoned")?.clone();
+    assert_eq!(
+        actual,
+        (0..16)
+            .chain([20])
+            .chain(16..20)
+            .chain([21, 22])
+            .collect::<Vec<_>>()
+    );
+    let opened = f.open(OpenMode::OfflineExactVersion)?;
+    let persisted = opened.run_offline_tx(|conn| {
+        conn.query_row("SELECT updated_at_ms FROM hub_meta", [], |row| {
+            row.get::<_, i64>(0)
+        })
+    })?;
+    assert_eq!(
+        persisted.value, 22,
+        "cancellation did not cancel the admitted mutation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn receipt_and_control_hooks_can_share_their_transaction() -> TestResult {
+    use super::actor::PriorityKind;
+
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let exec = handle.invoke(f.request(RequestId::new())).await?;
+    let wait = exec.waiter.ok_or("missing waiter")?;
+    let observed = Arc::new(AtomicUsize::new(0));
+    let hook = observed.clone();
+    let outcome = handle
+        .execute_priority(PriorityKind::CancelExecution, move |tx| {
+            let changed = tx.cancel_execution(exec.execution_id)?;
+            tx.on_commit(move || {
+                hook.fetch_add(1, Ordering::SeqCst);
+            });
+            Ok::<_, WriteTxError<Infallible>>(changed)
+        })
+        .await?;
+    assert!(outcome);
+    let receipt = f
+        .receipt(exec.execution_id, TerminalExecutionState::Cancelled)
+        .prepare()?;
+    let mut events = handle.subscribe_events()?;
+    let hook = observed.clone();
+    let outcome = handle
+        .execute_work(receipt.payload_bytes(), move |tx| {
+            let outcome = tx.apply_receipt(receipt)?;
+            tx.on_commit(move || {
+                assert!(matches!(
+                    events.try_recv().map(|event| event.envelope.kind()),
+                    Ok(efferian_protocol::EventKind::ExecutionCancelled)
+                ));
+                assert_eq!(wait.borrow().state, ExecutionState::Cancelled);
+                hook.fetch_add(1, Ordering::SeqCst);
+            });
+            Ok(outcome)
+        })
+        .await?;
+    assert_eq!(outcome, ReceiptOutcome::AppliedTerminal);
+    assert_eq!(observed.load(Ordering::SeqCst), 2);
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustained_receipts_leave_capacity_for_retention_and_periodic_gc() -> TestResult {
+    use futures_util::StreamExt;
+    let f = Fixture::create(StorageConfig {
+        max_events_rows: 32,
+        ..StorageConfig::default()
+    })?;
+    let (handle, runtime) = f.start()?;
+    let mut executions = Vec::new();
+    for _ in 0..768 {
+        executions.push(
+            handle
+                .invoke(f.request(RequestId::new()))
+                .await?
+                .execution_id,
+        );
+    }
+    let principal = f.principal;
+    let token = TokenId::new_user_or_agent();
+    handle
+        .execute_work(0, move |tx| {
+            seed_token(tx.conn(), token, principal, principal)?;
+            tx.conn().execute(
+                "UPDATE auth_tokens SET revoked_at_ms = 0 WHERE token_id = ?1",
+                [token.to_string()],
+            )?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+    f.clock
+        .0
+        .store(f.config.token_gc_grace_ms, Ordering::SeqCst);
+
+    let mut receipts = futures_util::stream::iter(executions)
+        .map(|id| handle.apply_receipt(f.receipt(id, TerminalExecutionState::Succeeded)))
+        .buffer_unordered(128);
+    let mut checked = 0;
+    while let Some(receipt) = receipts.next().await {
+        assert_eq!(receipt?, ReceiptOutcome::AppliedTerminal);
+        checked += 1;
+        if checked % 64 == 0 {
+            let status = handle.status_snapshot().await?;
+            assert!(
+                status.events_head_seq - status.events_pruned_through_seq <= 64,
+                "{status:?}"
+            );
+        }
+    }
+    assert_eq!(checked, 768);
+    let old = handle
+        .read_snapshot(move |conn| {
+            Ok::<_, StorageError>(conn.query_row(
+                "SELECT COUNT(*) FROM auth_tokens WHERE token_id = ?1",
+                [token.to_string()],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(old, 0);
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_maintenance_turn_is_skipped_if_shutdown_has_begun() -> TestResult {
+    use std::sync::Mutex;
+
+    struct PausedClock {
+        gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+        reads: AtomicUsize,
+    }
+
+    impl StorageClock for PausedClock {
+        fn wall_now_ms(&self) -> i64 {
+            0
+        }
+
+        fn monotonic_now(&self) -> Result<Duration, StorageError> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                let gate = self
+                    .gate
+                    .lock()
+                    .map_err(|_| StorageError::ActorStopped)?
+                    .take();
+                if let Some((ready, release)) = gate {
+                    let _ = ready.send(());
+                    let _ = release.blocking_recv();
+                }
+            }
+            Ok(Duration::ZERO)
+        }
+    }
+
+    let f = Fixture::create(StorageConfig::default())?;
+    let agent = PrincipalId::new_agent();
+    let token = TokenId::new_user_or_agent();
+    f.open(OpenMode::OfflineExactVersion)?
+        .run_offline_tx(|conn| {
+            conn.execute(
+                "INSERT INTO principals(principal_id, kind, name, managed_by_principal_id,
+            disabled_at_ms, created_at_ms, updated_at_ms)
+            VALUES (?1, 'agent', '~purging:agent', ?2, 0, 0, 0)",
+                params![agent.to_string(), f.principal.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE hub_meta SET gc_purging_principal_id = ?1",
+                [agent.to_string()],
+            )?;
+            seed_token(conn, token, agent, agent)
+        })?;
+    let (ready, blocked) = oneshot::channel();
+    let (release, park) = oneshot::channel();
+    let clock = Arc::new(PausedClock {
+        gate: Mutex::new(Some((ready, park))),
+        reads: AtomicUsize::new(0),
+    });
+    let (_, runtime) = open_existing(
+        acquire_state_lock(&f.dir)?,
+        OpenMode::ServeAutoMigrate,
+        ExpectedHubIdentity {
+            active_key_id: 1,
+            master_key_fingerprint: "test-fingerprint".to_owned(),
+        },
+        &f.config,
+        clock,
+    )?
+    .migrate_and_start_runtime()?;
+    tokio::time::timeout(TIMEOUT, blocked).await??;
+    let mut stopping = Box::pin(runtime.shutdown());
+    assert!(poll!(&mut stopping).is_pending());
+    release
+        .send(())
+        .map_err(|_| "writer did not reach first maintenance turn")?;
+    assert!(matches!(
+        tokio::time::timeout(TIMEOUT, stopping).await?,
+        ShutdownReport::Complete
+    ));
+
+    let retained = f
+        .open(OpenMode::OfflineExactVersion)?
+        .run_offline_tx(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM auth_tokens WHERE token_id = ?1",
+                [token.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+        })?;
+    assert_eq!(retained.value, 1);
+    Ok(())
+}
