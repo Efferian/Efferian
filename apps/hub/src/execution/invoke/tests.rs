@@ -27,6 +27,44 @@ use crate::upstream_dispatch::{
     UpstreamCancellation, UpstreamDispatchError, UpstreamDispatcher,
 };
 
+#[tokio::test]
+async fn shutdown_admission_authenticates_before_rejecting_without_reading_body() -> TestResult {
+    use axum::body::Body;
+    use http::Request;
+    use std::{io, time::Duration};
+    use tower_service::Service;
+
+    let hub = TestHub::start(
+        "shutdown-admission",
+        Config::default(),
+        RequestId::new().timestamp_ms(),
+    )
+    .await?;
+    hub.state.execution.stop();
+    for path in ["/v1/profiles/sample/invoke", "/v1/tools/sample/test"] {
+        for (token, expected) in [
+            (hub.admin_token.as_str(), StatusCode::SERVICE_UNAVAILABLE),
+            ("invalid-token", StatusCode::UNAUTHORIZED),
+        ] {
+            let body =
+                Body::from_stream(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("host", "localhost:8080")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(body)?;
+            let response =
+                tokio::time::timeout(Duration::from_secs(2), hub.router.clone().call(request))
+                    .await??;
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
+    hub.shutdown().await;
+    Ok(())
+}
+
 type DispatchGate = (
     oneshot::Sender<efferian_protocol::ExecutionId>,
     oneshot::Receiver<()>,

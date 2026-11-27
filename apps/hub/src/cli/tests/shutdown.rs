@@ -103,10 +103,13 @@ impl UpstreamDispatcher for UpstreamFixture {
         mut cancellation: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async move {
-            if !cancellation.may_start_io().await {
+            if cancellation
+                .start_io(|| eprintln!("fixture upstream started {}", request.execution_id))
+                .await
+                .is_none()
+            {
                 return Err(UpstreamDispatchError::Disconnected);
             }
-            eprintln!("fixture upstream started {}", request.execution_id);
             cancellation.cancelled().await;
             eprintln!("fixture upstream cancelled {}", request.execution_id);
             Err(UpstreamDispatchError::Disconnected)

@@ -8,7 +8,10 @@ mod tests;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use axum::{extract::State, response::Response};
+use axum::{
+    extract::{FromRequestParts, State},
+    response::Response,
+};
 use efferian_authz::{
     AuthContext, ExecutionAccess, authorize_admin, authorize_execution_access,
     authorize_profile_invoke_replay, check_profile_invoke_metadata,
@@ -19,7 +22,7 @@ use efferian_protocol::{
     ProblemDetails, ProfileToolBinding, RequestId, error_codes as code, validate_public_tool_name,
     validate_slug,
 };
-use http::StatusCode;
+use http::{StatusCode, request::Parts};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -103,6 +106,7 @@ struct ToolTestQuery {
 async fn profile_invoke(
     State(state): State<AppState>,
     caller: ApiCaller,
+    _: AcceptingExecutions,
     ApiPath(slug): ApiPath<String>,
     ApiJson(request): ApiJson<ProfileInvokeRequest>,
 ) -> ApiResult<Response> {
@@ -153,6 +157,7 @@ pub(crate) async fn invoke_profile_edition(
 async fn tool_test(
     State(state): State<AppState>,
     caller: ApiCaller,
+    _: AcceptingExecutions,
     ApiPath(slug): ApiPath<String>,
     ApiQuery(query): ApiQuery<ToolTestQuery>,
     ApiJson(request): ApiJson<ToolTestRequest>,
@@ -176,6 +181,20 @@ async fn tool_test(
         request.wait_ms,
     )?;
     invoke(&state, caller, input).await
+}
+
+struct AcceptingExecutions;
+
+impl FromRequestParts<AppState> for AcceptingExecutions {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(_: &mut Parts, state: &AppState) -> ApiResult<Self> {
+        if state.execution.is_accepting() {
+            Ok(Self)
+        } else {
+            Err(ApiError::overloaded())
+        }
+    }
 }
 
 enum Resource {

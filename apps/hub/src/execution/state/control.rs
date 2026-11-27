@@ -261,12 +261,18 @@ impl UpstreamReservation {
 pub(crate) struct UpstreamCancellation(watch::Receiver<UpstreamPhase>);
 
 impl UpstreamCancellation {
-    /// Observe the latest committed cancellation, waiting out a staged write.
-    pub(crate) async fn may_start_io(&mut self) -> bool {
-        self.0
+    /// Order a nonblocking transport handoff against the cancellation write.
+    /// Wait for any staged cancel before calling the handoff under the fence.
+    /// The handoff must return promptly and must not reenter cancellation.
+    pub(crate) async fn start_io<T>(&mut self, handoff: impl FnOnce() -> T) -> Option<T> {
+        let phase = self
+            .0
             .wait_for(|phase| !phase.cancellation_staged())
             .await
-            .is_ok_and(|phase| matches!(*phase, UpstreamPhase::Started))
+            .ok()?;
+        let result = matches!(*phase, UpstreamPhase::Started).then(handoff);
+        drop(phase);
+        result
     }
 
     /// Resolves for committed cancellation, Hub stop, or a retired reservation.

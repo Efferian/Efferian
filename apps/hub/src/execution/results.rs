@@ -180,10 +180,18 @@ pub(crate) async fn run_upstream(
     let Some(mut cancellation) = reservation.claim_start().await else {
         return;
     };
-    if !cancellation.may_start_io().await || state.clock.wall_now_ms() >= deadline_at_ms {
+    let transport_cancellation = cancellation.clone();
+    let Some(invoke) = cancellation
+        .start_io(|| {
+            (state.clock.wall_now_ms() < deadline_at_ms)
+                .then(|| state.upstream.invoke(request, transport_cancellation))
+        })
+        .await
+        .flatten()
+    else {
         return;
-    }
-    let result = tokio::time::timeout(timeout, state.upstream.invoke(request, cancellation)).await;
+    };
+    let result = tokio::time::timeout(timeout, invoke).await;
     // Shutdown cancels transport I/O before its writer sweep. The sweep
     // supplies the durable cause for work interrupted by that signal.
     if !state.execution.is_accepting() && !matches!(&result, Ok(Ok(_))) {

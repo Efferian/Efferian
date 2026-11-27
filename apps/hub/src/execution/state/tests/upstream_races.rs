@@ -194,12 +194,11 @@ impl UpstreamDispatcher for ControlledReplies {
         mut cancellation: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async move {
-            if !cancellation.may_start_io().await {
-                return Err(UpstreamDispatchError::Unavailable);
-            }
             let (send, receive) = oneshot::channel();
-            self.0
-                .send((request.execution_id, send))
+            cancellation
+                .start_io(|| self.0.send((request.execution_id, send)))
+                .await
+                .ok_or(UpstreamDispatchError::Unavailable)?
                 .map_err(|_| UpstreamDispatchError::Disconnected)?;
             receive
                 .await
@@ -218,6 +217,70 @@ async fn post_upstream(hub: &TestHub, status: StatusCode) -> TestResult<serde_js
         .await?;
     assert_eq!(actual, status, "{body}");
     Ok(body)
+}
+
+type DeferredHandoff = (ExecutionId, oneshot::Sender<()>, oneshot::Receiver<bool>);
+
+struct PreparingTransport(mpsc::UnboundedSender<DeferredHandoff>);
+
+impl UpstreamDispatcher for PreparingTransport {
+    fn discover(
+        &self,
+        request: DiscoverUpstream,
+    ) -> DispatchFuture<'_, Result<Vec<DiscoveredUpstreamTool>, UpstreamDispatchError>> {
+        ResultUpstream.discover(request)
+    }
+
+    fn invoke(
+        &self,
+        request: InvokeUpstream,
+        mut cancellation: UpstreamCancellation,
+    ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
+        Box::pin(async move {
+            let (resume, preparation) = oneshot::channel();
+            let (report, handed_off) = oneshot::channel();
+            self.0
+                .send((request.execution_id, resume, handed_off))
+                .map_err(|_| UpstreamDispatchError::Disconnected)?;
+            preparation
+                .await
+                .map_err(|_| UpstreamDispatchError::Disconnected)?;
+            let submitted = cancellation.start_io(|| ()).await.is_some();
+            let _ = report.send(submitted);
+            Err(UpstreamDispatchError::Unavailable)
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancel_during_transport_preparation_prevents_the_handoff() -> TestResult {
+    let now = RequestId::new().timestamp_ms();
+    let (send, mut preparing) = mpsc::unbounded_channel();
+    let hub = TestHub::start_with_dispatchers(
+        "cancel-during-upstream-preparation",
+        Config::default(),
+        now,
+        None,
+        Arc::new(PreparingTransport(send)),
+    )
+    .await?;
+    add_upstream_tool(&hub).await?;
+    let admitted = post_upstream(&hub, StatusCode::ACCEPTED).await?;
+    let (id, resume, handed_off) = tokio::time::timeout(TEST_TIMEOUT, preparing.recv())
+        .await?
+        .ok_or("transport did not begin preparation")?;
+    assert_eq!(admitted["execution_id"], id.to_string());
+    let (status, body) = hub
+        .request_admin(Method::POST, &format!("/v1/executions/{id}/cancel"), None)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "cancelled");
+    resume
+        .send(())
+        .map_err(|()| "transport dropped preparation")?;
+    assert!(!tokio::time::timeout(TEST_TIMEOUT, handed_off).await??);
+    hub.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test]
