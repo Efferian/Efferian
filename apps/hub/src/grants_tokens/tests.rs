@@ -648,11 +648,20 @@ async fn narrowed_anti_oracle_grants_pagination_labels_and_scope_caps() -> TestR
             true,
         )
         .await?;
-    let owned_agent = fixture
+    let member_agent = fixture
         .seed_principal(
-            "owned-agent",
+            "member-agent",
             PrincipalKind::Agent,
             Some(narrow_member.principal_id),
+            Some(narrow_member.principal_id),
+            false,
+        )
+        .await?;
+    let orch_agent = fixture
+        .seed_principal(
+            "orch-agent",
+            PrincipalKind::Agent,
+            None,
             Some(narrow_orch.principal_id),
             false,
         )
@@ -676,38 +685,71 @@ async fn narrowed_anti_oracle_grants_pagination_labels_and_scope_caps() -> TestR
             Ok(())
         })
         .await?;
-    let (_, agent_grant) = fixture
+    let (_, member_grant) = fixture
         .request_admin(
             Method::PUT,
             "/v1/grants",
             Some(json!({
-                "principal_id": owned_agent.principal_id,
+                "principal_id": member_agent.principal_id,
                 "scope": GrantScope::Profile(profile),
                 "capability": Capability::Discover,
             })),
         )
         .await?;
-    let owned_grant_id: GrantId = serde_json::from_value(agent_grant["grant"]["grant_id"].clone())?;
+    let member_grant_id: GrantId =
+        serde_json::from_value(member_grant["grant"]["grant_id"].clone())?;
+    let (_, orch_grant) = fixture
+        .request_admin(
+            Method::PUT,
+            "/v1/grants",
+            Some(json!({
+                "principal_id": orch_agent.principal_id,
+                "scope": GrantScope::Profile(profile),
+                "capability": Capability::Discover,
+            })),
+        )
+        .await?;
+    let orch_grant_id: GrantId = serde_json::from_value(orch_grant["grant"]["grant_id"].clone())?;
 
-    // 1. Narrowed admin, member, and orchestrator get uniform token_narrowed on mutations.
-    for (caller_secret, target_token, target_grant) in [
+    // 1. Narrowed admin, member, and orchestrator get uniform token_narrowed across managed, foreign, and missing targets.
+    for (
+        caller_secret,
+        managed_agent,
+        foreign_agent,
+        managed_tok,
+        foreign_tok,
+        managed_grant,
+        foreign_grant,
+    ) in [
         (
             narrow_admin.secret.expose_secret(),
-            owned_agent.token_id,
-            owned_grant_id,
+            member_agent.principal_id,
+            orch_agent.principal_id,
+            member_agent.token_id,
+            orch_agent.token_id,
+            member_grant_id,
+            orch_grant_id,
         ),
         (
             narrow_member.secret.expose_secret(),
-            owned_agent.token_id,
-            owned_grant_id,
+            member_agent.principal_id,
+            orch_agent.principal_id,
+            member_agent.token_id,
+            orch_agent.token_id,
+            member_grant_id,
+            orch_grant_id,
         ),
         (
             narrow_orch.secret.expose_secret(),
-            owned_agent.token_id,
-            owned_grant_id,
+            orch_agent.principal_id,
+            member_agent.principal_id,
+            orch_agent.token_id,
+            member_agent.token_id,
+            orch_grant_id,
+            member_grant_id,
         ),
     ] {
-        for tok in [target_token, TokenId::new_user_or_agent()] {
+        for tok in [managed_tok, foreign_tok, TokenId::new_user_or_agent()] {
             let (status, err) = fixture
                 .request(
                     Method::POST,
@@ -719,7 +761,7 @@ async fn narrowed_anti_oracle_grants_pagination_labels_and_scope_caps() -> TestR
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
         }
-        for grant in [target_grant, GrantId::new()] {
+        for grant in [managed_grant, foreign_grant, GrantId::new()] {
             let (status, err) = fixture
                 .request(
                     Method::DELETE,
@@ -731,7 +773,7 @@ async fn narrowed_anti_oracle_grants_pagination_labels_and_scope_caps() -> TestR
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
         }
-        for target_principal in [owned_agent.principal_id, PrincipalId::new_agent()] {
+        for target_principal in [managed_agent, foreign_agent, PrincipalId::new_agent()] {
             let (status, err) = fixture
                 .request(
                     Method::PUT,
@@ -748,6 +790,7 @@ async fn narrowed_anti_oracle_grants_pagination_labels_and_scope_caps() -> TestR
             assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
         }
     }
+    let owned_agent = member_agent;
     // Plain admin (no global grant) gets uniform forbidden on foreign/missing revocations.
     for tok in [owned_agent.token_id, TokenId::new_user_or_agent()] {
         let (status, err) = fixture

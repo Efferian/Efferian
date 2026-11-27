@@ -430,6 +430,19 @@ pub fn parse_csv<T: FromStr>(raw: &str) -> Result<Vec<T>, ConfigError> {
         .collect()
 }
 
+/// Comma-separated CLI value wrapper so `clap_derive` stores one parsed list
+/// instead of inferring `ArgAction::Append` from `Option<Vec<T>>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CsvList<T>(pub Vec<T>);
+
+impl<T: FromStr> FromStr for CsvList<T> {
+    type Err = ConfigError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        parse_csv(raw).map(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

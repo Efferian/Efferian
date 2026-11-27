@@ -677,14 +677,14 @@ async fn narrowed_and_non_global_anti_oracle_and_me_owned_agents() -> TestResult
                 "UPDATE principals SET is_orchestrator = 1 WHERE principal_id = ?1",
                 [&narrow_orch],
             )?;
-            // Seed one owned agent for each of global-admin, narrow-admin, plain-admin, member, narrow-member, and narrow-orch.
+            // Seed one owned/managed agent for each principal role (orchestrator agents have NULL owner).
             for (owner, manager, name) in [
-                (&global_admin, &global_admin, "ga-agent"),
-                (&narrow_admin, &narrow_admin, "na-agent"),
-                (&plain_admin, &plain_admin, "pa-agent"),
-                (&member, &member, "m-agent"),
-                (&narrow_member, &narrow_member, "nm-agent"),
-                (&member, &narrow_orch, "orch-agent"),
+                (Some(global_admin.as_str()), &global_admin, "ga-agent"),
+                (Some(narrow_admin.as_str()), &narrow_admin, "na-agent"),
+                (Some(plain_admin.as_str()), &plain_admin, "pa-agent"),
+                (Some(member.as_str()), &member, "m-agent"),
+                (Some(narrow_member.as_str()), &narrow_member, "nm-agent"),
+                (None, &narrow_orch, "orch-agent"),
             ] {
                 tx.execute(
                     "INSERT INTO principals (principal_id, name, kind, owner_principal_id,
@@ -742,7 +742,7 @@ async fn narrowed_and_non_global_anti_oracle_and_me_owned_agents() -> TestResult
     let (_, me_pa) = fixture.call(2, Method::GET, "/v1/me", None).await?;
     assert_eq!(me_pa["owned_agents"], json!([]));
     let (_, me_m) = fixture.call(3, Method::GET, "/v1/me", None).await?;
-    assert_eq!(me_m["owned_agents"].as_array().map(Vec::len), Some(2));
+    assert_eq!(me_m["owned_agents"].as_array().map(Vec::len), Some(1));
     assert_eq!(me_m["caller_bound_upstreams"], json!([]));
     let (_, me_nm) = fixture.call(4, Method::GET, "/v1/me", None).await?;
     assert_eq!(me_nm["owned_agents"].as_array().map(Vec::len), Some(1));
@@ -930,9 +930,12 @@ async fn disable_closes_managed_nodes_demotion_emits_signal_delete_restrict_and_
     assert_eq!(closes[0].through_epoch, 4);
     assert_eq!(closes[0].reason, BridgeCloseReason::NodeRevoked);
 
-    // 4. DELETE principal blocked by accounts and executions returns 409 resource_in_use.
-    let blocked_acc = PrincipalId::new_user();
-    let blocked_exec = PrincipalId::new_user();
+    // 4. DELETE disabled managed agent blocked by accounts (ON DELETE RESTRICT) or
+    //    executions (EXISTS pre-check) returns 409 resource_in_use, then succeeds
+    //    with 204 once the blocking row is removed.
+    let operator = fixture.principals[0].id;
+    let blocked_acc = PrincipalId::new_agent();
+    let blocked_exec = PrincipalId::new_agent();
     let tok_exec = TokenId::new_user_or_agent();
     let issued_tok = fixture.state.vault.issue_token(tok_exec)?;
     let tok_verifier = issued_tok.verifier.as_str().to_owned();
@@ -942,9 +945,10 @@ async fn disable_closes_managed_nodes_demotion_emits_signal_delete_restrict_and_
         .execute_work(0, move |tx| {
             for (pid, name) in [(blocked_acc, "acc-owner"), (blocked_exec, "exec-caller")] {
                 tx.conn().execute(
-                    "INSERT INTO principals (principal_id, name, kind, disabled_at_ms, created_at_ms, updated_at_ms)
-                     VALUES (?1, ?2, 'member', 1000, 1000, 1000)",
-                    params![pid.to_string(), name],
+                    "INSERT INTO principals (principal_id, name, kind, managed_by_principal_id,
+                                             disabled_at_ms, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, 'agent', ?3, 1000, 1000, 1000)",
+                    params![pid.to_string(), name, operator.to_string()],
                 )?;
             }
             tx.conn().execute(
@@ -954,9 +958,15 @@ async fn disable_closes_managed_nodes_demotion_emits_signal_delete_restrict_and_
                 [blocked_acc.to_string()],
             )?;
             tx.conn().execute(
-                "INSERT INTO auth_tokens (token_id, principal_id, created_by, label, key_id, verifier_hmac, created_at_ms)
-                 VALUES (?1, ?2, ?2, 'x', 1, ?3, 1000)",
-                params![tok_exec.to_string(), blocked_exec.to_string(), tok_verifier],
+                "INSERT INTO auth_tokens (token_id, principal_id, created_by, label, key_id,
+                                          verifier_hmac, created_at_ms)
+                 VALUES (?1, ?2, ?3, 'x', 1, ?4, 1000)",
+                params![
+                    tok_exec.to_string(),
+                    blocked_exec.to_string(),
+                    operator.to_string(),
+                    tok_verifier
+                ],
             )?;
             tx.conn().execute(
                 "INSERT INTO executions (execution_id, invoke_kind, request_id, request_digest,
@@ -965,7 +975,11 @@ async fn disable_closes_managed_nodes_demotion_emits_signal_delete_restrict_and_
                     result_expires_at_ms, expires_at_ms)
                  VALUES ('exec_1', 'tool_test', 'req_1', 'd', ?1, ?2, 'tool_1', 1, 't',
                          'node', ?3, 'succeeded', 1000, 1000, 2000, 2000)",
-                params![blocked_exec.to_string(), tok_exec.to_string(), node.to_string()],
+                params![
+                    blocked_exec.to_string(),
+                    tok_exec.to_string(),
+                    node.to_string()
+                ],
             )?;
             Ok::<_, crate::storage::WriteTxError<std::convert::Infallible>>(())
         })
@@ -981,6 +995,28 @@ async fn disable_closes_managed_nodes_demotion_emits_signal_delete_restrict_and_
             .await?;
         assert_eq!(status, StatusCode::CONFLICT, "{blocked}");
         assert_eq!(err["code"], "resource_in_use", "{blocked}");
+    }
+    fixture
+        .state
+        .storage
+        .execute_work(0, |tx| {
+            tx.conn()
+                .execute("DELETE FROM accounts WHERE account_id = 'acc_1'", [])?;
+            tx.conn()
+                .execute("DELETE FROM executions WHERE execution_id = 'exec_1'", [])?;
+            Ok::<_, crate::storage::WriteTxError<std::convert::Infallible>>(())
+        })
+        .await?;
+    for unblocked in [blocked_acc, blocked_exec] {
+        let (status, _) = fixture
+            .call(
+                0,
+                Method::DELETE,
+                &format!("/v1/principals/{unblocked}"),
+                None,
+            )
+            .await?;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{unblocked}");
     }
     fixture.stop().await
 }

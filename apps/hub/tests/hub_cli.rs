@@ -566,6 +566,102 @@ fn failed_stdout_delivery_reports_committed_init_and_mint() {
 }
 
 #[tokio::test]
+async fn serve_accepts_allowed_hosts_and_allowed_origins_flags() {
+    let client = client();
+    let dir = RunDir::new();
+    let state = dir.path("state");
+    success(
+        hub()
+            .args(["init", "--state-dir"])
+            .arg(&state)
+            .output()
+            .unwrap(),
+    );
+
+    let mut command = hub();
+    command.args(["serve", "--state-dir"]).arg(&state).args([
+        "--listen",
+        "127.0.0.1:0",
+        "--allowed-hosts",
+        "hub.example:443,127.0.0.1:8080",
+        "--allowed-origins",
+        "https://console.example:443,http://app.example:80",
+    ]);
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (send, recv) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut diagnostics = Vec::new();
+    let addr = loop {
+        match recv.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => {
+                if let Some(addr) = line.strip_prefix("Hub listening on ") {
+                    break addr.parse::<SocketAddr>().unwrap();
+                }
+                diagnostics.push(line);
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                reader.join().unwrap();
+                panic!("serve failed to start ({error}): {diagnostics:?}");
+            }
+        }
+    };
+    let server = Server {
+        child,
+        addr,
+        diagnostics: recv,
+        reader: Some(reader),
+    };
+
+    json(
+        client
+            .get(server.url("info"))
+            .header("Host", "hub.example:443")
+            .header("Origin", "https://console.example"),
+        StatusCode::OK,
+    )
+    .await;
+    json(
+        client
+            .get(server.url("info"))
+            .header("Host", "hub.example:443")
+            .header("Origin", "http://app.example"),
+        StatusCode::OK,
+    )
+    .await;
+    json(
+        client
+            .get(server.url("info"))
+            .header("Host", "other.example:443"),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    json(
+        client
+            .get(server.url("info"))
+            .header("Host", "hub.example:443")
+            .header("Origin", "https://evil.example"),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    server.stop("TERM");
+}
+
+#[tokio::test]
 #[ignore = "writes a SQLite fixture over 4 GiB for the offline recovery acceptance check"]
 async fn offline_recovery_respects_page_budget_over_four_gib() {
     use efferian_protocol::{ExecutionId, ToolId, UpstreamId};

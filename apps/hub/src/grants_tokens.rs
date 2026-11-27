@@ -19,8 +19,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::http::{
     ApiCaller, ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, AppState, EmptyBody, OperatorScope,
-    Page, RouteGroups, checked_page_limit, point_missing, reject_narrowed_admin,
-    require_unrestricted_operator,
+    Page, RouteGroups, checked_page_limit, point_missing, require_unrestricted_operator,
 };
 use crate::operations::{active_token_count, normalize_token_label};
 use crate::storage::{
@@ -381,9 +380,12 @@ async fn put_grant(
             if request.capability == Capability::Admin {
                 authorize_admin(&ctx)?;
             } else if request.scope == GrantScope::Global {
-                reject_narrowed_admin(&ctx)?;
-                if authorize_admin(&ctx).is_err() {
-                    return Err(ApiError::forbidden().into());
+                match authorize_admin(&ctx) {
+                    Ok(()) => {}
+                    Err(error @ AuthzError::UnrestrictedTokenRequired) => {
+                        return Err(ApiError::from(error).into());
+                    }
+                    Err(_) => return Err(ApiError::forbidden().into()),
                 }
             } else {
                 require_unrestricted_operator(&ctx, OperatorScope::SubjectOperator)?;

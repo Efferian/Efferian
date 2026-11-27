@@ -28,10 +28,13 @@ const TABLES: [&str; 15] = [
     "upstreams",
 ];
 
-const INDEXES: [&str; 29] = [
+const INDEXES: [&str; 32] = [
+    "idx_account_bindings_account",
+    "idx_account_bindings_upstream",
     "idx_accounts_owner",
     "idx_accounts_private_owner_slug",
     "idx_accounts_shared_slug",
+    "idx_accounts_upstream",
     "idx_auth_tokens_created_by",
     "idx_auth_tokens_expires",
     "idx_auth_tokens_principal",
@@ -126,6 +129,14 @@ async fn gate_sqlite_hygiene() -> TestResult {
                 "idx_nodes_managed_by",
                 ["managed_by_principal_id", "node_id"].as_slice(),
             ),
+            (
+                "idx_principals_owner",
+                ["owner_principal_id", "principal_id"].as_slice(),
+            ),
+            (
+                "idx_principals_managed_by",
+                ["managed_by_principal_id", "principal_id"].as_slice(),
+            ),
         ] {
             let mut stmt = conn.prepare(&format!(
                 "SELECT name FROM pragma_index_info('{index}') ORDER BY seqno"
@@ -134,6 +145,50 @@ async fn gate_sqlite_hygiene() -> TestResult {
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             assert_eq!(columns, expected_columns, "{index}");
+        }
+        // Every foreign key on non-singleton tables must have a non-partial index
+        // whose leading column matches the FK child column (SQLite never uses
+        // partial indexes for ON DELETE RESTRICT/CASCADE checks).
+        for table in TABLES {
+            if table == "hub_meta" {
+                continue;
+            }
+            let mut fk_stmt = conn.prepare(&format!(
+                "SELECT \"from\" FROM pragma_foreign_key_list('{table}')"
+            ))?;
+            let fk_cols = fk_stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if fk_cols.is_empty() {
+                continue;
+            }
+            let mut idx_stmt = conn.prepare(&format!(
+                "SELECT name FROM pragma_index_list('{table}') WHERE partial = 0"
+            ))?;
+            let non_partial = idx_stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut leading = Vec::new();
+            for index in non_partial {
+                let first: Option<String> = conn
+                    .query_row(
+                        &format!(
+                            "SELECT name FROM pragma_index_info('{index}') WHERE seqno = 0"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if let Some(col) = first {
+                    leading.push(col);
+                }
+            }
+            for col in fk_cols {
+                assert!(
+                    leading.contains(&col),
+                    "FK {table}.{col} lacks a non-partial leading-column index (found leading: {leading:?})"
+                );
+            }
         }
         Ok::<_, StorageError>(())
     })?;

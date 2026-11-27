@@ -122,13 +122,6 @@ pub(crate) fn point_missing(ctx: &AuthContext, mutating: bool) -> ApiError {
     }
 }
 
-pub(crate) fn reject_narrowed_admin(ctx: &AuthContext) -> ApiResult<()> {
-    if let Err(error @ AuthzError::UnrestrictedTokenRequired) = authorize_admin(ctx) {
-        return Err(error.into());
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum OperatorScope {
     /// Global admin, Member, or Orchestrator (principal, token-revoke, and profile-grant mutations).

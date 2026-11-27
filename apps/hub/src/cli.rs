@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::config::{self, Authority, Config, Origin, Overrides};
+use crate::config::{self, Authority, Config, CsvList, Origin, Overrides};
 use crate::egress::EgressClient;
 use crate::http::{self, AppState};
 use crate::http_transport;
@@ -40,11 +40,11 @@ enum Command {
         #[arg(long, value_name = "ADDR")]
         listen: Option<std::net::SocketAddr>,
         /// Allow these exact Host authorities (comma-separated).
-        #[arg(long, value_name = "LIST", value_parser = config::parse_csv::<Authority>)]
-        allowed_hosts: Option<Vec<Authority>>,
+        #[arg(long, value_name = "LIST")]
+        allowed_hosts: Option<CsvList<Authority>>,
         /// Allow these HTTP or HTTPS origins (comma-separated).
-        #[arg(long, value_name = "LIST", value_parser = config::parse_csv::<Origin>)]
-        allowed_origins: Option<Vec<Origin>>,
+        #[arg(long, value_name = "LIST")]
+        allowed_origins: Option<CsvList<Origin>>,
     },
     /// Recover access to a stopped Hub.
     Admin {
@@ -159,8 +159,8 @@ fn run(command: Command) -> CommandResult {
                 Overrides {
                     state_dir: settings.state_dir,
                     listen,
-                    allowed_hosts,
-                    allowed_origins,
+                    allowed_hosts: allowed_hosts.map(|list| list.0),
+                    allowed_origins: allowed_origins.map(|list| list.0),
                     max_active_tokens_per_principal: settings.max_active_tokens_per_principal,
                 },
             )?;
@@ -268,4 +268,81 @@ async fn serve(config: Config) -> CommandResult {
         return Err("Hub database writer stopped unexpectedly".into());
     }
     server_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_csv_allowed_hosts_and_allowed_origins_without_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parsed = Cli::try_parse_from([
+            "efferian-hub",
+            "serve",
+            "--state-dir",
+            "/tmp/state",
+            "--listen",
+            "0.0.0.0:8080",
+            "--allowed-hosts",
+            "hub.example:443,[::1]:8080",
+            "--allowed-origins",
+            "https://console.example:443,http://app.example:80",
+        ])?;
+        let Command::Serve {
+            allowed_hosts,
+            allowed_origins,
+            ..
+        } = parsed.command
+        else {
+            return Err("expected serve subcommand".into());
+        };
+        assert_eq!(
+            allowed_hosts.map(|list| list.0),
+            Some(vec!["hub.example:443".parse()?, "[::1]:8080".parse()?,])
+        );
+        assert_eq!(
+            allowed_origins.map(|list| list.0),
+            Some(vec![
+                "https://console.example".parse()?,
+                "http://app.example".parse()?,
+            ])
+        );
+
+        let single = Cli::try_parse_from([
+            "efferian-hub",
+            "serve",
+            "--allowed-hosts",
+            "hub.example:443",
+            "--allowed-origins",
+            "https://console.example",
+        ])?;
+        assert!(matches!(
+            single.command,
+            Command::Serve {
+                allowed_hosts: Some(_),
+                allowed_origins: Some(_),
+                ..
+            }
+        ));
+
+        for bad in [
+            [
+                "efferian-hub",
+                "serve",
+                "--allowed-hosts",
+                "hub.example:0443",
+            ],
+            ["efferian-hub", "serve", "--allowed-hosts", "hub.example,"],
+            [
+                "efferian-hub",
+                "serve",
+                "--allowed-origins",
+                "https://console.example/",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+        Ok(())
+    }
 }

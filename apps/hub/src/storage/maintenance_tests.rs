@@ -517,7 +517,7 @@ fn soft_pressure_clears_latch_in_normal_band_and_respects_recency_grace_until_ha
     let conn = &db.conn;
     conn.execute(
         "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
-         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(600000), 0, 0)",
+         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(560000), 0, 0)",
         [f.principal.to_string()],
     )?;
     let old = seed_execution(conn, &f, f.principal, "succeeded", 100, 200, 140_000)?;

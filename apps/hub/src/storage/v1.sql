@@ -136,6 +136,7 @@ CREATE TABLE accounts (
 CREATE UNIQUE INDEX idx_accounts_shared_slug ON accounts(slug) WHERE visibility = 'shared';
 CREATE UNIQUE INDEX idx_accounts_private_owner_slug ON accounts(owner_principal_id, slug) WHERE visibility = 'private';
 CREATE INDEX idx_accounts_owner ON accounts(owner_principal_id);
+CREATE INDEX idx_accounts_upstream ON accounts(upstream_id);
 
 
 CREATE TABLE account_bindings (
@@ -145,6 +146,8 @@ CREATE TABLE account_bindings (
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (principal_id, upstream_id)
 );
+CREATE INDEX idx_account_bindings_upstream ON account_bindings(upstream_id);
+CREATE INDEX idx_account_bindings_account ON account_bindings(account_id);
 
 
 CREATE TABLE tools (
