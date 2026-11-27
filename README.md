@@ -38,6 +38,14 @@ Use separate sidecar files such as `hub.lock` and `node.lock` for exclusive inst
 
 Only Node enables the Platform `process` feature. Its `ProcessHandle` owns the group through cleanup and keeps the leader unreaped until the final group signal. Explicit termination gives signalable group members the full TERM grace period, then escalates and collects the leader. Callers retain the handle through cleanup. Take each piped stdout and stderr and read both concurrently with waiting, or select inherited or null output when a stream is unused. Spawn on a thread with SIGCHLD unblocked and keep signal delivery and child collection available to the handle. Pipe registration errors after OS spawn trigger group cleanup and leader collection. The command may already have performed work when such an error is returned. The guarantee covers the original process group while Node is running.
 
+## Hub storage
+
+The Hub storage module owns a single `hub.sqlite3` writer under the `hub.lock` sidecar. The database uses WAL, full synchronous commits by default and eight read-only connections for snapshots. State changes and their outbox events commit together. Live subscribers also receive a dedicated revocation feed and must invalidate cached permissions if it reports a gap or closes.
+
+The default database page budget is 4 GiB. At 75% used pages, background cleanup can discard retained execution output. At 85%, admission rejects new invocations while replays, revocations and finalization can use available pages. The page budget tracks logical SQLite capacity. These writes still require free filesystem space for the database and WAL.
+
+Run `make gate_sqlite_hygiene` to verify the schema, SQLite settings and read-only behavior in the pinned environment. `make test app=hub` also exercises process crashes, transaction rollback, bounded maintenance and recovery.
+
 ## License
 
 Efferian is licensed under the GNU Affero General Public License v3.0 only. DevKit files and retained template configuration carry the DevKit MIT notice. [Efferian license](LICENSE) · [DevKit notice](.devkit/runtime/LICENSE)

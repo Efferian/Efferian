@@ -366,3 +366,23 @@ fn gate_banned_crates() -> Result {
     }
     Ok(())
 }
+
+#[test]
+fn gate_sqlite_hygiene() -> Result {
+    let status = Command::new(env!("CARGO"))
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args([
+            "test",
+            "-p",
+            HUB,
+            "--test",
+            "gate_sqlite_hygiene",
+            "--locked",
+            "--offline",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("Hub SQLite hygiene gate failed ({status})").into());
+    }
+    Ok(())
+}

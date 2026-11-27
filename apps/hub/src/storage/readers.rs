@@ -1,0 +1,129 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+
+use rusqlite::{Connection, TransactionBehavior};
+use tokio::sync::Semaphore;
+
+use super::StorageError;
+use super::lifecycle::open_reader;
+
+const READERS: usize = 8;
+
+pub(super) struct ReadPool {
+    path: PathBuf,
+    permits: Arc<Semaphore>,
+    state: Mutex<PoolState>,
+    closed: Condvar,
+}
+
+struct PoolState {
+    idle: Vec<Connection>,
+    in_flight: usize,
+    closing: bool,
+}
+
+impl ReadPool {
+    pub(super) fn open(path: PathBuf) -> Result<Arc<Self>, StorageError> {
+        let idle = (0..READERS)
+            .map(|_| open_reader(&path))
+            .collect::<Result<_, _>>()?;
+        Ok(Arc::new(Self {
+            path,
+            permits: Arc::new(Semaphore::new(READERS)),
+            state: Mutex::new(PoolState {
+                idle,
+                in_flight: 0,
+                closing: false,
+            }),
+            closed: Condvar::new(),
+        }))
+    }
+
+    fn state(&self) -> MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) async fn snapshot<T, E>(
+        self: &Arc<Self>,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| StorageError::ShuttingDown)?;
+        let pool = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut reader = pool.checkout()?;
+            let conn = reader.conn.as_mut().ok_or(StorageError::ActorStopped)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(StorageError::from)?;
+            let value = read(&tx)?;
+            tx.commit().map_err(StorageError::from)?;
+            Ok(value)
+        })
+        .await
+        .map_err(StorageError::from)?
+    }
+
+    pub(super) fn begin_close(&self) {
+        self.state().closing = true;
+        self.permits.close();
+    }
+
+    pub(super) fn finish_close(&self) {
+        self.begin_close();
+        let idle = std::mem::take(&mut self.state().idle);
+        drop(idle);
+        let _state = self
+            .closed
+            .wait_while(self.state(), |state| state.in_flight != 0)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+
+    fn checkout(&self) -> Result<Reader<'_>, StorageError> {
+        let conn = {
+            let mut state = self.state();
+            if state.closing {
+                return Err(StorageError::ShuttingDown);
+            }
+            state.in_flight += 1;
+            state.idle.pop()
+        };
+        let mut reader = Reader { pool: self, conn };
+        if reader.conn.is_none() {
+            reader.conn = Some(open_reader(&self.path)?);
+        }
+        Ok(reader)
+    }
+}
+
+struct Reader<'a> {
+    pool: &'a ReadPool,
+    conn: Option<Connection>,
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let clean = conn.is_autocommit()
+                || (conn.execute_batch("ROLLBACK").is_ok() && conn.is_autocommit());
+            if clean && !std::thread::panicking() {
+                let mut state = self.pool.state();
+                if !state.closing {
+                    state.idle.push(conn);
+                    state.in_flight -= 1;
+                    return;
+                }
+            }
+            drop(conn);
+        }
+        self.pool.state().in_flight -= 1;
+        self.pool.closed.notify_all();
+    }
+}
