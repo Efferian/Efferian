@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 
 use axum::{Json, extract::State};
 use efferian_authz::{
@@ -9,7 +9,7 @@ use efferian_protocol::{
     Capability, NodeId, PrincipalId, ProfileId, ProfileToolBinding, TokenId, ToolDefinition,
     ToolSpec, UpstreamAccountMode, UpstreamId,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use utoipa::ToSchema;
 use utoipa_axum::{router::UtoipaMethodRouter, routes};
@@ -143,7 +143,8 @@ fn caller_bound_upstreams(
     let mut active_upstream = conn.prepare_cached(
         "SELECT slug FROM upstreams WHERE upstream_id = ?1 AND disabled_at_ms IS NULL",
     )?;
-    let mut by_slug = BTreeMap::<String, UpstreamId>::new();
+    let mut revisions = HashMap::new();
+    let mut visible = BTreeSet::new();
     let mut rows = published.query([])?;
     while let Some(row) = rows.next()? {
         let profile_id = id(row, 0)?;
@@ -151,44 +152,58 @@ fn caller_bound_upstreams(
             continue;
         }
         let bindings: Vec<ProfileToolBinding> = json(row, 1)?;
+        let mut upstreams = BTreeSet::new();
         for binding in bindings {
-            let definition: Option<ToolDefinition> = pinned_definition
-                .query_row(
-                    params![binding.tool_id.to_string(), binding.tool_version],
-                    |row| json(row, 0),
-                )
-                .optional()?;
-            let Some(ToolDefinition {
-                spec:
-                    ToolSpec::UpstreamRef {
-                        upstream_id,
-                        account_mode: UpstreamAccountMode::CallerBound,
-                        ..
-                    },
-                ..
-            }) = definition
-            else {
-                continue;
+            let key = (binding.tool_id, binding.tool_version);
+            let upstream_id = match revisions.entry(key) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => *entry.insert(
+                    pinned_definition
+                        .query_row(
+                            params![binding.tool_id.to_string(), binding.tool_version],
+                            caller_bound_upstream_id,
+                        )
+                        .optional()?
+                        .flatten(),
+                ),
             };
+            if let Some(upstream_id) = upstream_id {
+                upstreams.insert(upstream_id);
+            }
+        }
+        for upstream_id in upstreams {
             let target = ExecutionTarget::Upstream {
                 upstream_id,
                 account: UpstreamAccountMode::CallerBound,
             };
-            if authorize_discovery_target(ctx, profile_id, target).is_err() {
-                continue;
-            }
-            if let Some(slug) = active_upstream
-                .query_row([upstream_id.to_string()], |row| row.get(0))
-                .optional()?
-            {
-                by_slug.insert(slug, upstream_id);
+            if authorize_discovery_target(ctx, profile_id, target).is_ok() {
+                visible.insert(upstream_id);
             }
         }
     }
-    Ok(by_slug
-        .into_iter()
-        .map(|(slug, upstream_id)| CallerBoundUpstream { upstream_id, slug })
-        .collect())
+    let mut result = Vec::new();
+    for upstream_id in visible {
+        if let Some(slug) = active_upstream
+            .query_row([upstream_id.to_string()], |row| row.get(0))
+            .optional()?
+        {
+            result.push(CallerBoundUpstream { upstream_id, slug });
+        }
+    }
+    result.sort_unstable_by(|left, right| left.slug.cmp(&right.slug));
+    Ok(result)
+}
+
+fn caller_bound_upstream_id(row: &Row<'_>) -> rusqlite::Result<Option<UpstreamId>> {
+    let definition: ToolDefinition = json(row, 0)?;
+    Ok(match definition.spec {
+        ToolSpec::UpstreamRef {
+            upstream_id,
+            account_mode: UpstreamAccountMode::CallerBound,
+            ..
+        } => Some(upstream_id),
+        _ => None,
+    })
 }
 
 #[derive(Serialize, ToSchema)]
