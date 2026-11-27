@@ -10,7 +10,6 @@ use efferian_protocol::{
 };
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
-use tokio::sync::watch;
 
 use crate::config::Config;
 use crate::execution::results::apply_node_result;
@@ -21,7 +20,7 @@ use crate::storage::{ReceiptOutcome, StorageError};
 use crate::test_support::{TestHub, TestResult};
 use crate::upstream_dispatch::{
     DiscoverUpstream, DispatchFuture, InvokeUpstream, OfflineUpstreamDispatcher,
-    UpstreamDispatchError, UpstreamDispatcher,
+    UpstreamCancellation, UpstreamDispatchError, UpstreamDispatcher,
 };
 
 struct TestNode {
@@ -372,7 +371,7 @@ impl UpstreamDispatcher for ResultUpstream {
     fn invoke(
         &self,
         request: InvokeUpstream,
-        _: watch::Receiver<bool>,
+        _: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async move {
             let bytes = match request.arguments["case"].as_str() {
@@ -643,22 +642,31 @@ async fn deadline_is_irreversible_and_current_epoch_records_only_one_late_receip
     Ok(())
 }
 
-struct CountingUpstream(std::sync::atomic::AtomicUsize);
+#[derive(Default)]
+struct CountingUpstream {
+    calls: std::sync::atomic::AtomicUsize,
+    cancellations: std::sync::atomic::AtomicUsize,
+}
 
 impl UpstreamDispatcher for CountingUpstream {
     fn invoke(
         &self,
         _: InvokeUpstream,
-        _: watch::Receiver<bool>,
+        _: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(Bytes::from_static(br#"{"structuredContent":null}"#)) })
+    }
+
+    fn cancel(&self, _: ExecutionId) {
+        self.cancellations.fetch_add(1, Ordering::SeqCst);
     }
 }
 
+mod upstream_races;
+
 #[tokio::test]
-async fn upstream_completion_retries_full_ingress_and_aborted_batches_without_replaying_io()
--> TestResult {
+async fn upstream_completion_retries_writes_and_cannot_replace_a_committed_cancel() -> TestResult {
     use std::convert::Infallible;
     use std::num::NonZeroU64;
     use std::task::Poll;
@@ -666,11 +674,11 @@ async fn upstream_completion_retries_full_ingress_and_aborted_batches_without_re
     use efferian_protocol::{PreparedArgumentsDigest, TokenId, ToolId};
 
     use crate::storage::{
-        ExecutionTarget, InvokeResource, NewExecutionWrite, WriteError, WriteTxError,
+        ExecutionTarget, InvokeResource, NewExecutionWrite, PriorityKind, WriteError, WriteTxError,
     };
 
     let now = RequestId::new().timestamp_ms();
-    let upstream = Arc::new(CountingUpstream(std::sync::atomic::AtomicUsize::new(0)));
+    let upstream = Arc::new(CountingUpstream::default());
     let hub = TestHub::start_with_dispatchers(
         "result-ingress",
         Config::default(),
@@ -680,7 +688,10 @@ async fn upstream_completion_retries_full_ingress_and_aborted_batches_without_re
     )
     .await?;
     let caller = hub.admin_id;
-    for (index, full) in [true, false].into_iter().enumerate() {
+    for (index, (full, cancel)) in [(true, false), (false, false), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
         let state = hub.state.clone();
         let execution_id = ExecutionId::new();
         let upstream_id = UpstreamId::new();
@@ -781,9 +792,24 @@ async fn upstream_completion_retries_full_ingress_and_aborted_batches_without_re
             now + 90_000,
         ));
         assert!(futures_util::poll!(worker.as_mut()).is_pending());
-        assert_eq!(upstream.0.load(Ordering::SeqCst), index + 1);
+        assert_eq!(upstream.calls.load(Ordering::SeqCst), index + 1);
+        let dispatcher = Arc::clone(&state.upstream);
+        let control = Arc::clone(&state.execution);
+        let mut cancel_write = Box::pin(state.storage.execute_priority(
+            PriorityKind::CancelExecution,
+            move |tx| {
+                super::control::cancel_upstream(tx, &control, dispatcher, execution_id, caller)?;
+                Ok::<_, WriteTxError<Infallible>>(())
+            },
+        ));
+        if cancel {
+            assert!(futures_util::poll!(cancel_write.as_mut()).is_pending());
+        }
         release_tx.send(())?;
         blocker.await??;
+        if cancel {
+            cancel_write.await?;
+        }
         for command in queued {
             command.await?;
         }
@@ -791,24 +817,33 @@ async fn upstream_completion_retries_full_ingress_and_aborted_batches_without_re
             assert!(matches!(poison.await, Err(WriteError::PreCommitAborted)));
         }
         tokio::time::timeout(Duration::from_secs(3), worker).await?;
-        assert_eq!(upstream.0.load(Ordering::SeqCst), index + 1);
+        assert_eq!(upstream.calls.load(Ordering::SeqCst), index + 1);
         let terminal = *waiter
             .wait_for(|snapshot| snapshot.state.is_terminal())
             .await?;
-        assert_eq!(terminal.state, efferian_protocol::ExecutionState::Succeeded);
         let event = events.try_recv()?;
-        assert!(matches!(
-            &event.envelope.event,
-            efferian_protocol::Event::ExecutionFinished(payload) if payload.execution_id == execution_id
-        ));
+        let result = get(&hub, execution_id, "?sensitive=true").await?;
+        if cancel {
+            assert_eq!(terminal.state, efferian_protocol::ExecutionState::Cancelled);
+            assert_eq!(result["result_access"], "unavailable");
+            assert_eq!(blob_lengths(&hub, execution_id).await?, (0, None));
+            assert!(matches!(
+                &event.envelope.event,
+                efferian_protocol::Event::ExecutionCancelled(payload) if payload.execution_id == execution_id
+            ));
+        } else {
+            assert_eq!(terminal.state, efferian_protocol::ExecutionState::Succeeded);
+            assert_eq!(result["result_access"], "available");
+            assert_eq!(result["result"]["result"]["structuredContent"], Value::Null);
+            assert!(matches!(
+                &event.envelope.event,
+                efferian_protocol::Event::ExecutionFinished(payload) if payload.execution_id == execution_id
+            ));
+        }
         assert!(matches!(
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
-        assert_eq!(
-            get(&hub, execution_id, "?sensitive=true").await?["result"]["result"]["structuredContent"],
-            Value::Null
-        );
     }
     hub.shutdown().await;
     Ok(())
@@ -828,11 +863,11 @@ impl UpstreamDispatcher for ShutdownUpstream {
     fn invoke(
         &self,
         _: InvokeUpstream,
-        mut cancellation: watch::Receiver<bool>,
+        mut cancellation: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async move {
             self.0.notify_one();
-            let _ = cancellation.wait_for(|&cancelled| cancelled).await;
+            cancellation.cancelled().await;
             Err(UpstreamDispatchError::Disconnected)
         })
     }

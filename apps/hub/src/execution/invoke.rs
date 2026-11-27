@@ -91,12 +91,13 @@ struct ToolTestQuery {
     responses(
         (status = 200, description = "Terminal execution", body = ExecutionDetail),
         (status = 202, description = "Active execution", body = ExecutionMetadata),
-        (status = 400, description = "Invalid input, arguments, request ID age, or ambiguous target", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, description = "Profile, tool or target unavailable to this caller", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 409, description = "Request ID conflict or disabled tool", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 410, description = "Referenced tool or account has been deleted", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 429, description = "Node or upstream busy", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 503, description = "Node offline, admission overloaded, or storage pressure", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 400, description = "`invalid_input`, `invalid_arguments`, `request_id_expired` or `ambiguous_target`. For `ambiguous_target`, `extensions.available_targets` is an array of visible ready node names, for example [\"node-a\", \"node-b\"].", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 403, description = "`forbidden`, `principal_disabled`, `owner_disabled`, `managed_by_disabled` or `account_not_bound`. For `account_not_bound`, `extensions.reason` and `extensions.upstream_slug` identify the binding issue.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 404, description = "`not_found` for an unavailable profile, tool or target.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "`request_id_conflict`, `tool_disabled` or `hub_identity_mismatch`.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 410, description = "`tool_not_found` or `account_not_found` for a deleted dependency of the edition.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 429, description = "`node_busy` or `upstream_busy`.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 503, description = "`node_offline`, `overloaded` or `storage_pressure`.", body = ProblemDetails, content_type = "application/problem+json"),
     )
 )]
 async fn profile_invoke(
@@ -140,12 +141,13 @@ pub(crate) async fn invoke_profile_edition(
     responses(
         (status = 200, description = "Terminal execution", body = ExecutionDetail),
         (status = 202, description = "Active execution", body = ExecutionMetadata),
-        (status = 400, description = "Invalid input, arguments, request ID age, or ambiguous target", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, description = "Tool, revision or target unavailable", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 409, description = "Request ID conflict or disabled tool", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 410, description = "Referenced tool or account has been deleted", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 429, description = "Node or upstream busy", body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 503, description = "Node offline, admission overloaded, or storage pressure", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 400, description = "`invalid_input`, `invalid_arguments`, `request_id_expired` or `ambiguous_target`. For `ambiguous_target`, `extensions.available_targets` is an array of visible ready node names, for example [\"node-a\", \"node-b\"].", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 403, description = "`admin_human_required`, `token_narrowed`, `forbidden` or a disabled caller or parent. For `account_not_bound`, `extensions.reason` and `extensions.upstream_slug` identify the binding issue.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 404, description = "`not_found` for an unavailable tool, revision or target.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "`request_id_conflict`, `tool_disabled` or `hub_identity_mismatch`.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 410, description = "`tool_not_found` or `account_not_found` for a deleted dependency of the revision.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 429, description = "`node_busy` or `upstream_busy`.", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 503, description = "`node_offline`, `overloaded` or `storage_pressure`.", body = ProblemDetails, content_type = "application/problem+json"),
     )
 )]
 async fn tool_test(
@@ -422,6 +424,14 @@ fn replay(
     match resource {
         InvokeResource::Profile { profile_id, .. } => {
             authorize_profile_invoke_replay(ctx, Some(profile_id), &target)?;
+            if let Resource::Profile {
+                edition: Some(requested),
+                ..
+            } = &input.resource
+                && recorded.profile_version != Some(requested.get())
+            {
+                return Err(ApiError::conflict(code::REQUEST_ID_CONFLICT).into());
+            }
         }
         InvokeResource::ToolTest { .. } => {
             authorize_admin(ctx)?;

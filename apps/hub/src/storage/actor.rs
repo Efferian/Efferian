@@ -25,6 +25,7 @@ const PRIORITY_BURST: usize = 16;
 pub(crate) const MAX_WORK_BYTES: usize = 4 * 1024 * 1024;
 const EVENTS_CAPACITY: usize = 1024;
 const REVOCATIONS_CAPACITY: usize = 128;
+const MAX_BARRIER_RETRIES: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionSnapshot {
@@ -66,8 +67,8 @@ pub enum ShutdownReport {
 }
 
 impl StorageRuntime {
-    /// Resolves when the background writer thread exits (either gracefully or
-    /// after an unrecoverable error). Safe to use in a supervisor `select!`.
+    /// Resolves when the writer stops accepting commands. Reader drain and
+    /// SQLite close can still be in progress until `shutdown` joins the thread.
     pub async fn wait_stopped(&self) {
         let mut rx = self.stopped.clone();
         let _ = rx.wait_for(|&stopped| stopped).await;
@@ -197,13 +198,20 @@ impl StorageHandle {
     }
 
     pub(crate) async fn work_barrier(&self) -> Result<(), WriteError<std::convert::Infallible>> {
+        let mut commit_retries = 0;
         loop {
             match self.execute_work(0, |_| Ok(())).await {
-                Err(WriteError::Storage(StorageError::Overloaded)) => {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                Err(WriteError::Storage(StorageError::Overloaded)) => {}
+                Err(WriteError::PreCommitAborted | WriteError::CommitOutcomeUnknown)
+                    if commit_retries < MAX_BARRIER_RETRIES =>
+                {
+                    commit_retries += 1;
                 }
                 result => return result,
             }
+            // A neighboring command can roll back the barrier's entire batch.
+            // Re-enqueuing an empty barrier remains safe after an unknown commit.
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -295,9 +303,10 @@ impl OpenedDb {
                 }));
                 // End live streams promptly if the writer can no longer publish.
                 drop(actor);
-                writer_readers.finish_close(failed);
+                writer_readers.stop(failed);
+                stopped_tx.send_replace(true);
+                writer_readers.wait_drained();
                 let (report, lock) = finish_writer(self, result);
-                let _ = stopped_tx.send(true);
                 (report, lock)
             })?;
         Ok((
@@ -397,7 +406,10 @@ impl DbActor {
                 }),
                 Err(error) => Err(error),
             },
-            (_, Some(error)) => Err(error),
+            (_, Some(error)) => {
+                effects.publish_indeterminate();
+                Err(error)
+            }
             _ if db.conn.is_autocommit() => Ok(()),
             _ => db
                 .conn
@@ -440,12 +452,16 @@ impl DbActor {
             let (outcome, error) =
                 run_transaction(db, &mut commands, &mut effects, &self.waiters, &mut probe);
             if !matches!(outcome, BatchOutcome::Committed) {
+                if let Some(error) = error {
+                    effects.publish_indeterminate();
+                    return Err(error);
+                }
                 if !db.conn.is_autocommit() {
                     db.conn.execute_batch("ROLLBACK")?;
                 }
-                return Err(error.unwrap_or(StorageError::InvalidDatabase(
+                return Err(StorageError::InvalidDatabase(
                     "post-commit continuation could not be persisted",
-                )));
+                ));
             }
             self.maintenance.after_write(
                 db,
@@ -591,6 +607,7 @@ struct Effects {
     updated: Vec<(ExecutionId, ExecutionSnapshot)>,
     finished: Vec<(ExecutionId, ExecutionSnapshot)>,
     hooks: Vec<Box<dyn FnOnce() -> Option<FollowUpWrite> + Send>>,
+    indeterminate_hooks: Vec<Box<dyn FnOnce() + Send>>,
     wrote_result_blob: bool,
 }
 
@@ -602,7 +619,16 @@ impl Effects {
         self.updated.extend(other.updated);
         self.finished.extend(other.finished);
         self.hooks.extend(other.hooks);
+        self.indeterminate_hooks.extend(other.indeterminate_hooks);
         self.wrote_result_blob |= other.wrote_result_blob;
+    }
+
+    fn publish_indeterminate(self) {
+        // Keep staged commit hooks alive until the associated guards have had
+        // a chance to fail closed. A durable commit cannot be ruled out.
+        for hook in self.indeterminate_hooks {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
+        }
     }
 }
 
@@ -715,6 +741,12 @@ impl WriteTx<'_> {
         hook: impl FnOnce() -> Option<FollowUpWrite> + Send + 'static,
     ) {
         self.effects.hooks.push(Box::new(hook));
+    }
+
+    /// Fail closed when SQLite ends a failed COMMIT without a provable rollback.
+    /// This runs before staged commit hooks are discarded and the writer stops.
+    pub(crate) fn on_indeterminate_commit(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.effects.indeterminate_hooks.push(Box::new(hook));
     }
 }
 

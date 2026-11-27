@@ -119,6 +119,16 @@ fn openapi_covers_the_complete_v1_surface() -> TestResult {
     );
     assert!(stream["responses"]["200"]["headers"]["X-Accel-Buffering"].is_object());
     for path in ["/v1/events", "/v1/events/stream"] {
+        let description = paths[path]["get"]["responses"]["410"]["description"]
+            .as_str()
+            .ok_or("missing resynchronization description")?;
+        for part in [
+            "resync_required",
+            "extensions.oldest_available_seq",
+            "extensions.latest_seq",
+        ] {
+            assert!(description.contains(part), "{path}: missing {part}");
+        }
         let parameters = paths[path]["get"]["parameters"]
             .as_array()
             .ok_or("missing parameters")?;
@@ -131,6 +141,86 @@ fn openapi_covers_the_complete_v1_surface() -> TestResult {
         assert_eq!(
             kinds["schema"]["items"]["$ref"],
             "#/components/schemas/EventKind"
+        );
+    }
+    for path in ["/v1/profiles/{slug}/invoke", "/v1/tools/{slug}/test"] {
+        let description = paths[path]["post"]["responses"]["400"]["description"]
+            .as_str()
+            .ok_or("missing target selection description")?;
+        assert!(description.contains("ambiguous_target"));
+        assert!(description.contains("extensions.available_targets"));
+    }
+    Ok(())
+}
+
+#[test]
+fn openapi_preserves_page_items_and_execution_response_types() -> TestResult {
+    let doc: Value = serde_json::from_slice(&efferian_hub::openapi_bytes()?)?;
+    let paths = &doc["paths"];
+    let schemas = &doc["components"]["schemas"];
+    for (resource, item) in [
+        ("accounts", "AccountMetadata"),
+        ("account-bindings", "AccountBindingMetadata"),
+        ("executions", "ExecutionMetadata"),
+        ("profiles", "ProfileSummary"),
+        ("tools", "ToolSummary"),
+        ("upstreams", "UpstreamSummary"),
+    ] {
+        let path = format!("/v1/{resource}");
+        let page = format!("Page_{item}");
+        let op = &paths[path.as_str()]["get"];
+        assert_eq!(
+            op["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{page}")
+        );
+        let properties = &schemas[page.as_str()]["properties"];
+        assert_eq!(properties["items"]["type"], "array");
+        assert!(schemas[item].is_object());
+        assert_eq!(properties["items"]["items"], schemas[item]);
+        assert_eq!(
+            properties["next_cursor"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        let limit = op["parameters"]
+            .as_array()
+            .and_then(|params| params.iter().find(|param| param["name"] == "limit"))
+            .ok_or("page limit is missing")?;
+        assert_eq!(limit["schema"]["minimum"], 1);
+        assert_eq!(limit["schema"]["maximum"], 200);
+    }
+
+    for (path, method, status, schema) in [
+        ("/v1/tools/{slug}/test", "post", "200", "ExecutionDetail"),
+        ("/v1/tools/{slug}/test", "post", "202", "ExecutionMetadata"),
+        (
+            "/v1/profiles/{slug}/invoke",
+            "post",
+            "200",
+            "ExecutionDetail",
+        ),
+        (
+            "/v1/profiles/{slug}/invoke",
+            "post",
+            "202",
+            "ExecutionMetadata",
+        ),
+        ("/v1/executions/{id}", "get", "200", "ExecutionDetail"),
+        (
+            "/v1/executions/{id}/cancel",
+            "post",
+            "200",
+            "ExecutionMetadata",
+        ),
+        (
+            "/v1/executions/{id}/cancel",
+            "post",
+            "202",
+            "ExecutionMetadata",
+        ),
+    ] {
+        assert_eq!(
+            paths[path][method]["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{schema}")
         );
     }
     Ok(())

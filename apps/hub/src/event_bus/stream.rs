@@ -12,38 +12,38 @@ use hyper::body::{Body as HttpBody, Frame};
 use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
-use super::{CATCH_UP_LIMIT, EventKinds};
-use crate::http::AppState;
-use crate::storage::{
-    EventsPageRaw, EventsReadError, RevocationWatch, StorageClock, StorageHandle, StoredEvent,
-};
+use super::{AuthorizedPage, CATCH_UP_LIMIT, EventKinds, EventReader, PageError};
+use crate::storage::{EventsPageRaw, EventsReadError, RevocationWatch, StorageClock, StoredEvent};
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 pub(super) fn body(
-    state: AppState,
-    context: AuthContext,
+    reader: EventReader,
+    shutdown: watch::Receiver<bool>,
     kinds: EventKinds,
     revocations: RevocationWatch,
     events: broadcast::Receiver<Arc<StoredEvent>>,
     after: i64,
-    initial: EventsPageRaw,
+    initial: AuthorizedPage,
 ) -> Body {
-    let shutdown = state.execution.shutdown_receiver();
     let mut ping = tokio::time::interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let AuthorizedPage {
+        scope,
+        events: page,
+    } = initial;
     let stream = EventStream {
-        context,
+        context: scope,
         kinds,
         revocations,
         shutdown,
         ping,
-        clock: state.clock,
+        clock: reader.clock.clone(),
         feed: Feed {
-            storage: state.storage,
+            reader,
             events,
             after,
-            page: Some(Page::new(initial.latest_seq, initial)),
+            page: Some(Page::new(page.latest_seq, page)),
             pending: None,
         },
     };
@@ -119,7 +119,10 @@ impl EventStream {
                     item = self.feed.next(&self.context, &self.kinds) => match item {
                         Ok(FeedItem::Event(event)) => break EventStreamFrame::Event { event },
                         Ok(FeedItem::Skipped) => {}
-                        Err(EventsReadError::ResyncRequired { oldest_available_seq, latest_seq }) => {
+                        Err(PageError::Events(EventsReadError::ResyncRequired {
+                            oldest_available_seq,
+                            latest_seq,
+                        })) => {
                             break EventStreamFrame::ResyncRequired { oldest_available_seq, latest_seq };
                         }
                         Ok(FeedItem::Closed) | Err(_) => return None,
@@ -162,10 +165,10 @@ async fn wait_for_expiry(clock: &dyn StorageClock, expiry: Option<i64>) {
     }
 }
 
-type PageRead = Pin<Box<dyn Future<Output = Result<EventsPageRaw, EventsReadError>> + Send>>;
+type PageRead = Pin<Box<dyn Future<Output = Result<EventsPageRaw, PageError>> + Send>>;
 
 struct Feed {
-    storage: StorageHandle,
+    reader: EventReader,
     events: broadcast::Receiver<Arc<StoredEvent>>,
     after: i64,
     page: Option<Page>,
@@ -201,11 +204,7 @@ enum FeedItem {
 }
 
 impl Feed {
-    async fn next(
-        &mut self,
-        ctx: &AuthContext,
-        kinds: &EventKinds,
-    ) -> Result<FeedItem, EventsReadError> {
+    async fn next(&mut self, ctx: &AuthContext, kinds: &EventKinds) -> Result<FeedItem, PageError> {
         loop {
             if let Some((through, pending)) = &mut self.pending {
                 let page = pending.await?;
@@ -236,23 +235,14 @@ impl Feed {
     fn read_page(&mut self, through: Option<i64>) {
         // Preserve this read across selections of a ping or irrelevant revocation.
         let after = self.after;
-        let storage = self.storage.clone();
-        let hub = *storage.hub_id();
+        let reader = self.reader.clone();
         self.pending = Some((
             through,
             Box::pin(async move {
-                storage
-                    .read_snapshot(move |conn| {
-                        StorageHandle::read_events_page(
-                            conn,
-                            hub,
-                            after,
-                            through,
-                            CATCH_UP_LIMIT,
-                            false,
-                        )
-                    })
+                reader
+                    .read(after, through, CATCH_UP_LIMIT, false)
                     .await
+                    .map(|page| page.events)
             }),
         ));
     }
@@ -262,6 +252,8 @@ impl Feed {
             return FeedItem::Skipped;
         }
         self.after = event.envelope.seq;
+        // SQLite pages already passed their fresh snapshot's authorization.
+        // The opening scope also applies here so a grant cannot widen the stream.
         if kinds.permits(ctx, event) {
             FeedItem::Event(event.envelope.clone())
         } else {

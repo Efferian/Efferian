@@ -195,7 +195,7 @@ fn client() -> Client {
 }
 
 #[tokio::test]
-async fn startup_recovers_upstream_and_sigterm_drains_waiter_and_stream() {
+async fn startup_recovers_upstream_and_preserves_pending_node_execution() {
     let client = client();
     let dir = RunDir::new();
     let state = dir.path("state");
@@ -252,9 +252,7 @@ async fn startup_recovers_upstream_and_sigterm_drains_waiter_and_stream() {
     }
     conn.close().unwrap();
 
-    let config = dir.path("hub.toml");
-    fs::write(&config, "max_app_requests = 1\n").unwrap();
-    let server = Server::start(&state, "2", Some(&config));
+    let server = Server::start(&state, "2", None);
     let recovered = json(
         client
             .get(server.url(&format!("executions/{upstream_execution}")))
@@ -273,46 +271,8 @@ async fn startup_recovers_upstream_and_sigterm_drains_waiter_and_stream() {
     .await;
     assert_eq!(status["active_waiters_count"], 1);
     assert_eq!(status["active_upstream_executions"], 0);
-    let last_seq = status["events_head_seq"].as_u64().unwrap();
-    assert!(last_seq > 0);
-
-    let waiter = {
-        let request = client
-            .get(server.url(&format!("executions/{node_execution}?wait_ms=25000")))
-            .bearer_auth(&credential);
-        tokio::spawn(json(request, StatusCode::OK))
-    };
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let probe = client
-                .get(server.url("admin/status"))
-                .bearer_auth(&credential)
-                .send()
-                .await
-                .unwrap();
-            if probe.status() == StatusCode::SERVICE_UNAVAILABLE {
-                break;
-            }
-            drop(probe);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-
-    let stream = client
-        .get(server.url(&format!("events/stream?after={last_seq}")))
-        .bearer_auth(&credential)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(stream.status(), StatusCode::OK);
-    let stop = tokio::task::spawn_blocking(move || server.stop("TERM"));
-    let state_on_shutdown = waiter.await.unwrap();
-    assert_eq!(state_on_shutdown["state"], "accepted");
-    assert_eq!(state_on_shutdown["result_access"], "not_requested");
-    assert!(stream.bytes().await.unwrap().is_empty());
-    stop.await.unwrap();
+    assert!(status["events_head_seq"].as_u64().unwrap() > 0);
+    server.stop("TERM");
 
     let server = Server::start(&state, "2", None);
     let pending = json(

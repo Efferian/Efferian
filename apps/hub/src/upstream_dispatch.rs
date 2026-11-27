@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
+pub(crate) use crate::execution::state::UpstreamCancellation;
 use bytes::Bytes;
 use efferian_protocol::{
     AccountId, DiscoveredUpstreamTool, ExecutionId, HttpAuthSecret, PrincipalId, UpstreamId,
 };
 use serde_json::{Map, Value};
-use tokio::sync::watch;
 
 pub(crate) type DispatchFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -86,10 +86,16 @@ pub(crate) trait UpstreamDispatcher: Send + Sync {
     }
 
     /// Returns the bounded JSON value of the corresponding MCP result.
+    ///
+    /// Before starting external I/O, call `cancellation.may_start_io().await`.
+    /// Check it again after asynchronous pool or connection setup, immediately
+    /// before sending the tool request. It waits for staged cancellations to
+    /// commit or roll back. After sending, use `cancelled().await` to stop this
+    /// execution's I/O without interrupting unrelated pooled requests.
     fn invoke(
         &self,
         _request: InvokeUpstream,
-        _cancellation: watch::Receiver<bool>,
+        _cancellation: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async { Err(UpstreamDispatchError::Unavailable) })
     }

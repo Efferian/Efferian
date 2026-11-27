@@ -1558,7 +1558,7 @@
             }
           },
           "410": {
-            "description": "Cursor requires resync",
+            "description": "resync_required if after is nonzero and older than the last pruned sequence or if it exceeds the outbox head. extensions.oldest_available_seq gives the first sequence after the pruned prefix. extensions.latest_seq gives the outbox head.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1694,7 +1694,7 @@
             }
           },
           "410": {
-            "description": "Cursor requires resync",
+            "description": "resync_required before streaming if after is nonzero and older than the last pruned sequence or if it exceeds the outbox head. extensions.oldest_available_seq gives the first sequence after the pruned prefix. extensions.latest_seq gives the outbox head.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4890,7 +4890,7 @@
             }
           },
           "400": {
-            "description": "Invalid input, arguments, request ID age, or ambiguous target",
+            "description": "`invalid_input`, `invalid_arguments`, `request_id_expired` or `ambiguous_target`. For `ambiguous_target`, `extensions.available_targets` is an array of visible ready node names, for example [\"node-a\", \"node-b\"].",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4910,7 +4910,7 @@
             }
           },
           "403": {
-            "description": "The request is forbidden.",
+            "description": "`forbidden`, `principal_disabled`, `owner_disabled`, `managed_by_disabled` or `account_not_bound`. For `account_not_bound`, `extensions.reason` and `extensions.upstream_slug` identify the binding issue.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4920,7 +4920,7 @@
             }
           },
           "404": {
-            "description": "Profile, tool or target unavailable to this caller",
+            "description": "`not_found` for an unavailable profile, tool or target.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4940,7 +4940,7 @@
             }
           },
           "409": {
-            "description": "Request ID conflict or disabled tool",
+            "description": "`request_id_conflict`, `tool_disabled` or `hub_identity_mismatch`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4950,7 +4950,7 @@
             }
           },
           "410": {
-            "description": "Referenced tool or account has been deleted",
+            "description": "`tool_not_found` or `account_not_found` for a deleted dependency of the edition.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4980,7 +4980,7 @@
             }
           },
           "429": {
-            "description": "Node or upstream busy",
+            "description": "`node_busy` or `upstream_busy`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5000,7 +5000,7 @@
             }
           },
           "503": {
-            "description": "Node offline, admission overloaded, or storage pressure",
+            "description": "`node_offline`, `overloaded` or `storage_pressure`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6687,7 +6687,7 @@
             }
           },
           "400": {
-            "description": "Invalid input, arguments, request ID age, or ambiguous target",
+            "description": "`invalid_input`, `invalid_arguments`, `request_id_expired` or `ambiguous_target`. For `ambiguous_target`, `extensions.available_targets` is an array of visible ready node names, for example [\"node-a\", \"node-b\"].",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6707,7 +6707,7 @@
             }
           },
           "403": {
-            "description": "The request is forbidden.",
+            "description": "`admin_human_required`, `token_narrowed`, `forbidden` or a disabled caller or parent. For `account_not_bound`, `extensions.reason` and `extensions.upstream_slug` identify the binding issue.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6717,7 +6717,7 @@
             }
           },
           "404": {
-            "description": "Tool, revision or target unavailable",
+            "description": "`not_found` for an unavailable tool, revision or target.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6737,7 +6737,7 @@
             }
           },
           "409": {
-            "description": "Request ID conflict or disabled tool",
+            "description": "`request_id_conflict`, `tool_disabled` or `hub_identity_mismatch`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6747,7 +6747,7 @@
             }
           },
           "410": {
-            "description": "Referenced tool or account has been deleted",
+            "description": "`tool_not_found` or `account_not_found` for a deleted dependency of the revision.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6777,7 +6777,7 @@
             }
           },
           "429": {
-            "description": "Node or upstream busy",
+            "description": "`node_busy` or `upstream_busy`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6797,7 +6797,7 @@
             }
           },
           "503": {
-            "description": "Node offline, admission overloaded, or storage pressure",
+            "description": "`node_offline`, `overloaded` or `storage_pressure`.",
             "content": {
               "application/problem+json": {
                 "schema": {

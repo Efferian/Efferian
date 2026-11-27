@@ -345,6 +345,8 @@ async fn deadline_sweeper(app: AppState) {
 
 #[cfg(test)]
 mod tests {
+    mod shutdown;
+
     use super::*;
 
     #[test]

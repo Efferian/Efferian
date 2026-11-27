@@ -8,7 +8,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::config::Config;
 use crate::http::AppState;
-use crate::storage::{CloseExecutions, StorageHandle, WriteError};
+use crate::storage::{
+    CloseExecutions, StorageError, StorageHandle, TRANSITION_BATCH, WriteError, WriteTx,
+};
+use crate::upstream_dispatch::UpstreamDispatcher;
 
 /// Shared limits and cancellation handles for active execution I/O and REST waiters.
 pub(crate) struct ExecutionControl {
@@ -32,7 +35,21 @@ struct UpstreamReservations {
 struct ReservedUpstream {
     resource: UpstreamId,
     principal: PrincipalId,
-    cancel: watch::Sender<bool>,
+    phase: Arc<watch::Sender<UpstreamPhase>>,
+}
+
+#[derive(Clone, Copy)]
+enum UpstreamPhase {
+    Ready,
+    Started,
+    CancelStaged { was_started: bool },
+    Cancelled,
+}
+
+impl UpstreamPhase {
+    fn cancellation_staged(self) -> bool {
+        matches!(self, Self::CancelStaged { .. })
+    }
 }
 
 impl ExecutionControl {
@@ -54,8 +71,11 @@ impl ExecutionControl {
     }
 
     pub(crate) fn stop(&self) {
+        let upstreams = lock(&self.upstreams);
         self.shutdown.send_replace(true);
-        self.cancel_all_upstreams();
+        for upstream in upstreams.executions.values() {
+            upstream.phase.send_replace(UpstreamPhase::Cancelled);
+        }
     }
 
     pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<bool> {
@@ -76,6 +96,11 @@ impl ExecutionControl {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_waiter_permits(&self) -> usize {
+        lock(&self.waiters_per_principal).values().sum()
+    }
+
     /// Called only after the writer's replay lookup misses. Rollback drops the
     /// staged guard and releases all three slots before another admission.
     pub(crate) fn reserve_upstream(
@@ -94,31 +119,71 @@ impl ExecutionControl {
         let Entry::Vacant(entry) = slots.executions.entry(execution_id) else {
             return None;
         };
-        let (cancel, cancellation) = watch::channel(false);
+        let (phase, receiver) = watch::channel(UpstreamPhase::Ready);
         entry.insert(ReservedUpstream {
             resource,
             principal,
-            cancel,
+            phase: Arc::new(phase),
         });
         *slots.resources.entry(resource).or_default() += 1;
         *slots.principals.entry(principal).or_default() += 1;
         Some(UpstreamReservation {
             control: Arc::clone(self),
             execution_id,
-            cancellation,
+            receiver,
         })
     }
 
-    pub(crate) fn cancel_upstream(&self, execution_id: ExecutionId) {
-        if let Some(slot) = lock(&self.upstreams).executions.get(&execution_id) {
-            slot.cancel.send_replace(true);
+    /// Reserve the cancellation before its write can commit. Dropping the
+    /// guard rolls back the fence, including when the actor aborts a batch.
+    fn stage_cancel_upstream(
+        &self,
+        tx: &mut WriteTx<'_>,
+        execution_id: ExecutionId,
+    ) -> Option<StagedUpstreamCancel> {
+        let upstreams = lock(&self.upstreams);
+        let slot = upstreams.executions.get(&execution_id)?;
+        let staged = slot.phase.send_if_modified(|phase| {
+            let was_started = match *phase {
+                UpstreamPhase::Ready => false,
+                UpstreamPhase::Started => true,
+                UpstreamPhase::CancelStaged { .. } | UpstreamPhase::Cancelled => return false,
+            };
+            *phase = UpstreamPhase::CancelStaged { was_started };
+            true
+        });
+        if !staged {
+            return None;
         }
+        let phase = Arc::clone(&slot.phase);
+        tx.on_indeterminate_commit(move || {
+            phase.send_replace(UpstreamPhase::Cancelled);
+        });
+        Some(StagedUpstreamCancel(Arc::clone(&slot.phase)))
     }
 
-    pub(crate) fn cancel_all_upstreams(&self) {
-        for upstream in lock(&self.upstreams).executions.values() {
-            upstream.cancel.send_replace(true);
+    fn claim_start(&self, execution_id: ExecutionId) -> StartDecision {
+        let slots = lock(&self.upstreams);
+        if !self.is_accepting() {
+            return StartDecision::Finished;
         }
+        let Some(slot) = slots.executions.get(&execution_id) else {
+            return StartDecision::Finished;
+        };
+        let mut decision = StartDecision::Finished;
+        slot.phase.send_if_modified(|phase| match *phase {
+            UpstreamPhase::Ready => {
+                *phase = UpstreamPhase::Started;
+                decision = StartDecision::Claimed;
+                true
+            }
+            UpstreamPhase::CancelStaged { .. } => {
+                decision = StartDecision::Wait;
+                false
+            }
+            UpstreamPhase::Started | UpstreamPhase::Cancelled => false,
+        });
+        decision
     }
 }
 
@@ -137,15 +202,80 @@ impl Drop for WaiterPermit {
     }
 }
 
+enum StartDecision {
+    Claimed,
+    Wait,
+    Finished,
+}
+
+/// The guard is held by the writer or its after-commit hook. Its channel is
+/// tied to this reservation even after the worker frees its slot.
+struct StagedUpstreamCancel(Arc<watch::Sender<UpstreamPhase>>);
+
+impl StagedUpstreamCancel {
+    fn commit(self) {
+        self.0.send_replace(UpstreamPhase::Cancelled);
+    }
+}
+
+impl Drop for StagedUpstreamCancel {
+    fn drop(&mut self) {
+        self.0.send_if_modified(|phase| {
+            let UpstreamPhase::CancelStaged { was_started } = *phase else {
+                return false;
+            };
+            *phase = if was_started {
+                UpstreamPhase::Started
+            } else {
+                UpstreamPhase::Ready
+            };
+            true
+        });
+    }
+}
+
 pub(crate) struct UpstreamReservation {
     control: Arc<ExecutionControl>,
     execution_id: ExecutionId,
-    cancellation: watch::Receiver<bool>,
+    receiver: watch::Receiver<UpstreamPhase>,
 }
 
 impl UpstreamReservation {
-    pub(crate) fn cancellation(&self) -> watch::Receiver<bool> {
-        self.cancellation.clone()
+    pub(crate) async fn claim_start(&mut self) -> Option<UpstreamCancellation> {
+        loop {
+            match self.control.claim_start(self.execution_id) {
+                StartDecision::Claimed => return Some(UpstreamCancellation(self.receiver.clone())),
+                StartDecision::Finished => return None,
+                StartDecision::Wait => {
+                    self.receiver
+                        .wait_for(|phase| !phase.cancellation_staged())
+                        .await
+                        .ok()?;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct UpstreamCancellation(watch::Receiver<UpstreamPhase>);
+
+impl UpstreamCancellation {
+    /// Observe the latest committed cancellation, waiting out a staged write.
+    pub(crate) async fn may_start_io(&mut self) -> bool {
+        self.0
+            .wait_for(|phase| !phase.cancellation_staged())
+            .await
+            .is_ok_and(|phase| matches!(*phase, UpstreamPhase::Started))
+    }
+
+    /// Resolves for committed cancellation, Hub stop, or a retired reservation.
+    #[allow(dead_code, reason = "the live upstream transport observes this signal")]
+    pub(crate) async fn cancelled(&mut self) {
+        let _ = self
+            .0
+            .wait_for(|phase| matches!(phase, UpstreamPhase::Cancelled))
+            .await;
     }
 }
 
@@ -177,6 +307,25 @@ fn decrement<K: Eq + std::hash::Hash>(map: &mut HashMap<K, usize>, key: K) {
     }
 }
 
+pub(super) fn cancel_upstream(
+    tx: &mut WriteTx<'_>,
+    control: &ExecutionControl,
+    dispatcher: Arc<dyn UpstreamDispatcher>,
+    id: ExecutionId,
+    caller: PrincipalId,
+) -> Result<(), StorageError> {
+    let cancellation = control.stage_cancel_upstream(tx, id);
+    if tx.cancel_upstream_execution(id, caller)? {
+        tx.on_commit(move || {
+            if let Some(cancellation) = cancellation {
+                cancellation.commit();
+            }
+            dispatcher.cancel(id);
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn recover_upstreams(
     storage: &StorageHandle,
 ) -> Result<(), WriteError<Infallible>> {
@@ -198,6 +347,10 @@ async fn close_executions(
     sweep_state: Option<&AppState>,
     cause: CloseExecutions,
 ) -> Result<(), WriteError<Infallible>> {
+    const CLOSE_RETRIES: u8 = 4;
+    const CLOSE_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+    let mut retries = 0;
     loop {
         if sweep_state.is_some_and(|state| !state.execution.is_accepting()) {
             return Ok(());
@@ -205,14 +358,21 @@ async fn close_executions(
         let state = sweep_state.cloned();
         let completed = storage
             .execute_work(0, move |tx| {
-                let (completed, upstreams) = tx.close_executions(cause)?;
+                let mut cancellations = Vec::new();
+                let completed = tx.close_executions(cause, |tx, id| {
+                    if let Some(state) = &state {
+                        cancellations.push((id, state.execution.stage_cancel_upstream(tx, id)));
+                    }
+                })?;
                 if let Some(state) = state
-                    && !upstreams.is_empty()
+                    && !cancellations.is_empty()
                 {
                     tx.on_commit(move || {
-                        for execution_id in upstreams {
-                            state.execution.cancel_upstream(execution_id);
-                            state.upstream.cancel(execution_id);
+                        for (id, cancellation) in cancellations {
+                            if let Some(cancellation) = cancellation {
+                                cancellation.commit();
+                            }
+                            state.upstream.cancel(id);
                         }
                     });
                 }
@@ -220,20 +380,17 @@ async fn close_executions(
             })
             .await;
         match completed {
-            Ok(completed) if completed < crate::storage::TRANSITION_BATCH => return Ok(()),
-            Ok(_) => {}
-            Err(error) => match cause {
-                // During shutdown the actor remains available to finish accepted work.
-                CloseExecutions::Shutdown
-                    if matches!(
-                        error,
-                        WriteError::Storage(crate::storage::StorageError::Overloaded)
-                    ) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                _ => return Err(error),
-            },
+            Ok(completed) if completed < TRANSITION_BATCH => return Ok(()),
+            Ok(_) => retries = 0,
+            Err(
+                WriteError::PreCommitAborted
+                | WriteError::CommitOutcomeUnknown
+                | WriteError::Storage(StorageError::Overloaded),
+            ) if !matches!(cause, CloseExecutions::Deadline) && retries < CLOSE_RETRIES => {
+                retries += 1;
+                tokio::time::sleep(CLOSE_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
         }
     }
 }

@@ -282,6 +282,78 @@ async fn broadcast_lag_catches_up_or_resyncs_even_from_zero() -> TestResult {
 }
 
 #[tokio::test]
+async fn lag_recovery_intersects_opening_grants_and_current_durable_permissions() -> TestResult {
+    let hub = TestHub::start("event-lag-auth", Config::default(), 10_000).await?;
+    let member = create_principal(&hub, "member", json!({"kind": "member"})).await?;
+    let (_, token) = mint(&hub, member, None).await?;
+    let (revoked_id, revoked_token) = mint(&hub, member, None).await?;
+    let original = ProfileId::new();
+    let gained = ProfileId::new();
+    hub.write(move |conn| {
+        conn.execute(
+            "INSERT INTO profiles (profile_id, slug, discovery_mode, created_at_ms, updated_at_ms)
+             VALUES (?1, 'original', 'full', 10000, 10000), (?2, 'gained', 'full', 10000, 10000)",
+            params![original.to_string(), gained.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let grant = |profile| {
+        hub.request_admin(
+            Method::PUT,
+            "/v1/grants",
+            Some(json!({
+                "principal_id": member,
+                "scope": GrantScope::Profile(profile),
+                "capability": "discover"
+            })),
+        )
+    };
+    let (status, response) = grant(original).await?;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let mut active = stream(&hub, "/v1/events/stream", &token).await?;
+    let mut revoked = stream(&hub, "/v1/events/stream", &revoked_token).await?;
+
+    // Model the window after COMMIT and before RevocationWatch publishes.
+    hub.write(move |conn| {
+        conn.execute(
+            "DELETE FROM grants WHERE principal_id = ?1 AND scope_kind = 'profile' AND scope_id = ?2",
+            params![member.to_string(), original.to_string()],
+        )?;
+        conn.execute(
+            "UPDATE auth_tokens SET revoked_at_ms = 10000 WHERE token_id = ?1",
+            [revoked_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let (status, response) = grant(gained).await?;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let hidden = Event::PrincipalRevoked(hub.admin_id);
+    append(
+        &hub,
+        std::iter::repeat_n(hidden, 1_025).chain([
+            Event::ProfilePublished(original),
+            Event::ProfilePublished(gained),
+            Event::PrincipalRevoked(member),
+        ]),
+    )
+    .await?;
+
+    // The original grant was revoked and the newly granted profile is outside the opening scope.
+    let frame = ndjson(&mut active)
+        .await?
+        .ok_or("expected the caller's event")?;
+    assert_eq!(frame["event"]["kind"], "auth.revoked");
+    assert_eq!(frame["event"]["aggregate_id"], member.to_string());
+    assert_eq!(frame["event"]["seq"], 1_028);
+    assert_eq!(ndjson(&mut revoked).await?, None);
+    drop(active);
+    hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_prune_between_initial_catch_up_pages_emits_one_resync() -> TestResult {
     let hub = TestHub::start("event-page-prune", Config::default(), 10_000).await?;
     let visible = Event::ProfilePublished(ProfileId::new());

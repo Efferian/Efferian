@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use axum::http::{Method, StatusCode};
 use efferian_protocol::{GrantId, ProfileId, ToolId};
@@ -14,7 +14,10 @@ struct Invalidations(Mutex<Vec<UpstreamInvalidation>>);
 
 impl UpstreamDispatcher for Invalidations {
     fn invalidate(&self, invalidation: UpstreamInvalidation) {
-        self.0.lock().unwrap().push(invalidation);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(invalidation);
     }
 }
 
@@ -45,7 +48,10 @@ async fn add_human(
         )
         .await?;
     assert_eq!(status, StatusCode::CREATED, "{token}");
-    Ok((principal_id, token["token"].as_str().unwrap().to_owned()))
+    let secret = token["token"]
+        .as_str()
+        .ok_or("token creation did not return a token")?;
+    Ok((principal_id, secret.to_owned()))
 }
 
 fn secret_kv(value: &str) -> Value {
@@ -181,7 +187,10 @@ async fn private_accounts_are_isolated_and_secret_writes_are_idempotent() -> Tes
     assert_eq!(metadata, left.1["account"]);
     assert!(!metadata.to_string().contains("rotated-fixture"));
     assert_eq!(
-        *invalidations.0.lock().unwrap(),
+        *invalidations
+            .0
+            .lock()
+            .map_err(|_| "mock invalidations lock poisoned")?,
         [
             UpstreamInvalidation::Account(alice_account),
             UpstreamInvalidation::Account(bobby_account),

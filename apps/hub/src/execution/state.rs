@@ -31,8 +31,8 @@ mod control;
 mod records;
 
 pub(crate) use control::{
-    ExecutionControl, UpstreamReservation, finish_upstreams_for_shutdown, recover_upstreams,
-    sweep_deadlines,
+    ExecutionControl, UpstreamCancellation, UpstreamReservation, finish_upstreams_for_shutdown,
+    recover_upstreams, sweep_deadlines,
 };
 pub(crate) use records::{ExecutionDetail, ExecutionMetadata, execution_auth_target};
 use records::{
@@ -171,19 +171,18 @@ async fn cancel_execution(
                     }
                 }
                 ExecutorKind::Upstream => {
-                    if tx.cancel_upstream_execution(id, ctx.caller.principal_id)? {
-                        tx.on_commit(move || {
-                            execution.cancel_upstream(id);
-                            upstream.cancel(id);
-                        });
-                    }
+                    control::cancel_upstream(
+                        tx,
+                        &execution,
+                        upstream,
+                        id,
+                        ctx.caller.principal_id,
+                    )?;
                 }
             }
-            Ok(
-                read_execution(tx.conn(), id)?.ok_or(WriteTxError::InvalidDatabase(
-                    "execution disappeared during cancel",
-                ))?,
-            )
+            read_execution(tx.conn(), id)?.ok_or(WriteTxError::InvalidDatabase(
+                "execution disappeared during cancel",
+            ))
         })
         .await?;
     let status = if row.fields.state.is_terminal() {

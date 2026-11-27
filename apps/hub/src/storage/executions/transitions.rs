@@ -329,11 +329,13 @@ impl WriteTx<'_> {
         )
     }
 
-    /// Returns the number processed and IDs whose upstream I/O should stop after commit.
+    /// Close one batch. The caller can stage a dispatch fence before each
+    /// upstream transition and confirm it after the enclosing commit.
     pub(crate) fn close_executions(
         &mut self,
         cause: CloseExecutions,
-    ) -> Result<(usize, Vec<ExecutionId>), StorageError> {
+        mut stage_upstream_cancel: impl FnMut(&mut Self, ExecutionId),
+    ) -> Result<usize, StorageError> {
         let suffix = match cause {
             CloseExecutions::Deadline => {
                 "AND deadline_at_ms <= ?1 ORDER BY deadline_at_ms, execution_id LIMIT ?2"
@@ -353,8 +355,10 @@ impl WriteTx<'_> {
                 TransitionRow::read,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut upstreams = Vec::new();
         for row in &rows {
+            if row.executor == ExecutorKind::Upstream {
+                stage_upstream_cancel(self, row.id);
+            }
             self.finish_active(
                 row,
                 ActorId::Hub(self.hub_id),
@@ -363,11 +367,8 @@ impl WriteTx<'_> {
                 None,
                 false,
             )?;
-            if row.executor == ExecutorKind::Upstream {
-                upstreams.push(row.id);
-            }
         }
-        Ok((rows.len(), upstreams))
+        Ok(rows.len())
     }
 
     fn finish_active(

@@ -171,17 +171,16 @@ async fn prepare_managed_result(
 pub(crate) async fn run_upstream(
     state: AppState,
     request: InvokeUpstream,
-    reservation: UpstreamReservation,
+    mut reservation: UpstreamReservation,
     caller_principal_id: PrincipalId,
     timeout: Duration,
     deadline_at_ms: i64,
 ) {
     let execution_id = request.execution_id;
-    let cancellation = reservation.cancellation();
-    if !state.execution.is_accepting()
-        || *cancellation.borrow()
-        || state.clock.wall_now_ms() >= deadline_at_ms
-    {
+    let Some(mut cancellation) = reservation.claim_start().await else {
+        return;
+    };
+    if !cancellation.may_start_io().await || state.clock.wall_now_ms() >= deadline_at_ms {
         return;
     }
     let result = tokio::time::timeout(timeout, state.upstream.invoke(request, cancellation)).await;

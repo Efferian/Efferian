@@ -1,6 +1,12 @@
-use axum::http::Method;
-use efferian_protocol::{AccountId, EventKind, GrantId, NodeId};
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::{Method, Request};
+use efferian_protocol::{AccountId, EventKind, EventStreamFrame, GrantId, NodeId};
+use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use tokio::time::timeout;
+use tower_service::Service;
 
 use super::*;
 use crate::{
@@ -207,17 +213,13 @@ async fn publish_pins_an_immutable_tool_and_republishes_a_disabled_edition() -> 
 #[tokio::test]
 async fn delete_profile_emits_one_revocation_for_all_affected_principals() -> TestResult {
     let hub = TestHub::start("catalog-revoke", Config::default(), 1000).await?;
-    let (_, created) = hub
-        .request_admin(
-            Method::PUT,
-            "/v1/profiles/wide",
-            Some(json!({"discovery_mode": "full", "bindings": []})),
-        )
-        .await?;
-    let profile: ProfileId = serde_json::from_value(created["profile"]["profile_id"].clone())?;
+    let profile = create_empty_profile(&hub, "wide").await?;
+    let separate_profile = create_empty_profile(&hub, "separate").await?;
     let admin = hub.admin_id;
     let member = PrincipalId::new_user();
+    let unrelated = PrincipalId::new_user();
     let agent = PrincipalId::new_agent();
+    let purging = PrincipalId::new_agent();
     let orchestrator = PrincipalId::new_service();
     let node = NodeId::new();
     hub.write(move |conn| {
@@ -229,11 +231,18 @@ async fn delete_profile_emits_one_revocation_for_all_affected_principals() -> Te
             "INSERT INTO grants (grant_id, principal_id, scope_kind, scope_id, capability, created_by, created_at_ms)
              VALUES (?1, ?2, 'profile', ?3, 'discover', ?4, 1)",
         )?;
+        let mut grant = |principal: PrincipalId, profile: ProfileId| {
+            insert_grant.execute(params![
+                GrantId::new().to_string(), principal.to_string(), profile.to_string(), admin.to_string()
+            ])
+        };
         for index in 0..140 {
             let principal = if index == 0 { member } else { PrincipalId::new_user() };
             insert_principal.execute(params![principal.to_string(), format!("member-{index}")])?;
-            insert_grant.execute(params![GrantId::new().to_string(), principal.to_string(), profile.to_string(), admin.to_string()])?;
+            grant(principal, profile)?;
         }
+        insert_principal.execute(params![unrelated.to_string(), "unrelated"])?;
+        grant(unrelated, separate_profile)?;
         conn.execute(
             "INSERT INTO principals(principal_id, name, kind, owner_principal_id, managed_by_principal_id,
                 created_at_ms, updated_at_ms) VALUES (?1, 'owned-agent', 'agent', ?2, ?2, 1, 1)",
@@ -244,7 +253,15 @@ async fn delete_profile_emits_one_revocation_for_all_affected_principals() -> Te
              VALUES (?1, 'orchestrator', 'service', 1, 1, 1)",
             [orchestrator.to_string()],
         )?;
-        insert_grant.execute(params![GrantId::new().to_string(), orchestrator.to_string(), profile.to_string(), admin.to_string()])?;
+        grant(orchestrator, profile)?;
+        conn.execute(
+            "INSERT INTO principals(principal_id, name, kind, managed_by_principal_id,
+                disabled_at_ms, created_at_ms, updated_at_ms)
+             VALUES (?1, '~purging:' || ?1, 'agent', ?2, 1, 1, 1)",
+            params![purging.to_string(), orchestrator.to_string()],
+        )?;
+        grant(purging, profile)?;
+        grant(purging, separate_profile)?;
         conn.execute(
             "INSERT INTO nodes(node_id, name, credential_hmac, managed_by_principal_id, created_at_ms, updated_at_ms)
              VALUES (?1, 'managed', 'node-test-hmac', ?2, 1, 1)",
@@ -252,6 +269,40 @@ async fn delete_profile_emits_one_revocation_for_all_affected_principals() -> Te
         )?;
         Ok(())
     }).await?;
+    let mut affected_stream = open_profile_events(&hub, member).await?;
+    let mut unrelated_stream = open_profile_events(&hub, unrelated).await?;
+    assert_eq!(
+        hub.request_admin(Method::POST, "/v1/profiles/wide/publish", None)
+            .await?
+            .0,
+        StatusCode::CREATED
+    );
+    assert_published_frame(&mut affected_stream, profile).await?;
+
+    // Model a committed GC claim with its child rows still present. The manual
+    // monotonic clock stays fixed, so the periodic sweep cannot finish it.
+    hub.write(move |conn| {
+        conn.execute(
+            "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1",
+            [purging.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let claimed_grant: bool = hub
+        .state
+        .storage
+        .read_snapshot(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM grants g JOIN hub_meta h ON h.id = 1
+                 WHERE g.principal_id = h.gc_purging_principal_id AND g.scope_id = ?1)",
+                [profile.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(crate::storage::StorageError::from)
+        })
+        .await?;
+    assert!(claimed_grant);
     let mut watcher = hub.state.storage.subscribe_revocations()?;
     assert_eq!(
         hub.request_admin(Method::DELETE, "/v1/profiles/wide", None)
@@ -263,25 +314,93 @@ async fn delete_profile_emits_one_revocation_for_all_affected_principals() -> Te
     assert_eq!(signal.reason, RevocationReason::ProfileDeleted(profile));
     assert_eq!(signal.affected_principals.len(), 142);
     assert!(signal.affected_principals.contains(&agent));
+    assert!(!signal.affected_principals.contains(&purging));
+    assert!(!signal.affected_principals.contains(&unrelated));
     assert_eq!(signal.affected_nodes, vec![node]);
     assert!(matches!(
         watcher.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
-    let remaining: i64 = hub
-        .state
-        .storage
-        .read_snapshot(move |conn| {
-            conn.query_row(
-                "SELECT count(*) FROM grants WHERE scope_id = ?1",
-                [profile.to_string()],
-                |row| row.get(0),
+    assert!(
+        timeout(Duration::from_secs(5), affected_stream.frame())
+            .await?
+            .is_none()
+    );
+    let (remaining, claim, separate_grant) =
+        hub.state
+            .storage
+            .read_snapshot(move |conn| {
+                conn.query_row(
+                "SELECT (SELECT count(*) FROM grants WHERE scope_id = ?1), gc_purging_principal_id,
+                        EXISTS(SELECT 1 FROM grants WHERE principal_id = ?2 AND scope_id = ?3)
+                 FROM hub_meta WHERE id = 1",
+                params![profile.to_string(), purging.to_string(), separate_profile.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)),
             )
             .map_err(crate::storage::StorageError::from)
-        })
-        .await?;
+            })
+            .await?;
     assert_eq!(remaining, 0);
+    assert_eq!(claim, purging.to_string());
+    assert!(separate_grant);
+    assert_eq!(
+        hub.request_admin(Method::POST, "/v1/profiles/separate/publish", None)
+            .await?
+            .0,
+        StatusCode::CREATED
+    );
+    assert_published_frame(&mut unrelated_stream, separate_profile).await?;
+    drop((affected_stream, unrelated_stream));
     hub.shutdown().await;
+    Ok(())
+}
+
+async fn create_empty_profile(hub: &TestHub, slug: &str) -> TestResult<ProfileId> {
+    let (status, created) = hub
+        .request_admin(
+            Method::PUT,
+            &format!("/v1/profiles/{slug}"),
+            Some(json!({"discovery_mode": "full", "bindings": []})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    Ok(serde_json::from_value(
+        created["profile"]["profile_id"].clone(),
+    )?)
+}
+
+async fn open_profile_events(hub: &TestHub, principal: PrincipalId) -> TestResult<Body> {
+    let (status, created) = hub
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({"principal_id": principal, "label": "profile-events"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = created["token"].as_str().ok_or("missing token")?;
+    let request = Request::builder()
+        .uri("/v1/events/stream?kinds=profile.published")
+        .header("host", "localhost:8080")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())?;
+    let response = hub.router.clone().call(request).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/x-ndjson");
+    Ok(response.into_body())
+}
+
+async fn assert_published_frame(stream: &mut Body, profile: ProfileId) -> TestResult {
+    let frame = timeout(Duration::from_secs(5), stream.frame())
+        .await?
+        .ok_or("stream closed")??;
+    let bytes = frame.into_data().map_err(|_| "expected a data frame")?;
+    assert!(bytes.ends_with(b"\n"));
+    let frame: EventStreamFrame = serde_json::from_slice(&bytes)?;
+    let EventStreamFrame::Event { event } = frame else {
+        return Err("expected a profile publication".into());
+    };
+    assert_eq!(event.event, Event::ProfilePublished(profile));
     Ok(())
 }
 

@@ -192,6 +192,27 @@ async fn pause_writer(
 }
 
 #[tokio::test]
+async fn work_barrier_retries_a_rolled_back_batch() -> TestResult {
+    let fixture = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = fixture.start()?;
+    let (release, anchor) = pause_writer(&handle).await?;
+    let mut aborted = std::pin::pin!(handle.execute_work(0, |tx| {
+        tx.conn()
+            .execute_batch("INSERT INTO missing_table VALUES (1)")?;
+        Ok::<_, WriteTxError<Infallible>>(())
+    }));
+    let mut barrier = std::pin::pin!(handle.work_barrier());
+    assert!(poll!(aborted.as_mut()).is_pending());
+    assert!(poll!(barrier.as_mut()).is_pending());
+    release.send(()).map_err(|()| "writer dropped the pause")?;
+    anchor.await?;
+    assert!(matches!(aborted.await, Err(WriteError::PreCommitAborted)));
+    tokio::time::timeout(TIMEOUT, barrier).await??;
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
 async fn priority_commits_before_the_next_work_batch_and_has_independent_capacity() -> TestResult {
     let f = Fixture::create(StorageConfig::default())?;
     let (handle, runtime) = f.start()?;
@@ -2302,6 +2323,22 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
         .await?
         .execution_id;
 
+    let (reader_entered, entered) = tokio::sync::oneshot::channel();
+    let (release_reader, released) = std::sync::mpsc::channel();
+    let reader_handle = handle.clone();
+    let reader = tokio::spawn(async move {
+        reader_handle
+            .read_snapshot(move |conn| {
+                let head: i64 =
+                    conn.query_row("SELECT events_head_seq FROM hub_meta", [], |row| row.get(0))?;
+                let _ = reader_entered.send(());
+                let _ = released.recv();
+                Ok::<_, StorageError>(head)
+            })
+            .await
+    });
+    entered.await?;
+
     // Trigger an unexpected writer exit via a panicking post-commit hook.
     handle
         .execute_work(0, |tx| {
@@ -2344,7 +2381,11 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
         Err(StorageError::ActorStopped)
     ));
 
-    let report = tokio::time::timeout(TIMEOUT, runtime.shutdown()).await?;
+    let stopping = tokio::spawn(runtime.shutdown());
+    assert!(!stopping.is_finished());
+    release_reader.send(())?;
+    reader.await??;
+    let report = tokio::time::timeout(TIMEOUT, stopping).await??;
     assert!(matches!(
         report,
         ShutdownReport::Failed(StorageError::ActorStopped)

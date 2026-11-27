@@ -114,7 +114,7 @@ impl ReadPool {
         self.control.close();
     }
 
-    pub(super) fn finish_close(&self, failed: bool) {
+    pub(super) fn stop(&self, failed: bool) {
         let idle = {
             let mut state = self.state();
             if failed {
@@ -127,6 +127,9 @@ impl ReadPool {
             std::mem::take(&mut state.idle)
         };
         drop(idle);
+    }
+
+    pub(super) fn wait_drained(&self) {
         let _state = self
             .closed
             .wait_while(self.state(), |state| state.in_flight != 0)

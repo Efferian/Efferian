@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used, reason = "fixtures require valid test data")]
 
+mod editions;
+mod writer;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -11,23 +14,30 @@ use efferian_protocol::{
 use http::{Method, StatusCode};
 use rusqlite::params;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::oneshot;
 
 use crate::config::Config;
+use crate::http::{ApiCaller, ApiError};
 use crate::node_bridge::{
     BridgeCloseReason, NodeDispatcher, NodeLiveStatus, NodeSendError, ReadyNode,
 };
 use crate::test_support::{TestHub, TestResult};
 use crate::upstream_dispatch::{
     DiscoverUpstream, DispatchFuture, InvokeUpstream, OfflineUpstreamDispatcher,
-    UpstreamDispatchError, UpstreamDispatcher,
+    UpstreamCancellation, UpstreamDispatchError, UpstreamDispatcher,
 };
+
+type DispatchGate = (
+    oneshot::Sender<efferian_protocol::ExecutionId>,
+    oneshot::Receiver<()>,
+);
 
 #[derive(Default)]
 struct NodeMock {
     ready: Mutex<BTreeMap<NodeId, Option<ReadyNode>>>,
     sent: Mutex<Vec<(NodeId, ExecuteReqPayload)>>,
     fail: Mutex<Option<NodeSendError>>,
+    dispatch_gate: Mutex<Option<DispatchGate>>,
 }
 
 impl NodeMock {
@@ -68,6 +78,11 @@ impl NodeDispatcher for NodeMock {
             .is_none_or(|ready| ready.epoch != epoch)
         {
             return Err(NodeSendError::Closed);
+        }
+        let gate = self.dispatch_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(request.execution_id);
+            let _ = release.blocking_recv();
         }
         if let Some(error) = *self.fail.lock().unwrap() {
             return Err(error);
@@ -176,6 +191,30 @@ async fn managed_fixture(now: i64) -> TestResult<(TestHub, Arc<NodeMock>, NodeId
     )
     .await?;
     Ok((hub, bridge, node, tool))
+}
+
+async fn admin_caller(hub: &TestHub) -> TestResult<ApiCaller> {
+    use efferian_protocol::TokenId;
+    use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+    use crate::vault::auth::{ParsedBearer, authenticate_api};
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", hub.admin_token))?,
+    );
+    let bearer = ParsedBearer::<TokenId>::from_headers(&headers)?;
+    let vault = hub.state.vault.clone();
+    let clock = hub.state.clock.clone();
+    let caller = hub
+        .state
+        .storage
+        .read_snapshot(move |conn| {
+            authenticate_api(&vault, conn, bearer, clock.wall_now_ms()).map_err(ApiError::from)
+        })
+        .await?;
+    Ok(ApiCaller(caller))
 }
 
 #[tokio::test]
@@ -511,7 +550,7 @@ impl UpstreamDispatcher for RemoteMock {
     fn invoke(
         &self,
         request: InvokeUpstream,
-        _: watch::Receiver<bool>,
+        _: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async move {
             let Some(auth) = request.auth else {
@@ -654,12 +693,8 @@ async fn archived_invocations_fail_closed_when_a_dependency_was_deleted() -> Tes
     use std::num::NonZeroU64;
 
     use axum::response::IntoResponse;
-    use efferian_protocol::TokenId;
-    use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 
     use super::{ProfileInvokeRequest, invoke_profile_edition};
-    use crate::http::{ApiCaller, ApiError};
-    use crate::vault::auth::{ParsedBearer, authenticate_api};
 
     let now = RequestId::new().timestamp_ms();
     let (hub, bridge, node, tool) = managed_fixture(now).await?;
@@ -721,23 +756,9 @@ async fn archived_invocations_fail_closed_when_a_dependency_was_deleted() -> Tes
         .await?;
     assert_eq!(status, StatusCode::NO_CONTENT, "{problem}");
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", hub.admin_token))?,
-    );
-    let bearer = ParsedBearer::<TokenId>::from_headers(&headers)?;
-    let vault = hub.state.vault.clone();
-    let caller = hub
-        .state
-        .storage
-        .read_snapshot(move |conn| {
-            authenticate_api(&vault, conn, bearer, now).map_err(ApiError::from)
-        })
-        .await?;
     let err = invoke_profile_edition(
         &hub.state,
-        ApiCaller(caller),
+        admin_caller(&hub).await?,
         "demo".to_owned(),
         NonZeroU64::new(1),
         serde_json::from_value::<ProfileInvokeRequest>(json!({
