@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, reason = "fixtures require valid test data")]
 
 mod editions;
+mod scopes;
 mod writer;
 
 use std::collections::BTreeMap;

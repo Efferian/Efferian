@@ -169,14 +169,15 @@ pub(crate) fn execution_auth_target(
 }
 
 macro_rules! select_execution {
-    ($suffix:literal) => {
+    ($prefix:literal, $from:literal, $suffix:literal) => {
         concat!(
+            $prefix,
             "SELECT e.execution_id, e.request_id, e.invoke_kind, e.state, e.caller_principal_id,
                     e.profile_id, e.profile_version, e.tool_id, e.tool_version, e.public_name,
                     e.executor_kind, e.node_id, e.upstream_id, e.result_truncated, e.result_expired,
                     e.cancel_requested_at_ms, e.created_at_ms, e.started_at_ms, e.finished_at_ms,
                     json_remove(e.summary_json, '$.error_message'), p.owner_principal_id
-             FROM executions e JOIN principals p ON p.principal_id = e.caller_principal_id ",
+             FROM ", $from, " CROSS JOIN principals p ON p.principal_id = e.caller_principal_id ",
             $suffix
         )
     };
@@ -186,9 +187,13 @@ pub(super) fn read_execution(
     conn: &Connection,
     id: ExecutionId,
 ) -> rusqlite::Result<Option<ExecutionRow>> {
-    conn.prepare_cached(select_execution!("WHERE e.execution_id = ?1"))?
-        .query_row([id.to_string()], ExecutionRow::from_row)
-        .optional()
+    conn.prepare_cached(select_execution!(
+        "",
+        "executions e",
+        "WHERE e.execution_id = ?1"
+    ))?
+    .query_row([id.to_string()], ExecutionRow::from_row)
+    .optional()
 }
 
 #[derive(Deserialize)]
@@ -225,25 +230,40 @@ pub(super) fn read_execution_page(
     cursor: Option<ExecutionCursor>,
 ) -> ApiResult<Page<ExecutionMetadata>> {
     let params = scope_parameters(ctx)?;
-    // Push visibility before the SQL limit. Recheck the authoritative policy
-    // on returned rows to keep this projection fail closed if the policy evolves.
-    // Keep the timestamp bound indexable even on the first page. The tuple
-    // predicate handles the exclusive cursor within a shared timestamp.
+    // Page the caller/time or global time index before loading metadata.
+    // A caller contributing to a merged page can supply at most `limit` rows.
+    // The rowid lookups hydrate only that bounded selection in this snapshot.
     let mut stmt = conn.prepare_cached(select_execution!(
-        "WHERE (:admin OR (
-             (e.caller_principal_id = :caller OR p.owner_principal_id = :caller)
-             AND (:profiles IS NULL OR e.profile_id IN (SELECT value FROM json_each(:profiles)))
-             AND (:nodes IS NULL OR e.node_id IN (SELECT value FROM json_each(:nodes)))
-         ))
-         AND (:state IS NULL OR e.state = :state)
-         AND (:principal IS NULL OR e.caller_principal_id = :principal)
-         AND (:profile IS NULL OR e.profile_id = :profile)
-         AND (:node IS NULL OR e.node_id = :node)
-         AND (:tool IS NULL OR e.tool_id = :tool)
-         AND e.created_at_ms <= :created
-         AND (:cursor IS NULL OR (e.created_at_ms, e.execution_id) < (:created, :cursor))
-         ORDER BY e.created_at_ms DESC, e.execution_id COLLATE BINARY DESC
-         LIMIT :limit"
+        "WITH eligible AS NOT MATERIALIZED (
+             SELECT rowid AS rid, created_at_ms, execution_id, caller_principal_id FROM executions
+             WHERE (:profiles IS NULL OR profile_id IN (SELECT value FROM json_each(:profiles)))
+               AND (:nodes IS NULL OR node_id IN (SELECT value FROM json_each(:nodes)))
+               AND (:state IS NULL OR state = :state)
+               AND (:profile IS NULL OR profile_id = :profile)
+               AND (:node IS NULL OR node_id = :node)
+               AND (:tool IS NULL OR tool_id = :tool)
+               AND created_at_ms <= :created
+               AND (:cursor IS NULL OR (created_at_ms, execution_id) < (:created, :cursor))
+         ), callers(id) AS (
+             SELECT :principal WHERE :admin AND :principal IS NOT NULL
+             UNION ALL
+             SELECT :caller WHERE NOT :admin AND (:principal IS NULL OR :principal = :caller)
+             UNION ALL
+             SELECT principal_id FROM principals WHERE NOT :admin AND owner_principal_id = :caller
+               AND (:principal IS NULL OR principal_id = :principal)
+         ), page AS (
+             SELECT rid, created_at_ms, execution_id FROM eligible
+             WHERE :admin AND :principal IS NULL
+             UNION ALL
+             SELECT e.rowid AS rid, e.created_at_ms, e.execution_id
+             FROM callers CROSS JOIN executions e ON e.rowid IN (
+                 SELECT f.rid FROM eligible f WHERE f.caller_principal_id = callers.id
+                 ORDER BY f.created_at_ms DESC, f.execution_id DESC LIMIT :limit
+             )
+             ORDER BY created_at_ms DESC, execution_id DESC LIMIT :limit
+         ) ",
+        "page CROSS JOIN executions e ON e.rowid = page.rid",
+        "ORDER BY page.created_at_ms DESC, page.execution_id DESC"
     ))?;
     let rows = stmt
         .query_map(

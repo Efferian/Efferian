@@ -141,7 +141,7 @@ pub fn check_archived_invoke_metadata(
             check_target_scope(checked, target).map_err(|_| AuthzError::ResourceNotFound)?
         }
         None if checked.context().token.allowed_nodes.is_some()
-            || checked.orchestrator_manager().is_some() =>
+            || checked.context().orchestrator_node_manager().is_some() =>
         {
             return Err(AuthzError::ResourceNotFound);
         }
@@ -188,8 +188,8 @@ fn check_target_scope(
                 .filter(|node| node.node_id == selected_id)
                 .ok_or(AuthzError::InvalidAuthContext)?;
             ctx.token.permits_node(Some(node.node_id))
-                && checked
-                    .orchestrator_manager()
+                && ctx
+                    .orchestrator_node_manager()
                     .is_none_or(|manager| node.managed_by_principal_id == Some(manager))
         }
         ExecutionTarget::Upstream { .. } => ctx.token.permits_node(None),

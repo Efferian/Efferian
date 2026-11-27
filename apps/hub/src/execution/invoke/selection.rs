@@ -127,9 +127,14 @@ fn visit_selector_nodes(
     };
     let mut sql = format!("{ACTIVE_NODE_COLUMNS} AND {condition}");
     let mut parameters = vec![value];
+    // A token allowlist already bounds this query to at most 256 node IDs.
+    // With a wider token, use the manager index for agents managed by an orchestrator.
     if let Some(allowed) = &ctx.token.allowed_nodes {
         sql.push_str(" AND node_id IN (SELECT value FROM json_each(?2))");
         parameters.push(serde_json::to_string(allowed).map_err(|_| ApiError::internal())?);
+    } else if let Some(manager) = ctx.orchestrator_node_manager() {
+        sql.push_str(" AND managed_by_principal_id = ?2");
+        parameters.push(manager.to_string());
     }
     sql.push_str(" ORDER BY name COLLATE BINARY");
     let mut statement = conn.prepare_cached(&sql)?;
