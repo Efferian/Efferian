@@ -130,11 +130,26 @@ fn caller_bound_upstreams(
     conn: &Connection,
     ctx: &AuthContext,
 ) -> ApiResult<Vec<CallerBoundUpstream>> {
+    if let Some(ids) = &ctx.token.allowed_profiles {
+        return upstreams_for_profiles(conn, ctx, ids.iter().copied().map(Ok));
+    }
+    let mut profiles = conn.prepare_cached(
+        "SELECT profile_id FROM profiles WHERE published_version > 0 AND disabled_at_ms IS NULL",
+    )?;
+    upstreams_for_profiles(conn, ctx, profiles.query_map([], |row| id(row, 0))?)
+}
+
+fn upstreams_for_profiles(
+    conn: &Connection,
+    ctx: &AuthContext,
+    profiles: impl Iterator<Item = rusqlite::Result<ProfileId>>,
+) -> ApiResult<Vec<CallerBoundUpstream>> {
     let mut published = conn.prepare_cached(
-        "SELECT p.profile_id, pe.bindings_json
+        "SELECT pe.bindings_json
          FROM profiles p JOIN profile_editions pe
            ON pe.profile_id = p.profile_id AND pe.version = p.published_version
-         WHERE p.published_version > 0 AND p.disabled_at_ms IS NULL AND pe.disabled_at_ms IS NULL",
+         WHERE p.profile_id = ?1 AND p.published_version > 0
+           AND p.disabled_at_ms IS NULL AND pe.disabled_at_ms IS NULL",
     )?;
     let mut pinned_definition = conn.prepare_cached(
         "SELECT tr.definition_json FROM tools t JOIN tool_revisions tr ON tr.tool_id = t.tool_id
@@ -145,13 +160,19 @@ fn caller_bound_upstreams(
     )?;
     let mut revisions = HashMap::new();
     let mut visible = BTreeSet::new();
-    let mut rows = published.query([])?;
-    while let Some(row) = rows.next()? {
-        let profile_id = id(row, 0)?;
+    for profile_id in profiles {
+        let profile_id = profile_id?;
         if authorize_profile_discover(ctx, Some(profile_id)).is_err() {
             continue;
         }
-        let bindings: Vec<ProfileToolBinding> = json(row, 1)?;
+        let Some(bindings) = published
+            .query_row([profile_id.to_string()], |row| {
+                json::<Vec<ProfileToolBinding>>(row, 0)
+            })
+            .optional()?
+        else {
+            continue;
+        };
         let mut upstreams = BTreeSet::new();
         for binding in bindings {
             let key = (binding.tool_id, binding.tool_version);

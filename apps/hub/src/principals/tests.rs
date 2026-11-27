@@ -401,7 +401,11 @@ async fn me_uses_visible_published_profiles_and_the_pinned_tool_version() -> Tes
     let hidden_upstream = UpstreamId::new();
     let fixture = Fixture::start(
         Config::default(),
-        &[("operator", Admin, false), ("member", Member, false)],
+        &[
+            ("operator", Admin, false),
+            ("member", Member, false),
+            ("delegate", Member, false),
+        ],
         |tx, subjects| {
             let admin = subjects[0].id.to_string();
             let member = subjects[1].id.to_string();
@@ -470,6 +474,21 @@ async fn me_uses_visible_published_profiles_and_the_pinned_tool_version() -> Tes
                 "UPDATE auth_tokens SET allowed_profiles_json = ?1 WHERE principal_id = ?2",
                 params![serde_json::to_string(&[visible_profile])?, member],
             )?;
+            tx.execute(
+                "INSERT INTO grants (grant_id, principal_id, scope_kind, scope_id, capability, created_by, created_at_ms)
+                 VALUES (?1, ?2, 'profile', ?3, 'discover', ?4, 1000)",
+                params![GrantId::new().to_string(), subjects[2].id.to_string(), visible_profile.to_string(), admin],
+            )?;
+            // Make SQLite fail if a query evaluates bindings_json for the hidden profile.
+            tx.execute(
+                "UPDATE profile_editions SET bindings_json = 'unreadable' WHERE profile_id = ?1",
+                [hidden_profile.to_string()],
+            )?;
+            tx.execute_batch(
+                "ALTER TABLE profile_editions RENAME TO stored_editions;
+                 CREATE VIEW profile_editions AS SELECT profile_id, version, disabled_at_ms,
+                    json(bindings_json) AS bindings_json FROM stored_editions;",
+            )?;
             Ok(())
         },
     )?;
@@ -484,6 +503,12 @@ async fn me_uses_visible_published_profiles_and_the_pinned_tool_version() -> Tes
     assert_eq!(
         body["token_scope"]["allowed_profiles"],
         json!([visible_profile])
+    );
+    let (status, delegate) = fixture.call(2, Method::GET, "/v1/me", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        delegate["caller_bound_upstreams"],
+        body["caller_bound_upstreams"]
     );
     fixture.stop().await
 }
