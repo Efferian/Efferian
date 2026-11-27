@@ -20,11 +20,12 @@ pub use lifecycle::{
 };
 pub use maintenance::{StoragePressure, StorageStatus};
 
-pub(crate) use actor::MAX_WORK_BYTES;
-pub(crate) use events::{id, json, opt_id, scalar, scalar_text};
+pub(crate) use actor::{MAX_WORK_BYTES, PriorityKind, WriteTx, WriteTxError};
+pub(crate) use events::{
+    id, invalid_text_msg, json, opt_id, optional_json, optional_scalar, read_grant_scope, scalar,
+    scalar_text,
+};
 
-#[allow(unused_imports, reason = "storage write seams for hub modules")]
-pub(crate) use actor::{PriorityKind, WriteTx, WriteTxError};
 #[allow(unused_imports, reason = "storage execution seams for hub modules")]
 pub(crate) use executions::{
     ExecutionTarget, InvalidReceipt, InvokeOutcome, InvokeReplayInput, InvokeResource,
@@ -33,9 +34,11 @@ pub(crate) use executions::{
 };
 
 use std::io;
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use efferian_platform::{MonoInstant, MonotonicClock, PlatformError};
+use serde::Deserialize;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 const PAGE_SIZE: u32 = 4096;
@@ -44,11 +47,24 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DAY_MS: i64 = 86_400_000;
 const SOFT_PRESSURE_GRACE_MS: i64 = 60_000;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SqliteSynchronous {
     #[default]
     Full,
     Normal,
+}
+
+impl FromStr for SqliteSynchronous {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "full" => Ok(Self::Full),
+            "normal" => Ok(Self::Normal),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

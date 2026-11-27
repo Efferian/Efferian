@@ -7,22 +7,37 @@ use efferian_protocol::{HubId, SecretString};
 
 use super::{OperationError, RESERVED, path_io};
 
+pub(super) enum TokenOutputPlan {
+    Stdout,
+    File(FileOutput),
+}
+
+impl TokenOutputPlan {
+    pub(super) fn preflight(state_dir: &Path, path: &Path) -> Result<Self, OperationError> {
+        if path.as_os_str() == "-" {
+            Ok(Self::Stdout)
+        } else {
+            Ok(Self::File(FileOutput::preflight(state_dir, path)?))
+        }
+    }
+
+    pub(super) fn reserve(self) -> Result<TokenOutput, OperationError> {
+        match self {
+            Self::Stdout => Ok(TokenOutput::Stdout),
+            Self::File(target) => {
+                let temporary = target.reserve()?;
+                Ok(TokenOutput::File(target, temporary))
+            }
+        }
+    }
+}
+
 pub(super) enum TokenOutput {
     Stdout,
     File(FileOutput, TemporaryFile),
 }
 
 impl TokenOutput {
-    pub(super) fn preflight(state_dir: &Path, path: &Path) -> Result<Self, OperationError> {
-        if path.as_os_str() == "-" {
-            Ok(Self::Stdout)
-        } else {
-            let target = FileOutput::preflight(state_dir, path)?;
-            let temporary = target.reserve()?;
-            Ok(Self::File(target, temporary))
-        }
-    }
-
     pub(super) fn write(self, secret: &SecretString) -> Result<(), OperationError> {
         fn write_token(out: &mut impl Write, secret: &SecretString) -> io::Result<()> {
             out.write_all(secret.expose_secret().as_bytes())?;
@@ -41,6 +56,25 @@ impl TokenOutput {
             }
         }
     }
+}
+
+pub(super) fn publish_private_file(
+    dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<(), OperationError> {
+    let directory =
+        File::open(dir.join(".")).map_err(|error| path_io("open state directory", dir, error))?;
+    let target = FileOutput {
+        path: dir.join(filename),
+        directory,
+    };
+    let mut temporary = target.reserve()?;
+    temporary
+        .file
+        .write_all(bytes)
+        .map_err(|error| path_io("write private file", &temporary.path, error))?;
+    temporary.publish(target)
 }
 
 pub(super) struct FileOutput {

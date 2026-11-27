@@ -1,11 +1,17 @@
-pub mod config;
-pub mod egress;
+mod cli;
+mod config;
+mod egress;
 mod grants_tokens;
-pub mod http;
-pub mod http_transport;
-pub mod node_bridge;
+mod http;
+mod http_transport;
+mod node_bridge;
 mod nodes;
-pub mod operations;
+mod operations;
 mod principals;
 pub mod storage;
-pub mod vault;
+#[cfg(test)]
+mod test_support;
+mod vault;
+
+pub use cli::run_cli;
+pub use http::openapi_bytes;

@@ -6,26 +6,21 @@ use std::str::FromStr;
 
 use efferian_authz::{AuthContext, AuthzError, GrantView, TokenScope, check_active};
 use efferian_protocol::{
-    Capability, EnrollmentId, GrantScope, NodeId, PrincipalId, PrincipalKind, ProfileId, TokenId,
+    Capability, EnrollmentId, GrantScope, NodeId, PrincipalId, PrincipalKind, TokenId,
 };
 use http::{HeaderMap, header::AUTHORIZATION};
-use rusqlite::{Connection, OptionalExtension, Row, types::ValueRef};
+use rusqlite::{Connection, OptionalExtension};
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroizing;
 
 use super::{ACTIVE_KEY_ID, CredentialFamily, SecretBytes, Vault, VaultError};
 use crate::storage::{
-    PrincipalLiveness, StorageError, id, json, opt_id, principal_liveness, read_principal, scalar,
+    PrincipalLiveness, StorageError, id, invalid_text_msg, opt_id, optional_scalar,
+    principal_liveness, read_grant_scope, read_principal, scalar,
 };
 
 const MAX_AUTHORIZATION_BYTES: usize = 512;
 const DUMMY_VERIFIER: [u8; 32] = [0; 32];
-const API_VERIFIER_QUERY: &str =
-    "SELECT t.key_id, t.verifier_hmac FROM auth_tokens t JOIN hub_meta h ON h.id = 1
-     WHERE t.token_id = ?1 AND t.principal_id IS NOT h.gc_purging_principal_id";
-const ENROLLMENT_VERIFIER_QUERY: &str =
-    "SELECT key_id, verifier_hmac FROM node_enrollments WHERE enrollment_id = ?1";
-const NODE_VERIFIER_QUERY: &str = "SELECT key_id, credential_hmac FROM nodes WHERE node_id = ?1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
@@ -51,7 +46,7 @@ impl From<rusqlite::Error> for CredentialError {
 pub struct VerifiedCredential<Id> {
     id: Id,
     key_id: u16,
-    verifier: String,
+    verifier: Zeroizing<String>,
 }
 
 impl<Id: Copy> VerifiedCredential<Id> {
@@ -101,6 +96,14 @@ pub enum EnrollmentRecord {
     },
 }
 
+struct StoredApiLiveness {
+    key_id: i64,
+    verifier: Zeroizing<String>,
+    principal_id: PrincipalId,
+    expires_at_ms: Option<i64>,
+    revoked_at_ms: Option<i64>,
+}
+
 /// Authenticate inside one read snapshot. Bearer bytes are never copied into
 /// the output or handed to a write transaction.
 pub fn authenticate_api(
@@ -109,18 +112,70 @@ pub fn authenticate_api(
     bearer: ParsedBearer<TokenId>,
     now_ms: i64,
 ) -> Result<AuthenticatedApi, CredentialError> {
-    let credential = verify(
+    let ParsedBearer {
+        id: token_id,
+        secret,
+    } = bearer;
+    let canonical_id = token_id.to_string();
+    let row = conn
+        .prepare_cached(
+            "SELECT t.key_id, t.verifier_hmac, t.principal_id, t.expires_at_ms, t.revoked_at_ms
+             FROM auth_tokens t JOIN hub_meta h ON h.id = 1
+             WHERE t.token_id = ?1 AND t.principal_id IS NOT h.gc_purging_principal_id",
+        )?
+        .query_row([&canonical_id], |row| {
+            Ok(StoredApiLiveness {
+                key_id: row.get(0)?,
+                verifier: Zeroizing::new(row.get(1)?),
+                principal_id: id(row, 2)?,
+                expires_at_ms: row.get(3)?,
+                revoked_at_ms: row.get(4)?,
+            })
+        })
+        .optional()?;
+    let row = verify_row(
         vault,
-        conn,
-        bearer,
         CredentialFamily::Token,
-        API_VERIFIER_QUERY,
+        &canonical_id,
+        &secret,
+        row,
+        |r| (r.key_id, &r.verifier),
     )?;
-    let context = active_api_context(conn, credential.id(), now_ms)?;
+    let token = TokenScope {
+        token_id,
+        principal_id: row.principal_id,
+        max_capability: None,
+        allowed_profiles: None,
+        allowed_nodes: None,
+        withhold_sensitive: false,
+        expires_at_ms: row.expires_at_ms,
+        revoked_at_ms: row.revoked_at_ms,
+    };
+    if !token.is_active(now_ms) {
+        return Err(CredentialError::Unauthenticated);
+    }
+    let context = active_principal_context(conn, token, now_ms)?;
     Ok(AuthenticatedApi {
         principal_id: context.caller.principal_id,
-        credential,
+        credential: VerifiedCredential {
+            id: token_id,
+            key_id: ACTIVE_KEY_ID,
+            verifier: row.verifier,
+        },
     })
+}
+
+struct StoredApiFull {
+    key_id: i64,
+    verifier: Zeroizing<String>,
+    principal_id: PrincipalId,
+    label: String,
+    max_capability: Option<Capability>,
+    allowed_profiles_json: Option<String>,
+    allowed_nodes_json: Option<String>,
+    withhold_sensitive: bool,
+    expires_at_ms: Option<i64>,
+    revoked_at_ms: Option<i64>,
 }
 
 /// Recheck the bearer proof and reload the authorization context in the same
@@ -130,8 +185,53 @@ pub fn refresh_api(
     credential: &VerifiedCredential<TokenId>,
     now_ms: i64,
 ) -> Result<AuthContext, CredentialError> {
-    recheck_verifier(conn, credential, API_VERIFIER_QUERY)?;
-    let mut context = active_api_context(conn, credential.id(), now_ms)?;
+    refresh_api_with_label(conn, credential, now_ms).map(|(ctx, _)| ctx)
+}
+
+pub(crate) fn refresh_api_with_label(
+    conn: &Connection,
+    credential: &VerifiedCredential<TokenId>,
+    now_ms: i64,
+) -> Result<(AuthContext, String), CredentialError> {
+    let token_id = credential.id();
+    let row = conn
+        .prepare_cached(
+            "SELECT t.key_id, t.verifier_hmac, t.principal_id, t.label, t.max_capability,
+                    t.allowed_profiles_json, t.allowed_nodes_json, t.withhold_sensitive,
+                    t.expires_at_ms, t.revoked_at_ms
+             FROM auth_tokens t JOIN hub_meta h ON h.id = 1
+             WHERE t.token_id = ?1 AND t.principal_id IS NOT h.gc_purging_principal_id",
+        )?
+        .query_row([token_id.to_string()], |row| {
+            Ok(StoredApiFull {
+                key_id: row.get(0)?,
+                verifier: Zeroizing::new(row.get(1)?),
+                principal_id: id(row, 2)?,
+                label: row.get(3)?,
+                max_capability: optional_scalar(row, 4)?,
+                allowed_profiles_json: row.get(5)?,
+                allowed_nodes_json: row.get(6)?,
+                withhold_sensitive: row.get(7)?,
+                expires_at_ms: row.get(8)?,
+                revoked_at_ms: row.get(9)?,
+            })
+        })
+        .optional()?;
+    let row = recheck_row(credential, row, |r| (r.key_id, &r.verifier))?;
+    let token = TokenScope {
+        token_id,
+        principal_id: row.principal_id,
+        max_capability: row.max_capability,
+        allowed_profiles: decode_nullable_set(row.allowed_profiles_json.as_deref(), 5)?,
+        allowed_nodes: decode_nullable_set(row.allowed_nodes_json.as_deref(), 6)?,
+        withhold_sensitive: row.withhold_sensitive,
+        expires_at_ms: row.expires_at_ms,
+        revoked_at_ms: row.revoked_at_ms,
+    };
+    if !token.is_active(now_ms) {
+        return Err(CredentialError::Unauthenticated);
+    }
+    let mut context = active_principal_context(conn, token, now_ms)?;
     context.caller_grants = grant_views(conn, context.caller.principal_id)?;
     if let Some(owner) = &context.owner {
         context.owner_grants = grant_views(conn, owner.principal_id)?;
@@ -139,7 +239,58 @@ pub fn refresh_api(
     if let Some(manager) = &context.managed_by {
         context.managed_by_grants = grant_views(conn, manager.principal_id)?;
     }
-    Ok(context)
+    Ok((context, row.label))
+}
+
+struct StoredEnrollment {
+    key_id: i64,
+    verifier: Zeroizing<String>,
+    issuer: PrincipalId,
+    name: Option<String>,
+    managed_by: Option<PrincipalId>,
+    tags_json: String,
+    node_id: Option<NodeId>,
+    node_exists: bool,
+    node_revoked_at_ms: Option<i64>,
+    node_managed_by: Option<PrincipalId>,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+    revoked_at_ms: Option<i64>,
+    consumed_at_ms: Option<i64>,
+}
+
+const ENROLLMENT_QUERY: &str = "SELECT e.key_id, e.verifier_hmac, e.created_by,
+        e.target_node_name, e.managed_by_principal_id, e.tags_json, e.target_node_id,
+        n.node_id IS NOT NULL, n.revoked_at_ms, n.managed_by_principal_id,
+        e.created_at_ms, e.expires_at_ms, e.revoked_at_ms, e.consumed_at_ms
+     FROM node_enrollments e LEFT JOIN nodes n ON n.node_id = e.target_node_id
+     WHERE e.enrollment_id = ?1";
+
+fn read_enrollment(
+    conn: &Connection,
+    enrollment_id: &str,
+) -> Result<Option<StoredEnrollment>, CredentialError> {
+    Ok(conn
+        .prepare_cached(ENROLLMENT_QUERY)?
+        .query_row([enrollment_id], |row| {
+            Ok(StoredEnrollment {
+                key_id: row.get(0)?,
+                verifier: Zeroizing::new(row.get(1)?),
+                issuer: id(row, 2)?,
+                name: row.get(3)?,
+                managed_by: opt_id(row, 4)?,
+                tags_json: row.get(5)?,
+                node_id: opt_id(row, 6)?,
+                node_exists: row.get(7)?,
+                node_revoked_at_ms: row.get(8)?,
+                node_managed_by: opt_id(row, 9)?,
+                created_at_ms: row.get(10)?,
+                expires_at_ms: row.get(11)?,
+                revoked_at_ms: row.get(12)?,
+                consumed_at_ms: row.get(13)?,
+            })
+        })
+        .optional()?)
 }
 
 pub fn authenticate_enrollment(
@@ -148,15 +299,30 @@ pub fn authenticate_enrollment(
     bearer: ParsedBearer<EnrollmentId>,
     now_ms: i64,
 ) -> Result<AuthenticatedEnrollment, CredentialError> {
-    let credential = verify(
+    let ParsedBearer {
+        id: enrollment_id,
+        secret,
+    } = bearer;
+    let canonical_id = enrollment_id.to_string();
+    let row = read_enrollment(conn, &canonical_id)?;
+    let mut row = verify_row(
         vault,
-        conn,
-        bearer,
         CredentialFamily::Enrollment,
-        ENROLLMENT_VERIFIER_QUERY,
+        &canonical_id,
+        &secret,
+        row,
+        |r| (r.key_id, &r.verifier),
     )?;
-    let record = active_enrollment(conn, credential.id(), now_ms)?;
-    Ok(AuthenticatedEnrollment { credential, record })
+    let verifier = std::mem::take(&mut row.verifier);
+    let record = validate_enrollment_row(conn, row, now_ms)?;
+    Ok(AuthenticatedEnrollment {
+        credential: VerifiedCredential {
+            id: enrollment_id,
+            key_id: ACTIVE_KEY_ID,
+            verifier,
+        },
+        record,
+    })
 }
 
 pub fn recheck_enrollment(
@@ -164,8 +330,84 @@ pub fn recheck_enrollment(
     credential: &VerifiedCredential<EnrollmentId>,
     now_ms: i64,
 ) -> Result<EnrollmentRecord, CredentialError> {
-    recheck_verifier(conn, credential, ENROLLMENT_VERIFIER_QUERY)?;
-    active_enrollment(conn, credential.id(), now_ms)
+    let row = read_enrollment(conn, &credential.id().to_string())?;
+    let row = recheck_row(credential, row, |r| (r.key_id, &r.verifier))?;
+    validate_enrollment_row(conn, row, now_ms)
+}
+
+fn validate_enrollment_row(
+    conn: &Connection,
+    row: StoredEnrollment,
+    now_ms: i64,
+) -> Result<EnrollmentRecord, CredentialError> {
+    if row.expires_at_ms <= now_ms || row.revoked_at_ms.is_some() || row.consumed_at_ms.is_some() {
+        return Err(CredentialError::Unauthenticated);
+    }
+    if row.node_id.is_some()
+        && (!row.node_exists
+            || row
+                .node_revoked_at_ms
+                .is_some_and(|revoked_at| row.created_at_ms <= revoked_at))
+    {
+        return Err(CredentialError::Unauthenticated);
+    }
+    let tags: BTreeSet<String> = serde_json::from_str(&row.tags_json)
+        .map_err(|_| StorageError::InvalidDatabase("invalid enrollment tags"))?;
+
+    let issuer = read_principal(conn, row.issuer)?
+        .filter(|issuer| issuer.disabled_at_ms.is_none())
+        .ok_or(CredentialError::Unauthenticated)?;
+
+    let admin = issuer.kind == PrincipalKind::Admin
+        && grant_views(conn, issuer.principal_id)?.contains(&GrantView {
+            scope: GrantScope::Global,
+            capability: Capability::Admin,
+        });
+    match (row.name, row.node_id) {
+        (Some(name), None)
+            if (admin && row.managed_by.is_none())
+                || (issuer.is_orchestrator
+                    && row.managed_by == Some(issuer.principal_id)
+                    && tags.is_subset(&issuer.allowed_node_tags)) =>
+        {
+            Ok(EnrollmentRecord::New {
+                name,
+                tags,
+                managed_by: row.managed_by,
+            })
+        }
+        (None, Some(node_id)) if admin && manager_is_active(conn, row.node_managed_by)? => {
+            Ok(EnrollmentRecord::Reenroll { node_id })
+        }
+        _ => Err(CredentialError::Unauthenticated),
+    }
+}
+
+struct StoredNodeCredential {
+    key_id: i64,
+    verifier: Zeroizing<String>,
+    revoked_at_ms: Option<i64>,
+    managed_by: Option<PrincipalId>,
+}
+
+const NODE_QUERY: &str = "SELECT key_id, credential_hmac, revoked_at_ms, managed_by_principal_id
+     FROM nodes WHERE node_id = ?1";
+
+fn read_node_credential(
+    conn: &Connection,
+    node_id: &str,
+) -> Result<Option<StoredNodeCredential>, CredentialError> {
+    Ok(conn
+        .prepare_cached(NODE_QUERY)?
+        .query_row([node_id], |row| {
+            Ok(StoredNodeCredential {
+                key_id: row.get(0)?,
+                verifier: Zeroizing::new(row.get(1)?),
+                revoked_at_ms: row.get(2)?,
+                managed_by: opt_id(row, 3)?,
+            })
+        })
+        .optional()?)
 }
 
 pub fn authenticate_node(
@@ -173,53 +415,53 @@ pub fn authenticate_node(
     conn: &Connection,
     bearer: ParsedBearer<NodeId>,
 ) -> Result<VerifiedCredential<NodeId>, CredentialError> {
-    let credential = verify(
+    let ParsedBearer {
+        id: node_id,
+        secret,
+    } = bearer;
+    let canonical_id = node_id.to_string();
+    let row = read_node_credential(conn, &canonical_id)?;
+    let row = verify_row(
         vault,
-        conn,
-        bearer,
         CredentialFamily::Node,
-        NODE_VERIFIER_QUERY,
+        &canonical_id,
+        &secret,
+        row,
+        |r| (r.key_id, &r.verifier),
     )?;
-    check_active_node(conn, credential.id())?;
-    Ok(credential)
+    validate_node_row(conn, &row)?;
+    Ok(VerifiedCredential {
+        id: node_id,
+        key_id: ACTIVE_KEY_ID,
+        verifier: row.verifier,
+    })
 }
 
+#[allow(dead_code, reason = "node bridge handshake CAS seam for #7")]
 pub fn recheck_node(
     conn: &Connection,
     credential: &VerifiedCredential<NodeId>,
 ) -> Result<(), CredentialError> {
-    recheck_verifier(conn, credential, NODE_VERIFIER_QUERY)?;
-    check_active_node(conn, credential.id())
+    let row = read_node_credential(conn, &credential.id().to_string())?;
+    let row = recheck_row(credential, row, |r| (r.key_id, &r.verifier))?;
+    validate_node_row(conn, &row)
 }
 
-fn active_api_context(
+fn validate_node_row(conn: &Connection, row: &StoredNodeCredential) -> Result<(), CredentialError> {
+    if row.revoked_at_ms.is_some() {
+        return Err(CredentialError::Unauthenticated);
+    }
+    if !manager_is_active(conn, row.managed_by)? {
+        return Err(AuthzError::ManagedByDisabled.into());
+    }
+    Ok(())
+}
+
+fn active_principal_context(
     conn: &Connection,
-    token_id: TokenId,
+    token: TokenScope,
     now_ms: i64,
 ) -> Result<AuthContext, CredentialError> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT t.principal_id, t.max_capability, t.allowed_profiles_json,
-                t.allowed_nodes_json, t.withhold_sensitive, t.expires_at_ms, t.revoked_at_ms
-         FROM auth_tokens t JOIN hub_meta h ON h.id = 1
-         WHERE t.token_id = ?1 AND t.principal_id IS NOT h.gc_purging_principal_id",
-    )?;
-    let token = stmt
-        .query_row([token_id.to_string()], |row| {
-            Ok(TokenScope {
-                token_id,
-                principal_id: id(row, 0)?,
-                max_capability: optional_scalar(row, 1)?,
-                allowed_profiles: nullable_set(row, 2)?,
-                allowed_nodes: nullable_set(row, 3)?,
-                withhold_sensitive: row.get(4)?,
-                expires_at_ms: row.get(5)?,
-                revoked_at_ms: row.get(6)?,
-            })
-        })
-        .optional()?
-        .filter(|token| token.is_active(now_ms))
-        .ok_or(CredentialError::Unauthenticated)?;
-
     let caller =
         read_principal(conn, token.principal_id)?.ok_or(CredentialError::Unauthenticated)?;
     let context = AuthContext {
@@ -265,133 +507,21 @@ pub fn grant_views(
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub(crate) fn read_grant_scope(
-    row: &Row<'_>,
-    kind_column: usize,
-    id_column: usize,
-) -> rusqlite::Result<GrantScope> {
-    match row.get_ref(kind_column)?.as_str()? {
-        "global" if row.get_ref(id_column)?.as_str()?.is_empty() => Ok(GrantScope::Global),
-        "profile" => id::<ProfileId>(row, id_column).map(GrantScope::Profile),
-        _ => Err(rusqlite::Error::InvalidQuery),
-    }
-}
-
-pub(crate) fn optional_scalar<T: serde::de::DeserializeOwned>(
-    row: &Row<'_>,
-    column: usize,
-) -> rusqlite::Result<Option<T>> {
-    if row.get_ref(column)? == ValueRef::Null {
-        Ok(None)
-    } else {
-        scalar(row, column).map(Some)
-    }
-}
-
-pub(crate) fn optional_json<T: serde::de::DeserializeOwned>(
-    row: &Row<'_>,
-    column: usize,
-) -> rusqlite::Result<Option<T>> {
-    if row.get_ref(column)? == ValueRef::Null {
-        Ok(None)
-    } else {
-        json(row, column).map(Some)
-    }
-}
-
-fn nullable_set<T>(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<BTreeSet<T>>>
+fn decode_nullable_set<T>(raw: Option<&str>, column: usize) -> rusqlite::Result<Option<BTreeSet<T>>>
 where
     T: Ord + serde::de::DeserializeOwned,
 {
-    let Some(values): Option<Vec<T>> = optional_json(row, column)? else {
+    let Some(raw) = raw else {
         return Ok(None);
     };
+    let values: Vec<T> = serde_json::from_str(raw)
+        .map_err(|_| invalid_text_msg(column, "invalid token scope JSON"))?;
     let count = values.len();
     let set: BTreeSet<_> = values.into_iter().collect();
     if count != set.len() {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(invalid_text_msg(column, "duplicate token scope entry"));
     }
     Ok(Some(set))
-}
-
-struct PendingEnrollment {
-    issuer: PrincipalId,
-    name: Option<String>,
-    managed_by: Option<PrincipalId>,
-    tags: BTreeSet<String>,
-    node_id: Option<NodeId>,
-    node_managed_by: Option<PrincipalId>,
-}
-
-fn active_enrollment(
-    conn: &Connection,
-    enrollment_id: EnrollmentId,
-    now_ms: i64,
-) -> Result<EnrollmentRecord, CredentialError> {
-    let row = conn
-        .prepare_cached(
-            "SELECT e.created_by, e.target_node_name, e.managed_by_principal_id,
-                e.tags_json, e.target_node_id, n.managed_by_principal_id
-         FROM node_enrollments e LEFT JOIN nodes n ON n.node_id = e.target_node_id
-         WHERE e.enrollment_id = ?1 AND e.expires_at_ms > ?2
-           AND e.revoked_at_ms IS NULL AND e.consumed_at_ms IS NULL
-           AND (e.target_node_id IS NULL OR (n.node_id IS NOT NULL
-                AND (n.revoked_at_ms IS NULL OR e.created_at_ms > n.revoked_at_ms)))",
-        )?
-        .query_row(
-            rusqlite::params![enrollment_id.to_string(), now_ms],
-            |row| {
-                Ok(PendingEnrollment {
-                    issuer: id(row, 0)?,
-                    name: row.get(1)?,
-                    managed_by: opt_id(row, 2)?,
-                    tags: json(row, 3)?,
-                    node_id: opt_id(row, 4)?,
-                    node_managed_by: opt_id(row, 5)?,
-                })
-            },
-        )
-        .optional()?
-        .ok_or(CredentialError::Unauthenticated)?;
-
-    let issuer = read_principal(conn, row.issuer)?
-        .filter(|issuer| issuer.disabled_at_ms.is_none())
-        .ok_or(CredentialError::Unauthenticated)?;
-
-    let admin = issuer.kind == PrincipalKind::Admin
-        && grant_views(conn, issuer.principal_id)?.contains(&GrantView {
-            scope: GrantScope::Global,
-            capability: Capability::Admin,
-        });
-    match (row.name, row.node_id) {
-        (Some(name), None)
-            if (admin && row.managed_by.is_none())
-                || (issuer.is_orchestrator
-                    && row.managed_by == Some(issuer.principal_id)
-                    && row.tags.is_subset(&issuer.allowed_node_tags)) =>
-        {
-            Ok(EnrollmentRecord::New {
-                name,
-                tags: row.tags,
-                managed_by: row.managed_by,
-            })
-        }
-        (None, Some(node_id)) if admin && manager_is_active(conn, row.node_managed_by)? => {
-            Ok(EnrollmentRecord::Reenroll { node_id })
-        }
-        _ => Err(CredentialError::Unauthenticated),
-    }
-}
-
-fn check_active_node(conn: &Connection, node_id: NodeId) -> Result<(), CredentialError> {
-    let manager = conn.prepare_cached(
-        "SELECT managed_by_principal_id FROM nodes WHERE node_id = ?1 AND revoked_at_ms IS NULL",
-    )?.query_row([node_id.to_string()], |row| opt_id(row, 0))
-      .optional()?.ok_or(CredentialError::Unauthenticated)?;
-    if !manager_is_active(conn, manager)? {
-        return Err(AuthzError::ManagedByDisabled.into());
-    }
-    Ok(())
 }
 
 fn manager_is_active(
@@ -404,79 +534,60 @@ fn manager_is_active(
     }
 }
 
-struct StoredVerifier {
-    key_id: i64,
-    text: String,
-}
-
-fn read_verifier(
-    conn: &Connection,
-    query: &str,
-    id: &str,
-) -> Result<Option<StoredVerifier>, CredentialError> {
-    Ok(conn
-        .prepare_cached(query)?
-        .query_row([id], |row| {
-            Ok(StoredVerifier {
-                key_id: row.get(0)?,
-                text: row.get(1)?,
-            })
-        })
-        .optional()?)
-}
-
-fn verify<Id: fmt::Display>(
+fn verify_row<T>(
     vault: &Vault,
-    conn: &Connection,
-    bearer: ParsedBearer<Id>,
     family: CredentialFamily,
-    query: &str,
-) -> Result<VerifiedCredential<Id>, CredentialError> {
-    let ParsedBearer { id, secret } = bearer;
-    let canonical_id = id.to_string();
-    let row = read_verifier(conn, query, &canonical_id)?;
-
+    canonical_id: &str,
+    secret: &SecretBytes,
+    row: Option<T>,
+    extract: impl FnOnce(&T) -> (i64, &Zeroizing<String>),
+) -> Result<T, CredentialError> {
     // With a single active key, real and dummy checks both use that family's
     // key. Keep the MAC and constant-time comparison on every parsed bearer.
-    let mut decoded = [0; 32];
-    let known = row.as_ref().is_some_and(|verifier| {
-        u16::try_from(verifier.key_id) == Ok(ACTIVE_KEY_ID)
-            && decode_hex(&verifier.text, &mut decoded).is_some()
+    let mut decoded = Zeroizing::new([0; 32]);
+    let known = row.as_ref().is_some_and(|row| {
+        let (key_id, verifier) = extract(row);
+        u16::try_from(key_id) == Ok(ACTIVE_KEY_ID) && decode_hex(verifier, &mut decoded).is_some()
     });
-    let expected = if known { &decoded } else { &DUMMY_VERIFIER };
-    let computed = vault
-        .keys
-        .compute_verifier(family, &canonical_id, &secret)?;
+    let expected = if known {
+        decoded.as_slice()
+    } else {
+        &DUMMY_VERIFIER
+    };
+    let computed = vault.keys.compute_verifier(family, canonical_id, secret)?;
     let matched = Choice::from(u8::from(known)) & computed.as_slice().ct_eq(expected);
     #[cfg(test)]
     MAC_CHECKS.with(|checks| checks.set(checks.get() + 1));
-    let row = row
-        .filter(|_| bool::from(matched))
-        .ok_or(CredentialError::Unauthenticated)?;
-    Ok(VerifiedCredential {
-        id,
-        key_id: ACTIVE_KEY_ID,
-        verifier: row.text,
-    })
+    row.filter(|_| bool::from(matched))
+        .ok_or(CredentialError::Unauthenticated)
 }
 
-fn recheck_verifier<Id: fmt::Display>(
-    conn: &Connection,
+fn recheck_row<Id: Copy, T>(
     credential: &VerifiedCredential<Id>,
-    query: &str,
-) -> Result<(), CredentialError> {
-    let row = read_verifier(conn, query, &credential.id.to_string())?
-        .filter(|row| u16::try_from(row.key_id) == Ok(credential.key_id))
-        .ok_or(CredentialError::Unauthenticated)?;
-    if !bool::from(row.text.as_bytes().ct_eq(credential.verifier.as_bytes())) {
+    row: Option<T>,
+    extract: impl FnOnce(&T) -> (i64, &Zeroizing<String>),
+) -> Result<T, CredentialError> {
+    let row = row.ok_or(CredentialError::Unauthenticated)?;
+    let (key_id, verifier) = extract(&row);
+    if u16::try_from(key_id) != Ok(credential.key_id())
+        || !bool::from(verifier.as_bytes().ct_eq(credential.verifier().as_bytes()))
+    {
         return Err(CredentialError::Unauthenticated);
     }
-    Ok(())
+    Ok(row)
 }
 
 pub struct ParsedBearer<Id> {
     id: Id,
     secret: SecretBytes,
+}
+
+impl<Id: fmt::Debug> fmt::Debug for ParsedBearer<Id> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParsedBearer")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<Id: FromStr> ParsedBearer<Id> {

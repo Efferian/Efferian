@@ -23,7 +23,9 @@ use tokio::time::{self, Sleep};
 use tower_service::Service;
 
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HEADER_BUFFER: usize = 32 * 1024;
 const BODY_READ_IDLE: Duration = Duration::from_secs(15);
+const BODY_READ_TOTAL: Duration = Duration::from_secs(90);
 const WRITE_IDLE: Duration = Duration::from_secs(30);
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -48,7 +50,8 @@ pub async fn serve(
     let mut tasks = JoinSet::new();
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT);
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .max_buf_size(MAX_HEADER_BUFFER);
     tokio::pin!(shutdown);
 
     loop {
@@ -64,6 +67,7 @@ pub async fn serve(
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                     continue;
                 };
+                let _ = stream.set_nodelay(true);
                 let io = TokioIo::new(TrackedWriteIdle::new(stream, permit));
                 let service = TowerToHyperService::new(ReadIdleService(router.clone()));
                 let connection = http.serve_connection(io, service).with_upgrades();
@@ -197,6 +201,7 @@ pub struct ReadIdleTimeout;
 struct ReadIdleBody {
     incoming: Incoming,
     read_idle: IdleTimer,
+    read_total: IdleTimer,
     timed_out: bool,
 }
 
@@ -212,6 +217,12 @@ impl HttpBody for ReadIdleBody {
         if this.timed_out {
             return Poll::Ready(None);
         }
+        if idle_expired(&mut this.read_total, BODY_READ_TOTAL, cx) {
+            this.timed_out = true;
+            this.read_idle = None;
+            this.read_total = None;
+            return Poll::Ready(Some(Err(ReadIdleTimeout.into())));
+        }
         match Pin::new(&mut this.incoming).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if frame.data_ref().is_some_and(|data| !data.is_empty()) {
@@ -219,11 +230,20 @@ impl HttpBody for ReadIdleBody {
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => {
+                this.read_idle = None;
+                this.read_total = None;
+                Poll::Ready(Some(Err(error.into())))
+            }
+            Poll::Ready(None) => {
+                this.read_idle = None;
+                this.read_total = None;
+                Poll::Ready(None)
+            }
             Poll::Pending if idle_expired(&mut this.read_idle, BODY_READ_IDLE, cx) => {
                 this.timed_out = true;
                 this.read_idle = None;
+                this.read_total = None;
                 Poll::Ready(Some(Err(ReadIdleTimeout.into())))
             }
             Poll::Pending => Poll::Pending,
@@ -260,6 +280,7 @@ impl Service<Request<Incoming>> for ReadIdleService {
             Body::new(ReadIdleBody {
                 incoming,
                 read_idle: None,
+                read_total: None,
                 timed_out: false,
             })
         }))

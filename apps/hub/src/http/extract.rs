@@ -31,7 +31,10 @@ pub struct ApiCaller(pub AuthenticatedApi);
 pub struct EnrollmentCaller(pub AuthenticatedEnrollment);
 
 #[derive(Clone)]
-pub struct NodeCaller(pub VerifiedCredential<NodeId>);
+pub struct NodeCaller(
+    #[allow(dead_code, reason = "node bridge handshake extractor seam for #7")]
+    pub  VerifiedCredential<NodeId>,
+);
 
 macro_rules! extract_caller {
     ($name:ty) => {

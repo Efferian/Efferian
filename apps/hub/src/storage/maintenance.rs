@@ -241,7 +241,13 @@ impl Maintenance {
         {
             self.sample(db)?;
         }
-        if committed && wrote_result_blob && !matches!(self.soft, SoftState::Idle) {
+        if committed
+            && wrote_result_blob
+            && !matches!(
+                self.soft,
+                SoftState::Idle | SoftState::Exhausted { at_hard: false }
+            )
+        {
             self.soft = SoftState::Active {
                 defer_next_work: true,
             };
@@ -708,17 +714,16 @@ const CLAIM_AGENT: &str = "SELECT p.principal_id FROM principals p
       AND NOT EXISTS (SELECT 1 FROM executions e WHERE e.caller_principal_id = p.principal_id)
       AND NOT EXISTS (SELECT 1 FROM auth_tokens t
                       WHERE t.created_by = p.principal_id AND t.principal_id != p.principal_id)
-      AND p.principal_id NOT IN (
-         SELECT owner_principal_id FROM accounts
-         UNION SELECT created_by FROM grants WHERE created_by != principal_id
-         UNION SELECT created_by FROM node_enrollments
-         UNION SELECT managed_by_principal_id FROM node_enrollments WHERE managed_by_principal_id IS NOT NULL
-         UNION SELECT managed_by_principal_id FROM nodes WHERE managed_by_principal_id IS NOT NULL
-         UNION SELECT owner_principal_id FROM principals WHERE owner_principal_id IS NOT NULL
-         UNION SELECT managed_by_principal_id FROM principals WHERE managed_by_principal_id IS NOT NULL
-         UNION SELECT published_by FROM profile_editions
-         UNION SELECT created_by FROM tools
-      )
+      AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.owner_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM grants g
+                      WHERE g.created_by = p.principal_id AND g.principal_id != p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM node_enrollments ne WHERE ne.created_by = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM node_enrollments ne WHERE ne.managed_by_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.managed_by_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM principals c WHERE c.owner_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM principals c WHERE c.managed_by_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM profile_editions pe WHERE pe.published_by = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM tools t WHERE t.created_by = p.principal_id)
     ORDER BY p.disabled_at_ms, p.principal_id LIMIT 1";
 
 fn claim_agent(conn: &Connection, cutoff: i64) -> rusqlite::Result<bool> {

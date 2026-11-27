@@ -1,91 +1,26 @@
-use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    Router,
     body::Body,
     http::{Method, Request, StatusCode},
 };
-use efferian_protocol::HubId;
-use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower_service::Service;
 
 use super::*;
 use crate::config::Config;
-use crate::egress::EgressClient;
-use crate::http::router;
-use crate::node_bridge::OfflineNodeBridge;
-use crate::operations;
-use crate::storage::{OpenMode, ShutdownReport, StorageClock, StorageRuntime, SystemStorageClock};
-
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-struct TestDirectory(PathBuf);
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use crate::test_support::{TestHub, TestResult};
 
 struct Fixture {
-    app: AppState,
-    http: Router,
-    runtime: StorageRuntime,
-    admin: PrincipalId,
-    admin_token: String,
-    _dir: TestDirectory,
+    hub: TestHub,
 }
 
 impl Fixture {
     async fn start(max_active_tokens: usize) -> TestResult<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let dir = TestDirectory(std::env::temp_dir().join(format!("hub-access-{}", HubId::new())));
-        let state_dir = dir.0.join("state");
-        fs::create_dir(&dir.0)?;
-        let output = dir.0.join("initial-token");
         let mut config = Config::default();
         config.max_active_tokens_per_principal = max_active_tokens;
-        let storage_config = config.storage_config();
-        operations::init(&state_dir, "admin", &output, &storage_config)?;
-        let admin_token = fs::read_to_string(output)?.trim_end().to_owned();
-        let clock: Arc<dyn StorageClock> = Arc::new(SystemStorageClock::new()?);
-        let (opened, vault) = operations::open_existing(
-            &state_dir,
-            OpenMode::ServeAutoMigrate,
-            &storage_config,
-            Arc::clone(&clock),
-        )?;
-        let (storage, runtime) = opened.migrate_and_start_runtime()?;
-        let admin = storage
-            .read_snapshot(|conn| {
-                conn.query_row(
-                    "SELECT principal_id FROM principals WHERE name = 'admin'",
-                    [],
-                    |row| id(row, 0),
-                )
-                .map_err(crate::storage::StorageError::from)
-            })
-            .await?;
-        let app = AppState {
-            storage,
-            vault,
-            clock,
-            egress: EgressClient::new(config.egress_policy()?)?,
-            config: Arc::new(config),
-            bridge: Arc::new(OfflineNodeBridge),
-        };
-        let http = router(app.clone(), 8080)?;
-        Ok(Self {
-            app,
-            http,
-            runtime,
-            admin,
-            admin_token,
-            _dir: dir,
-        })
+        let hub = TestHub::start("access", config, 10_000).await?;
+        Ok(Self { hub })
     }
 
     async fn request(
@@ -95,26 +30,7 @@ impl Fixture {
         token: &str,
         json: Option<Value>,
     ) -> TestResult<(StatusCode, Value)> {
-        let mut request = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("host", "localhost:8080")
-            .header("authorization", format!("Bearer {token}"));
-        let body = if let Some(json) = json {
-            request = request.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(&json)?)
-        } else {
-            Body::empty()
-        };
-        let response = self.http.clone().call(request.body(body)?).await?;
-        let status = response.status();
-        let data = response.into_body().collect().await?.to_bytes();
-        let json = if data.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&data)?
-        };
-        Ok((status, json))
+        self.hub.request(method, path, token, json).await
     }
 
     async fn request_admin(
@@ -123,7 +39,7 @@ impl Fixture {
         path: &str,
         body: Option<Value>,
     ) -> TestResult<(StatusCode, Value)> {
-        self.request(method, path, &self.admin_token, body).await
+        self.hub.request_admin(method, path, body).await
     }
 
     async fn seed_principal(
@@ -134,6 +50,19 @@ impl Fixture {
         manager: Option<PrincipalId>,
         is_orchestrator: bool,
     ) -> TestResult<SeededPrincipal> {
+        self.seed_principal_with(name, kind, owner, manager, is_orchestrator, false)
+            .await
+    }
+
+    async fn seed_principal_with(
+        &self,
+        name: &'static str,
+        kind: PrincipalKind,
+        owner: Option<PrincipalId>,
+        manager: Option<PrincipalId>,
+        is_orchestrator: bool,
+        narrowed: bool,
+    ) -> TestResult<SeededPrincipal> {
         use std::convert::Infallible;
         let principal_id = PrincipalId::new_for_kind(kind);
         let token_id = TokenId::new_for_kind(kind);
@@ -141,9 +70,10 @@ impl Fixture {
             key_id,
             verifier,
             secret,
-        } = self.app.vault.issue_token(token_id)?;
-        let admin = self.admin;
-        self.app.storage.execute_work::<_, Infallible, _>(name.len(), move |tx| {
+        } = self.hub.state.vault.issue_token(token_id)?;
+        let verifier = verifier.as_str().to_owned();
+        let admin = self.hub.admin_id;
+        self.hub.state.storage.execute_work::<_, Infallible, _>(name.len(), move |tx| {
             tx.conn().execute(
                 "INSERT INTO principals (principal_id, kind, name, owner_principal_id, managed_by_principal_id,
                  is_orchestrator, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
@@ -151,9 +81,10 @@ impl Fixture {
                     owner.map(|id| id.to_string()), manager.map(|id| id.to_string()), is_orchestrator, tx.now_ms()],
             )?;
             tx.conn().execute(
-                "INSERT INTO auth_tokens (token_id, principal_id, created_by, label, key_id, verifier_hmac, created_at_ms)
-                 VALUES (?1, ?2, ?3, 'fixture', ?4, ?5, ?6)",
-                params![token_id.to_string(), principal_id.to_string(), admin.to_string(), key_id, verifier, tx.now_ms()],
+                "INSERT INTO auth_tokens (token_id, principal_id, created_by, label, key_id,
+                 verifier_hmac, withhold_sensitive, created_at_ms)
+                 VALUES (?1, ?2, ?3, 'fixture', ?4, ?5, ?6, ?7)",
+                params![token_id.to_string(), principal_id.to_string(), admin.to_string(), key_id, verifier, narrowed, tx.now_ms()],
             )?;
             Ok(())
         }).await?;
@@ -165,10 +96,7 @@ impl Fixture {
     }
 
     async fn finish(self) {
-        assert!(matches!(
-            self.runtime.shutdown().await,
-            ShutdownReport::Complete
-        ));
+        self.hub.shutdown().await;
     }
 }
 
@@ -192,7 +120,7 @@ async fn quota_and_idempotent_token_revocation_through_router() -> TestResult {
             Method::POST,
             "/v1/tokens",
             Some(json!({
-                "principal_id": fixture.admin, "label": "cli"
+                "principal_id": fixture.hub.admin_id, "label": "cli"
             })),
         )
     };
@@ -219,7 +147,7 @@ async fn quota_and_idempotent_token_revocation_through_router() -> TestResult {
     );
 
     let head = || {
-        fixture.app.storage.read_snapshot(|conn| {
+        fixture.hub.state.storage.read_snapshot(|conn| {
             conn.query_row(
                 "SELECT events_head_seq FROM hub_meta WHERE id = 1",
                 [],
@@ -252,7 +180,7 @@ async fn quota_and_idempotent_token_revocation_through_router() -> TestResult {
             Method::POST,
             "/v1/tokens",
             Some(json!({
-                "principal_id": fixture.admin, "label": "bad\nlabel",
+                "principal_id": fixture.hub.admin_id, "label": "bad\nlabel",
             })),
         )
         .await?;
@@ -293,7 +221,8 @@ async fn token_pages_filter_before_binary_cursor_and_treat_purging_as_missing() 
         .await?;
     let purging_id = purging.principal_id;
     fixture
-        .app
+        .hub
+        .state
         .storage
         .execute_work::<_, Infallible, _>(0, move |tx| {
             tx.conn().execute(
@@ -398,7 +327,7 @@ async fn grant_upsert_orders_authorization_and_preserves_identity() -> TestResul
         )
         .await?;
     let profile = ProfileId::new();
-    fixture.app.storage.execute_work::<_, Infallible, _>(0, move |tx| {
+    fixture.hub.state.storage.execute_work::<_, Infallible, _>(0, move |tx| {
         tx.conn().execute(
             "INSERT INTO profiles (profile_id, slug, discovery_mode, disabled_at_ms, created_at_ms, updated_at_ms)
              VALUES (?1, 'draft', 'full', ?2, ?2, ?2)",
@@ -483,7 +412,7 @@ async fn concurrent_grant_deletes_preserve_a_global_admin() -> TestResult {
     }))).await?;
     assert_eq!(status, StatusCode::CREATED);
     let second_grant = format!("/v1/grants/{}", field(&grant["grant"], "grant_id")?);
-    let path = format!("/v1/grants?principal_id={}", fixture.admin);
+    let path = format!("/v1/grants?principal_id={}", fixture.hub.admin_id);
     let (_, first_page) = fixture.request_admin(Method::GET, &path, None).await?;
     let first_grant = format!("/v1/grants/{}", field(&first_page["items"][0], "grant_id")?);
     let (first, second) = tokio::join!(
@@ -526,9 +455,11 @@ async fn orchestrator_can_only_attenuate_into_active_managed_nodes() -> TestResu
     let manager_id = orchestrator.principal_id;
     let IssuedCredential {
         key_id, verifier, ..
-    } = fixture.app.vault.issue_node(node)?;
+    } = fixture.hub.state.vault.issue_node(node)?;
+    let verifier = verifier.as_str().to_owned();
     fixture
-        .app
+        .hub
+        .state
         .storage
         .execute_work::<_, Infallible, _>(0, move |tx| {
             tx.conn().execute(
@@ -553,7 +484,7 @@ async fn orchestrator_can_only_attenuate_into_active_managed_nodes() -> TestResu
             "label": "delegated",
             "max_capability": "invoke",
             "allowed_nodes": [node],
-            "expires_at_ms": fixture.app.clock.wall_now_ms() + 60_000,
+            "expires_at_ms": fixture.hub.state.clock.wall_now_ms() + 60_000,
         })
     };
     let mint = |target| {
@@ -566,7 +497,8 @@ async fn orchestrator_can_only_attenuate_into_active_managed_nodes() -> TestResu
     };
     assert_eq!(mint(agent.principal_id).await?.0, StatusCode::CREATED);
     fixture
-        .app
+        .hub
+        .state
         .storage
         .execute_work::<_, Infallible, _>(0, move |tx| {
             tx.conn().execute(
@@ -585,7 +517,8 @@ async fn orchestrator_can_only_attenuate_into_active_managed_nodes() -> TestResu
 
     let disabled_agent = agent.principal_id;
     fixture
-        .app
+        .hub
+        .state
         .storage
         .execute_work::<_, Infallible, _>(0, move |tx| {
             tx.conn().execute(
@@ -625,7 +558,7 @@ async fn a_token_revoked_while_the_request_body_is_pending_cannot_mint() -> Test
         .request_admin(
             Method::POST,
             "/v1/tokens",
-            Some(json!({"principal_id": fixture.admin, "label": "pending-caller"})),
+            Some(json!({"principal_id": fixture.hub.admin_id, "label": "pending-caller"})),
         )
         .await?;
     assert_eq!(status, StatusCode::CREATED);
@@ -634,7 +567,7 @@ async fn a_token_revoked_while_the_request_body_is_pending_cannot_mint() -> Test
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let payload = Bytes::from(serde_json::to_vec(&json!({
-        "principal_id": fixture.admin,
+        "principal_id": fixture.hub.admin_id,
         "label": "after-revoke",
     }))?);
     let body = Body::from_stream(stream::once({
@@ -653,7 +586,7 @@ async fn a_token_revoked_while_the_request_body_is_pending_cannot_mint() -> Test
         .header("authorization", format!("Bearer {bearer}"))
         .header("content-type", "application/json")
         .body(body)?;
-    let mut router = fixture.http.clone();
+    let mut router = fixture.hub.router.clone();
     let pending = tokio::spawn(async move { router.call(request).await });
 
     tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
@@ -668,6 +601,299 @@ async fn a_token_revoked_while_the_request_body_is_pending_cannot_mint() -> Test
         .request_admin(Method::GET, "/v1/tokens", None)
         .await?;
     assert_eq!(tokens["items"].as_array().map(Vec::len), Some(2));
+    fixture.finish().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn narrowed_anti_oracle_grants_pagination_labels_and_scope_caps() -> TestResult {
+    let fixture = Fixture::start(64).await?;
+    let narrow_admin = fixture
+        .seed_principal_with(
+            "narrow-admin",
+            PrincipalKind::Admin,
+            None,
+            None,
+            false,
+            true,
+        )
+        .await?;
+    let plain_admin = fixture
+        .seed_principal_with(
+            "plain-admin",
+            PrincipalKind::Admin,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await?;
+    let narrow_member = fixture
+        .seed_principal_with(
+            "narrow-member",
+            PrincipalKind::Member,
+            None,
+            None,
+            false,
+            true,
+        )
+        .await?;
+    let narrow_orch = fixture
+        .seed_principal_with(
+            "narrow-orch",
+            PrincipalKind::Service,
+            None,
+            None,
+            true,
+            true,
+        )
+        .await?;
+    let owned_agent = fixture
+        .seed_principal(
+            "owned-agent",
+            PrincipalKind::Agent,
+            Some(narrow_member.principal_id),
+            Some(narrow_orch.principal_id),
+            false,
+        )
+        .await?;
+    let profile = ProfileId::new();
+    let admin_id = fixture.hub.admin_id;
+    let na_id = narrow_admin.principal_id;
+    fixture
+        .hub
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO grants (grant_id, principal_id, scope_kind, capability, created_by, created_at_ms)
+                 VALUES (?1, ?2, 'global', 'admin', ?3, 1000)",
+                params![GrantId::new().to_string(), na_id.to_string(), admin_id.to_string()],
+            )?;
+            conn.execute(
+                "INSERT INTO profiles (profile_id, slug, discovery_mode, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'p', 'full', 1000, 1000)",
+                [profile.to_string()],
+            )?;
+            Ok(())
+        })
+        .await?;
+    let (_, agent_grant) = fixture
+        .request_admin(
+            Method::PUT,
+            "/v1/grants",
+            Some(json!({
+                "principal_id": owned_agent.principal_id,
+                "scope": GrantScope::Profile(profile),
+                "capability": Capability::Discover,
+            })),
+        )
+        .await?;
+    let owned_grant_id: GrantId = serde_json::from_value(agent_grant["grant"]["grant_id"].clone())?;
+
+    // 1. Narrowed admin, member, and orchestrator get uniform token_narrowed on mutations.
+    for (caller_secret, target_token, target_grant) in [
+        (
+            narrow_admin.secret.expose_secret(),
+            owned_agent.token_id,
+            owned_grant_id,
+        ),
+        (
+            narrow_member.secret.expose_secret(),
+            owned_agent.token_id,
+            owned_grant_id,
+        ),
+        (
+            narrow_orch.secret.expose_secret(),
+            owned_agent.token_id,
+            owned_grant_id,
+        ),
+    ] {
+        for tok in [target_token, TokenId::new_user_or_agent()] {
+            let (status, err) = fixture
+                .request(
+                    Method::POST,
+                    &format!("/v1/tokens/{tok}/revoke"),
+                    caller_secret,
+                    None,
+                )
+                .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
+        }
+        for grant in [target_grant, GrantId::new()] {
+            let (status, err) = fixture
+                .request(
+                    Method::DELETE,
+                    &format!("/v1/grants/{grant}"),
+                    caller_secret,
+                    None,
+                )
+                .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
+        }
+        for target_principal in [owned_agent.principal_id, PrincipalId::new_agent()] {
+            let (status, err) = fixture
+                .request(
+                    Method::PUT,
+                    "/v1/grants",
+                    caller_secret,
+                    Some(json!({
+                        "principal_id": target_principal,
+                        "scope": GrantScope::Profile(profile),
+                        "capability": Capability::Discover,
+                    })),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
+        }
+    }
+    // Plain admin (no global grant) gets uniform forbidden on foreign/missing revocations.
+    for tok in [owned_agent.token_id, TokenId::new_user_or_agent()] {
+        let (status, err) = fixture
+            .request(
+                Method::POST,
+                &format!("/v1/tokens/{tok}/revoke"),
+                plain_admin.secret.expose_secret(),
+                None,
+            )
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(err["code"], error_codes::FORBIDDEN);
+    }
+
+    // 2. Invalid grant combinations & GET /v1/grants pagination/visibility.
+    let (status, err) = fixture
+        .request_admin(
+            Method::PUT,
+            "/v1/grants",
+            Some(json!({
+                "principal_id": owned_agent.principal_id,
+                "scope": GrantScope::Profile(profile),
+                "capability": Capability::Admin,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], error_codes::INVALID_INPUT);
+
+    let (status, err) = fixture
+        .request(
+            Method::PUT,
+            "/v1/grants",
+            narrow_member.secret.expose_secret(),
+            Some(json!({
+                "principal_id": owned_agent.principal_id,
+                "scope": GrantScope::Global,
+                "capability": Capability::Invoke,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(err["code"], error_codes::FORBIDDEN);
+
+    let (status, page1) = fixture
+        .request_admin(Method::GET, "/v1/grants?limit=1", None)
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let cursor = field(&page1, "next_cursor")?;
+    let (status, page2) = fixture
+        .request_admin(
+            Method::GET,
+            &format!("/v1/grants?limit=1&cursor={cursor}"),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(field(&page1["items"][0], "grant_id")? < field(&page2["items"][0], "grant_id")?);
+
+    // 3. Label trimming and cardinality caps (256 profiles/nodes).
+    let (status, err) = fixture
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({"principal_id": fixture.hub.admin_id, "label": "   "})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], error_codes::INVALID_INPUT);
+    let exact_128 = "x".repeat(128);
+    let (status, minted) = fixture
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(
+                json!({"principal_id": fixture.hub.admin_id, "label": format!("  {exact_128}  ")}),
+            ),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let minted_id = field(&minted, "token_id")?;
+    let (_, listed) = fixture
+        .request_admin(
+            Method::GET,
+            &format!("/v1/tokens?principal_id={}", fixture.hub.admin_id),
+            None,
+        )
+        .await?;
+    let stored = listed["items"]
+        .as_array()
+        .ok_or("expected items")?
+        .iter()
+        .find(|item| item["token_id"] == minted_id)
+        .ok_or("missing minted token in listing")?;
+    assert_eq!(stored["label"], exact_128);
+    let (status, err) = fixture
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({"principal_id": fixture.hub.admin_id, "label": "x".repeat(129)})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], error_codes::INVALID_INPUT);
+
+    let profiles_257: Vec<ProfileId> = (0..257).map(|_| ProfileId::new()).collect();
+    let (status, err) = fixture
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({
+                "principal_id": fixture.hub.admin_id,
+                "label": "too-many-profiles",
+                "allowed_profiles": profiles_257,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], error_codes::INVALID_INPUT);
+    let nodes_257: Vec<NodeId> = (0..257).map(|_| NodeId::new()).collect();
+    let (status, err) = fixture
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({
+                "principal_id": fixture.hub.admin_id,
+                "label": "too-many-nodes",
+                "allowed_nodes": nodes_257,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], error_codes::INVALID_INPUT);
+    let profiles_256: Vec<ProfileId> = (0..256).map(|_| ProfileId::new()).collect();
+    let (status, _) = fixture
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({
+                "principal_id": fixture.hub.admin_id,
+                "label": "max-profiles",
+                "allowed_profiles": profiles_256,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
     fixture.finish().await;
     Ok(())
 }

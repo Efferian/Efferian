@@ -8,10 +8,13 @@ use super::StorageError;
 use super::lifecycle::open_reader;
 
 const READERS: usize = 8;
+const CONTROL_READERS: usize = 2;
+const GENERAL_READERS: usize = READERS - CONTROL_READERS;
 
 pub(super) struct ReadPool {
     path: PathBuf,
-    permits: Arc<Semaphore>,
+    general: Arc<Semaphore>,
+    control: Arc<Semaphore>,
     state: Mutex<PoolState>,
     closed: Condvar,
 }
@@ -30,7 +33,8 @@ impl ReadPool {
             .collect::<Result<_, _>>()?;
         Ok(Arc::new(Self {
             path,
-            permits: Arc::new(Semaphore::new(READERS)),
+            general: Arc::new(Semaphore::new(GENERAL_READERS)),
+            control: Arc::new(Semaphore::new(CONTROL_READERS)),
             state: Mutex::new(PoolState {
                 idle,
                 in_flight: 0,
@@ -61,7 +65,30 @@ impl ReadPool {
         T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
-        let permit = Arc::clone(&self.permits)
+        self.snapshot_on(&self.general, read).await
+    }
+
+    pub(super) async fn control_snapshot<T, E>(
+        self: &Arc<Self>,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        self.snapshot_on(&self.control, read).await
+    }
+
+    async fn snapshot_on<T, E>(
+        self: &Arc<Self>,
+        lane: &Arc<Semaphore>,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        let permit = Arc::clone(lane)
             .acquire_owned()
             .await
             .map_err(|_| self.closed_error())?;
@@ -83,7 +110,8 @@ impl ReadPool {
 
     pub(super) fn begin_close(&self) {
         self.state().closing = true;
-        self.permits.close();
+        self.general.close();
+        self.control.close();
     }
 
     pub(super) fn finish_close(&self, failed: bool) {
@@ -94,7 +122,8 @@ impl ReadPool {
             } else {
                 state.closing = true;
             }
-            self.permits.close();
+            self.general.close();
+            self.control.close();
             std::mem::take(&mut state.idle)
         };
         drop(idle);

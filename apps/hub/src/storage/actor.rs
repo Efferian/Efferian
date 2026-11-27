@@ -155,7 +155,17 @@ impl StorageHandle {
         self.readers.snapshot(read).await
     }
 
-    #[allow(dead_code, reason = "work lane write seam for hub modules")]
+    pub(crate) async fn read_control_snapshot<T, E>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        self.readers.control_snapshot(read).await
+    }
+
     pub(crate) async fn execute_work<T, E, F>(
         &self,
         bytes: usize,
@@ -172,7 +182,6 @@ impl StorageHandle {
         self.execute(Some(bytes), op).await
     }
 
-    #[allow(dead_code, reason = "priority lane write seam for hub modules")]
     pub(crate) async fn execute_priority<T, E, F>(
         &self,
         _kind: PriorityKind,

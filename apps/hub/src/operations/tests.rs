@@ -1,35 +1,12 @@
-use std::error::Error;
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Barrier;
 use std::thread;
 
 use super::*;
-
-type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
-
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> TestResult<Self> {
-        let path = std::env::temp_dir().join(format!("efferian-operations-{}", HubId::new()));
-        DirBuilder::new().mode(0o700).create(&path)?;
-        fs::set_permissions(&path, Permissions::from_mode(0o700))?;
-        Ok(Self(path))
-    }
-
-    fn join(&self, path: &str) -> PathBuf {
-        self.0.join(path)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use crate::test_support::{TestDir, TestResult};
 
 fn open_test(state: &Path) -> Result<(OpenedDb, Arc<Vault>), OperationError> {
     open_existing(
@@ -42,7 +19,7 @@ fn open_test(state: &Path) -> Result<(OpenedDb, Arc<Vault>), OperationError> {
 
 #[test]
 fn init_preflight_preserves_existing_entries_and_creates_no_key_on_refusal() -> TestResult {
-    let root = TestDir::new()?;
+    let root = TestDir::new("operations")?;
     let state = root.join("state");
     let alias = root.join("alias");
     let dangling = root.join("dangling");
@@ -138,9 +115,9 @@ fn init_preflight_preserves_existing_entries_and_creates_no_key_on_refusal() -> 
 
 #[test]
 fn preflight_reserves_private_output_and_cleans_up_on_abort() -> TestResult {
-    let root = TestDir::new()?;
+    let root = TestDir::new("operations")?;
     let target = root.join("token");
-    let pending = TokenOutput::preflight(&root.0, &target)?;
+    let pending = TokenOutputPlan::preflight(&root.0, &target)?.reserve()?;
     let files = fs::read_dir(&root.0)?.collect::<io::Result<Vec<_>>>()?;
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].metadata()?.len(), 0);
@@ -153,7 +130,7 @@ fn preflight_reserves_private_output_and_cleans_up_on_abort() -> TestResult {
 
 #[test]
 fn snapshot_requires_an_existing_hub_identity() -> TestResult {
-    let root = TestDir::new()?;
+    let root = TestDir::new("operations")?;
     let source = root.join(DATABASE);
     let backup = root.join("backup");
     fs::File::create(&source)?;
@@ -170,7 +147,7 @@ fn snapshot_requires_an_existing_hub_identity() -> TestResult {
 
 #[test]
 fn offline_mint_obeys_the_lock_quota_and_current_admin_grant() -> TestResult {
-    let root = TestDir::new()?;
+    let root = TestDir::new("operations")?;
     let state = root.join("state");
     let config = StorageConfig::default();
     let out = root.join("new.token");
@@ -219,7 +196,7 @@ fn offline_mint_obeys_the_lock_quota_and_current_admin_grant() -> TestResult {
 
 #[test]
 fn an_incomplete_checkpoint_does_not_hide_the_committed_token() -> TestResult {
-    let root = TestDir::new()?;
+    let root = TestDir::new("operations")?;
     let state = root.join("state");
     let database = state.join(DATABASE);
     let config = StorageConfig {
@@ -248,7 +225,7 @@ fn an_incomplete_checkpoint_does_not_hide_the_committed_token() -> TestResult {
 
 #[test]
 fn online_snapshot_has_one_publisher_and_restores_only_with_its_key() -> TestResult {
-    let root = TestDir::new()?;
+    let root = TestDir::new("operations")?;
     let state = root.join("state");
     let backup = root.join("backup.sqlite3");
     init(
@@ -337,5 +314,96 @@ fn online_snapshot_has_one_publisher_and_restores_only_with_its_key() -> TestRes
         snapshot(&state, &state.join(SIDECARS[0])),
         Err(OperationError::InvalidOutput { .. })
     ));
+    Ok(())
+}
+
+#[test]
+fn symlink_state_dir_non_regular_files_and_preflight_order_fail_without_side_effects() -> TestResult
+{
+    let root = TestDir::new("operations")?;
+    let state = root.join("state");
+    let config = StorageConfig::default();
+    init(&state, "admin", &root.join("initial.token"), &config)?;
+
+    // Symlink state_dir (both bare and with trailing slash) must be rejected by open_existing and snapshot.
+    let link = root.join("state-link");
+    symlink(&state, &link)?;
+    let link_slash = std::path::PathBuf::from(format!("{}/", link.display()));
+    for path in [&link, &link_slash] {
+        assert!(matches!(
+            open_test(path),
+            Err(OperationError::InvalidExistingStateDir)
+        ));
+        let backup = root.join("symlink-backup.sqlite3");
+        assert!(matches!(
+            snapshot(path, &backup),
+            Err(OperationError::InvalidExistingStateDir)
+        ));
+        assert!(!backup.exists());
+    }
+
+    // Invalid --out in create_token must fail before acquiring hub.lock or mutating restored state.
+    let existing_out = root.join("existing.token");
+    fs::write(&existing_out, "keep\n")?;
+    let (held_lock, _) = open_test(&state)?;
+    assert!(matches!(
+        create_token(&state, "admin", &existing_out, "recovery", &config, 4),
+        Err(OperationError::InvalidOutput { .. })
+    ));
+    drop(held_lock);
+    assert_eq!(fs::read_to_string(&existing_out)?, "keep\n");
+
+    // Non-regular hub.master.key / hub.sqlite3 must fail before creating hub.lock.
+    let bad_key_dir = root.join("bad-key");
+    DirBuilder::new().mode(0o700).create(&bad_key_dir)?;
+    DirBuilder::new()
+        .mode(0o700)
+        .create(bad_key_dir.join(MASTER_KEY))?;
+    fs::write(bad_key_dir.join(DATABASE), b"placeholder")?;
+    assert!(matches!(
+        open_test(&bad_key_dir),
+        Err(OperationError::InvalidOutput {
+            reason: "expected a regular file",
+            ..
+        })
+    ));
+    assert!(!bad_key_dir.join("hub.lock").exists());
+
+    let bad_db_dir = root.join("bad-db");
+    DirBuilder::new().mode(0o700).create(&bad_db_dir)?;
+    fs::copy(state.join(MASTER_KEY), bad_db_dir.join(MASTER_KEY))?;
+    DirBuilder::new()
+        .mode(0o700)
+        .create(bad_db_dir.join(DATABASE))?;
+    assert!(matches!(
+        open_test(&bad_db_dir),
+        Err(OperationError::InvalidOutput {
+            reason: "expected a regular file",
+            ..
+        })
+    ));
+    assert!(!bad_db_dir.join("hub.lock").exists());
+
+    // create_token trims whitespace, rejects whitespace-only/too-long, and accepts 128 trimmed bytes.
+    let trimmed_out = root.join("trimmed.token");
+    assert!(matches!(
+        create_token(&state, "admin", &trimmed_out, "   ", &config, 4),
+        Err(OperationError::InvalidTokenLabel)
+    ));
+    let exact_128 = "a".repeat(128);
+    let padded_128 = format!("  {exact_128}  ");
+    let over_128 = "a".repeat(129);
+    assert!(matches!(
+        create_token(&state, "admin", &trimmed_out, &over_128, &config, 4),
+        Err(OperationError::InvalidTokenLabel)
+    ));
+    create_token(&state, "admin", &trimmed_out, &padded_128, &config, 4)?;
+    let db = Connection::open_with_flags(state.join(DATABASE), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let stored_label: String = db.query_row(
+        "SELECT label FROM auth_tokens WHERE label != 'bootstrap'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored_label, exact_128);
     Ok(())
 }

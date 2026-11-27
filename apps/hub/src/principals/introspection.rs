@@ -2,12 +2,12 @@ use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 
 use axum::{Json, extract::State};
 use efferian_authz::{
-    AuthContext, ExecutionTarget, authorize_admin, authorize_discovery_target,
-    authorize_profile_discover,
+    AuthContext, ExecutionTarget, PrincipalAccess, authorize_admin, authorize_discovery_target,
+    authorize_principal_manage, authorize_profile_discover,
 };
 use efferian_protocol::{
-    Capability, NodeId, PrincipalId, ProfileId, ProfileToolBinding, TokenId, ToolDefinition,
-    ToolSpec, UpstreamAccountMode, UpstreamId,
+    Capability, NodeId, PrincipalId, PrincipalKind, ProfileId, ProfileToolBinding, TokenId,
+    ToolDefinition, ToolSpec, UpstreamAccountMode, UpstreamId,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -15,17 +15,13 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::UtoipaMethodRouter, routes};
 
 use crate::http::{ApiCaller, ApiError, ApiResult, AppState};
-use crate::storage::{StorageStatus, id, json};
-use crate::vault::auth::refresh_api;
+use crate::storage::{id, json};
+use crate::vault::auth::refresh_api_with_label;
 
-use super::data::{Principal, principal_by_id};
+use super::data::{Principal, owned_agent_principals, principal_by_id};
 
 pub(super) fn me_route() -> UtoipaMethodRouter<AppState> {
     routes!(me)
-}
-
-pub(super) fn status_route() -> UtoipaMethodRouter<AppState> {
-    routes!(admin_status)
 }
 
 #[derive(Serialize, ToSchema)]
@@ -63,11 +59,8 @@ struct CallerBoundUpstream {
 #[utoipa::path(
     get,
     path = "/v1/me",
-    responses(
-        (status = 200, body = OwnIdentity),
-        (status = 401, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json")
-    ),
+    tag = "Principals",
+    responses((status = 200, description = "Current caller identity and effective discovery scope", body = OwnIdentity)),
     security(("api_bearer" = []))
 )]
 async fn me(
@@ -78,20 +71,18 @@ async fn me(
     let identity = state
         .storage
         .read_snapshot(move |conn| -> ApiResult<_> {
-            let ctx = refresh_api(conn, &caller.credential, clock.wall_now_ms())?;
-            identity(conn, ctx)
+            let (ctx, label) =
+                refresh_api_with_label(conn, &caller.credential, clock.wall_now_ms())?;
+            identity(conn, ctx, label)
         })
         .await?;
     Ok(Json(identity))
 }
 
-fn identity(conn: &Connection, ctx: AuthContext) -> ApiResult<OwnIdentity> {
+fn identity(conn: &Connection, ctx: AuthContext, label: String) -> ApiResult<OwnIdentity> {
     let principal =
         principal_by_id(conn, ctx.caller.principal_id)?.ok_or_else(ApiError::internal)?;
-    let label = conn
-        .prepare_cached("SELECT label FROM auth_tokens WHERE token_id = ?1")?
-        .query_row([ctx.token.token_id.to_string()], |row| row.get(0))?;
-    let owned_agents = owned_agents(conn, ctx.caller.principal_id)?;
+    let owned_agents = owned_agents(conn, &ctx)?;
     let caller_bound_upstreams = caller_bound_upstreams(conn, &ctx)?;
     Ok(OwnIdentity {
         principal,
@@ -109,29 +100,46 @@ fn identity(conn: &Connection, ctx: AuthContext) -> ApiResult<OwnIdentity> {
     })
 }
 
-fn owned_agents(conn: &Connection, caller: PrincipalId) -> rusqlite::Result<Vec<OwnedAgent>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT p.principal_id, p.name, p.disabled_at_ms FROM principals p JOIN hub_meta h ON h.id = 1
-         WHERE p.kind = 'agent' AND p.owner_principal_id = ?1
-           AND p.principal_id IS NOT h.gc_purging_principal_id
-         ORDER BY p.principal_id COLLATE BINARY ASC",
-    )?;
-    stmt.query_map([caller.to_string()], |row| {
-        Ok(OwnedAgent {
-            principal_id: id(row, 0)?,
-            name: row.get(1)?,
-            disabled_at_ms: row.get(2)?,
-        })
-    })?
-    .collect()
+fn owned_agents(conn: &Connection, ctx: &AuthContext) -> ApiResult<Vec<OwnedAgent>> {
+    if authorize_admin(ctx).is_err() && ctx.caller.kind != PrincipalKind::Member {
+        return Ok(Vec::new());
+    }
+    let agents = owned_agent_principals(conn, ctx.caller.principal_id)?;
+    let mut visible = Vec::with_capacity(agents.len());
+    for agent in agents {
+        if authorize_principal_manage(ctx, &agent.view(), PrincipalAccess::Read).is_ok() {
+            visible.push(OwnedAgent {
+                principal_id: agent.principal_id,
+                name: agent.name,
+                disabled_at_ms: agent.disabled_at_ms,
+            });
+        }
+    }
+    Ok(visible)
 }
 
 fn caller_bound_upstreams(
     conn: &Connection,
     ctx: &AuthContext,
 ) -> ApiResult<Vec<CallerBoundUpstream>> {
+    if ctx.token.allowed_nodes.is_some() {
+        return Ok(Vec::new());
+    }
     if let Some(ids) = &ctx.token.allowed_profiles {
-        return upstreams_for_profiles(conn, ctx, ids.iter().copied().map(Ok));
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json = serde_json::to_string(ids).map_err(|_| ApiError::internal())?;
+        let mut profiles = conn.prepare_cached(
+            "SELECT p.profile_id FROM profiles p
+             WHERE p.published_version > 0 AND p.disabled_at_ms IS NULL
+               AND p.profile_id IN (SELECT value FROM json_each(?1))",
+        )?;
+        return upstreams_for_profiles(
+            conn,
+            ctx,
+            profiles.query_map([ids_json], |row| id(row, 0))?,
+        );
     }
     let mut profiles = conn.prepare_cached(
         "SELECT profile_id FROM profiles WHERE published_version > 0 AND disabled_at_ms IS NULL",
@@ -153,7 +161,8 @@ fn upstreams_for_profiles(
     )?;
     let mut pinned_definition = conn.prepare_cached(
         "SELECT tr.definition_json FROM tools t JOIN tool_revisions tr ON tr.tool_id = t.tool_id
-         WHERE t.tool_id = ?1 AND tr.version = ?2 AND t.disabled_at_ms IS NULL",
+         WHERE t.tool_id = ?1 AND tr.version = ?2
+           AND t.kind = 'upstream_ref' AND t.disabled_at_ms IS NULL",
     )?;
     let mut active_upstream = conn.prepare_cached(
         "SELECT slug FROM upstreams WHERE upstream_id = ?1 AND disabled_at_ms IS NULL",
@@ -225,46 +234,4 @@ fn caller_bound_upstream_id(row: &Row<'_>) -> rusqlite::Result<Option<UpstreamId
         } => Some(upstream_id),
         _ => None,
     })
-}
-
-#[derive(Serialize, ToSchema)]
-struct AdminStatus {
-    #[serde(flatten)]
-    storage: StorageStatus,
-    gc_error_count: u64,
-    online_nodes_count: usize,
-    upstream_pool_connections: usize,
-    active_upstream_executions: usize,
-}
-
-#[utoipa::path(
-    get,
-    path = "/v1/admin/status",
-    responses(
-        (status = 200, body = AdminStatus),
-        (status = 401, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json")
-    ),
-    security(("api_bearer" = []))
-)]
-async fn admin_status(
-    State(state): State<AppState>,
-    ApiCaller(caller): ApiCaller,
-) -> ApiResult<Json<AdminStatus>> {
-    let clock = state.clock;
-    let storage = state
-        .storage
-        .status_snapshot_with(move |conn| -> ApiResult<()> {
-            let ctx = refresh_api(conn, &caller.credential, clock.wall_now_ms())?;
-            authorize_admin(&ctx)?;
-            Ok(())
-        })
-        .await?;
-    Ok(Json(AdminStatus {
-        storage,
-        gc_error_count: state.storage.gc_error_count(),
-        online_nodes_count: state.bridge.online_nodes_count(),
-        upstream_pool_connections: 0,
-        active_upstream_executions: 0,
-    }))
 }

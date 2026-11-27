@@ -193,18 +193,22 @@ impl WriteTx<'_> {
         principal: PrincipalId,
     ) -> Result<Option<Vec<(NodeId, u64)>>, StorageError> {
         let principal_id = principal.to_string();
-        let changed = {
+        let kind: Option<String> = {
             let mut stmt = self.conn().prepare_cached(
                 "UPDATE principals SET disabled_at_ms = ?1, updated_at_ms = ?1
                  WHERE principal_id = ?2 AND disabled_at_ms IS NULL
-                   AND principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1)",
+                   AND principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1)
+                 RETURNING kind",
             )?;
-            stmt.execute(params![self.now_ms(), &principal_id])? == 1
+            stmt.query_row(params![self.now_ms(), &principal_id], |row| row.get(0))
+                .optional()?
         };
-        if !changed {
+        let Some(kind) = kind else {
             return Ok(None);
+        };
+        if kind == "admin" {
+            require_global_admin(self.conn())?;
         }
-        require_global_admin(self.conn())?;
         self.append_event(actor, Event::PrincipalRevoked(principal))?;
 
         let nodes = managed_nodes(self.conn(), principal)?;
@@ -235,17 +239,21 @@ impl WriteTx<'_> {
     }
 
     pub(crate) fn revoke_grant(&mut self, grant: GrantId) -> Result<bool, StorageError> {
-        let principal = {
+        let removed: Option<(PrincipalId, String, String)> = {
             let mut stmt = self.conn().prepare_cached(
                 "DELETE FROM grants WHERE grant_id = ?1
                    AND principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1)
-                 RETURNING principal_id",
+                 RETURNING principal_id, scope_kind, capability",
             )?;
-            stmt.query_row([grant.to_string()], |row| id(row, 0))
-                .optional()?
+            stmt.query_row([grant.to_string()], |row| {
+                Ok((id(row, 0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?
         };
-        if let Some(principal) = principal {
-            require_global_admin(self.conn())?;
+        if let Some((principal, scope_kind, capability)) = removed {
+            if scope_kind == "global" && capability == "admin" {
+                require_global_admin(self.conn())?;
+            }
             let nodes = managed_nodes(self.conn(), principal)?;
             stage_cascade(
                 self,
@@ -342,7 +350,9 @@ fn require_global_admin(conn: &Connection) -> Result<(), StorageError> {
 
 fn managed_nodes(conn: &Connection, principal: PrincipalId) -> rusqlite::Result<Vec<NodeId>> {
     let mut nodes = conn.prepare_cached(
-        "SELECT node_id FROM nodes WHERE managed_by_principal_id = ?1 ORDER BY node_id",
+        "SELECT node_id FROM nodes
+         WHERE managed_by_principal_id = ?1 AND revoked_at_ms IS NULL
+         ORDER BY node_id",
     )?;
     nodes
         .query_map([principal.to_string()], |row| id(row, 0))?

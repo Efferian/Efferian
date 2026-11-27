@@ -944,7 +944,7 @@ async fn ro_pool_retains_a_cancelled_workers_slot_and_shutdown_waits_for_readers
     let (handle, runtime) = f.start()?;
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut slots = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..6 {
         let handle = handle.clone();
         let entered = entered_tx.clone();
         let (release, held) = oneshot::channel();
@@ -960,11 +960,21 @@ async fn ro_pool_retains_a_cancelled_workers_slot_and_shutdown_waits_for_readers
         });
         slots.push((release, reader));
     }
-    for _ in 0..8 {
+    for _ in 0..6 {
         tokio::time::timeout(TIMEOUT, entered_rx.recv())
             .await?
             .ok_or("reader disconnected")?;
     }
+    // Control snapshots stay available while all 6 general readers are saturated.
+    let control_id = tokio::time::timeout(
+        TIMEOUT,
+        handle.read_control_snapshot(|conn| {
+            conn.query_row("SELECT id FROM hub_meta", [], |row| row.get::<_, i64>(0))
+                .map_err(StorageError::from)
+        }),
+    )
+    .await??;
+    assert_eq!(control_id, 1);
     let (cancelled_release, cancelled) = slots.pop().ok_or("missing reader to cancel")?;
     cancelled.abort();
     assert!(cancelled.await.is_err());
@@ -1755,7 +1765,7 @@ async fn large_receipts_make_progress_at_the_soft_watermark_while_ttl_advances()
 
 #[tokio::test]
 async fn writer_samples_a_payload_batch_crossing_the_soft_watermark() -> TestResult {
-    check_receipt_pressure(4096, 10_000_000, 5000, 73..75).await
+    check_receipt_pressure(4096, 9_900_000, 5000, 73..75).await
 }
 
 async fn check_receipt_pressure(

@@ -291,6 +291,53 @@ async fn body_read_idle_is_reset_by_data_and_returns_the_typed_timeout() -> Test
 }
 
 #[tokio::test(start_paused = true)]
+async fn body_read_total_bounds_slow_trickle_even_with_active_progress() -> TestResult {
+    let (progress, mut seen) = mpsc::unbounded_channel();
+    let route = post(move |request: Request<Body>| async move {
+        let mut body = request.into_body();
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        let _ = progress.send(data);
+                    }
+                }
+                Err(error)
+                    if error
+                        .source()
+                        .is_some_and(|source| source.is::<ReadIdleTimeout>()) =>
+                {
+                    return (StatusCode::REQUEST_TIMEOUT, [(CONNECTION, "close")]).into_response();
+                }
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+        StatusCode::NO_CONTENT.into_response()
+    });
+    let server = TestServer::start(Router::new().route("/", route), 1).await?;
+    let mut stream = server.connect().await?;
+    wait_for_io(stream.write_all(
+        b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n",
+    ))
+    .await??;
+    assert!(head(&mut stream).await?.starts_with("HTTP/1.1 100"));
+
+    // Six 14s steps = 84s total, always under the 15s idle window.
+    for _ in 0..6 {
+        time::advance(Duration::from_secs(14)).await;
+        wait_for_io(stream.write_all(b"x")).await??;
+        assert_eq!(wait_for_io(seen.recv()).await?.as_deref(), Some(&b"x"[..]));
+    }
+    // 6s later hits BODY_READ_TOTAL (90s) even though idle is only 6s (< 15s).
+    time::advance(Duration::from_secs(6)).await;
+    let response = head(&mut stream).await?;
+    assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+    assert!(response.contains("connection: close\r\n"), "{response}");
+    assert_closed(&mut stream).await?;
+    server.stop().await
+}
+
+#[tokio::test(start_paused = true)]
 async fn shutdown_bounds_the_drain_of_an_in_flight_request() -> TestResult {
     let (started, mut entered) = mpsc::unbounded_channel();
     let server = TestServer::start(

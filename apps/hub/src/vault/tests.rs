@@ -153,7 +153,7 @@ fn envelope_authenticates_header_payload_and_row_identity() {
     assert!(
         VaultKeys::derive(Zeroizing::new([0; 32]))
             .unwrap()
-            .bind_hub(vault.hub_id())
+            .bind_hub(vault.hub_id)
             .open_account(&aad, &first)
             .is_err()
     );
@@ -222,11 +222,42 @@ async fn owned_execution_helpers_round_trip_across_offload_threshold() {
             &[7].repeat(size)
         );
     }
+    let aad = execution_aad();
+    assert!(matches!(
+        vault
+            .seal_execution_async(aad, Zeroizing::new(vec![1; MAX_WORK_BYTES - OVERHEAD + 1]))
+            .await,
+        Err(VaultError::PayloadTooLarge)
+    ));
+    assert!(matches!(
+        vault
+            .open_execution_async(aad, vec![0; MAX_WORK_BYTES + 1])
+            .await,
+        Err(VaultError::PayloadTooLarge)
+    ));
 }
 
 #[test]
-fn issuing_uses_fresh_randomness_and_redacts_both_secrets() {
+fn issuing_uses_fresh_randomness_and_redacts_secrets_and_keys() {
+    let keys = fixed_keys();
+    let keys_debug = format!("{keys:?}");
+    for key in [
+        &keys.aead,
+        &keys.token,
+        &keys.enrollment,
+        &keys.node,
+        &keys.fingerprint,
+    ] {
+        assert!(!keys_debug.contains(&format!("{:?}", key.as_slice())));
+        assert!(!keys_debug.contains(&encode_hex(key.as_slice())));
+    }
     let vault = fixed_vault();
+    let vault_debug = format!("{vault:?}");
+    assert!(vault_debug.contains("Vault"));
+    assert!(vault_debug.contains("hub_id"));
+    assert!(!vault_debug.contains(&encode_hex(vault.keys.aead.as_slice())));
+    assert!(!vault_debug.contains(&format!("{:?}", vault.keys.aead.as_slice())));
+
     let id = TokenId::new_user_or_agent();
     let first = vault.issue_token(id).unwrap();
     let second = vault.issue_token(id).unwrap();
@@ -240,5 +271,5 @@ fn issuing_uses_fresh_randomness_and_redacts_both_secrets() {
     );
     let debug = format!("{first:?}");
     assert!(!debug.contains(first.secret.expose_secret()));
-    assert!(!debug.contains(&first.verifier));
+    assert!(!debug.contains(first.verifier.as_str()));
 }

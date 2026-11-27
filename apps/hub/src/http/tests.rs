@@ -113,17 +113,17 @@ impl Fixture {
             tx.execute(
                 "INSERT INTO auth_tokens(token_id, principal_id, created_by, label, verifier_hmac, created_at_ms)
                  VALUES (?1, ?2, ?2, 'operator', ?3, ?4)",
-                params![token.to_string(), admin.to_string(), api.verifier, now],
+                params![token.to_string(), admin.to_string(), api.verifier.as_str(), now],
             )?;
             tx.execute(
                 "INSERT INTO node_enrollments(enrollment_id, verifier_hmac, target_node_name, created_by, expires_at_ms, created_at_ms)
                  VALUES (?1, ?2, 'fresh', ?3, ?4, ?5)",
-                params![enrollment_id.to_string(), enrollment.verifier, admin.to_string(), now + 60_000, now],
+                params![enrollment_id.to_string(), enrollment.verifier.as_str(), admin.to_string(), now + 60_000, now],
             )?;
             tx.execute(
                 "INSERT INTO nodes(node_id, name, credential_hmac, created_at_ms, updated_at_ms)
                  VALUES (?1, 'active', ?2, ?3, ?3)",
-                params![node_id.to_string(), node.verifier, now],
+                params![node_id.to_string(), node.verifier.as_str(), now],
             )?;
             Ok::<_, StorageError>(())
         }).unwrap();
@@ -365,6 +365,8 @@ async fn headers_are_checked_before_credentials_with_health_exception() {
             StatusCode::BAD_REQUEST,
         ),
         ("/v1/info", "localhost:", StatusCode::BAD_REQUEST),
+        ("/v1/info", "localhost:0", StatusCode::BAD_REQUEST),
+        ("/v1/info", "localhost:08101", StatusCode::BAD_REQUEST),
         ("/v1/info", "localhost.:8101", StatusCode::BAD_REQUEST),
         ("/v1/info", "[0::1]:8101", StatusCode::OK),
         (
@@ -386,6 +388,9 @@ async fn headers_are_checked_before_credentials_with_health_exception() {
     }
     for (origin, status) in [
         ("HTTPS://CONSOLE.EXAMPLE", StatusCode::OK),
+        ("https://console.example:443", StatusCode::OK),
+        ("https://console.example:80", StatusCode::FORBIDDEN),
+        ("https://console.example:0443", StatusCode::BAD_REQUEST),
         ("https://console.example/", StatusCode::BAD_REQUEST),
         ("null", StatusCode::FORBIDDEN),
         ("https://attacker.example", StatusCode::FORBIDDEN),
@@ -597,7 +602,7 @@ async fn canceled_http_request_keeps_pre_auth_slot_until_sqlite_finishes() {
     let (polls, body) = counted_body();
     let protected = send(
         router.clone(),
-        request(Method::POST, "/v1/test/control", Some(&fixture.api), body),
+        request(Method::POST, "/v1/test/json", Some(&fixture.api), body),
     )
     .await;
     let public = send(
@@ -962,5 +967,456 @@ async fn openapi_bytes_are_a_per_router_artifact_with_weak_etag_matching() {
     let res = send(router, req).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), bytes);
+    assert_eq!(openapi_bytes().unwrap(), bytes);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn streaming_response_holds_lane_permits_until_body_finishes_or_drops() {
+    let fixture = Fixture::new();
+    let app_release = Arc::new(Notify::new());
+    let ctl_release = Arc::new(Notify::new());
+    let stream_handler = |release: Arc<Notify>| {
+        move || async move {
+            let body = Body::from_stream(futures_util::stream::once(async move {
+                release.notified().await;
+                Ok::<_, Infallible>(Bytes::from_static(b"done"))
+            }));
+            (StatusCode::OK, body).into_response()
+        }
+    };
+    let routes = RouteGroups {
+        application: OpenApiRouter::default()
+            .route(
+                "/v1/test/stream",
+                get(stream_handler(Arc::clone(&app_release))),
+            )
+            .route("/v1/test/ok", get(|| async { StatusCode::NO_CONTENT })),
+        control: OpenApiRouter::default()
+            .route(
+                "/v1/test/ctl-stream",
+                post(stream_handler(Arc::clone(&ctl_release))),
+            )
+            .route("/v1/test/ctl-ok", post(|| async { StatusCode::NO_CONTENT })),
+        ..RouteGroups::default()
+    };
+    let router = assemble(fixture.state.clone(), 8101, routes).unwrap();
+
+    // Application streaming response holds its permit until body completes/drops.
+    let app_res = send(
+        router.clone(),
+        request(
+            Method::GET,
+            "/v1/test/stream",
+            Some(&fixture.api),
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(app_res.status(), StatusCode::OK);
+    problem(
+        send(
+            router.clone(),
+            request(
+                Method::GET,
+                "/v1/test/ok",
+                Some(&fixture.api),
+                Body::empty(),
+            ),
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        code::OVERLOADED,
+    )
+    .await;
+    app_release.notify_one();
+    assert_eq!(
+        app_res.into_body().collect().await.unwrap().to_bytes(),
+        Bytes::from_static(b"done")
+    );
+    assert_eq!(
+        send(
+            router.clone(),
+            request(
+                Method::GET,
+                "/v1/test/ok",
+                Some(&fixture.api),
+                Body::empty()
+            ),
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    // Control streaming response holds its permit until dropped.
+    let ctl_res = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/v1/test/ctl-stream",
+            Some(&fixture.api),
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(ctl_res.status(), StatusCode::OK);
+    problem(
+        send(
+            router.clone(),
+            request(
+                Method::POST,
+                "/v1/test/ctl-ok",
+                Some(&fixture.api),
+                Body::empty(),
+            ),
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        code::OVERLOADED,
+    )
+    .await;
+    drop(ctl_res);
+    assert_eq!(
+        send(
+            router,
+            request(
+                Method::POST,
+                "/v1/test/ctl-ok",
+                Some(&fixture.api),
+                Body::empty()
+            ),
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn per_principal_slots_enrollment_cap_and_control_read_pool_stay_isolated() {
+    let fixture = Fixture::new();
+    let second_principal = PrincipalId::new_for_kind(PrincipalKind::Member);
+    let second_token_id = TokenId::new_for_kind(PrincipalKind::Member);
+    let second_issued = fixture.state.vault.issue_token(second_token_id).unwrap();
+    let second_verifier = second_issued.verifier.as_str().to_owned();
+    let now = fixture.state.clock.wall_now_ms();
+    fixture
+        .state
+        .storage
+        .execute_work(0, move |tx| {
+            tx.conn().execute(
+                "INSERT INTO principals(principal_id, name, kind, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'second', 'member', ?2, ?2)",
+                params![second_principal.to_string(), now],
+            )?;
+            tx.conn().execute(
+                "INSERT INTO auth_tokens(token_id, principal_id, created_by, label, verifier_hmac, created_at_ms)
+                 VALUES (?1, ?2, ?2, 'second', ?3, ?4)",
+                params![
+                    second_token_id.to_string(),
+                    second_principal.to_string(),
+                    second_verifier,
+                    now
+                ],
+            )?;
+            Ok::<_, crate::storage::WriteTxError<Infallible>>(())
+        })
+        .await
+        .unwrap();
+    let mut second_bearer =
+        HeaderValue::from_str(&format!("Bearer {}", second_issued.secret.expose_secret())).unwrap();
+    second_bearer.set_sensitive(true);
+
+    // 1. Per-principal limit = 1 with max_app_requests = 8 isolates principal A from principal B,
+    //    and enrollment exchange is capped at 4 concurrent slots per EnrollmentId.
+    let mut state = fixture.state.clone();
+    let cfg = Arc::make_mut(&mut state.config);
+    cfg.max_app_requests = 8;
+    cfg.max_requests_per_principal = 1;
+    cfg.max_control_requests = 1;
+    let hold_gate = Arc::new(Gate::default());
+    let enroll_entered = Arc::new(AtomicUsize::new(0));
+    let enroll_all_in = Arc::new(Notify::new());
+    let enroll_release = Arc::new(Notify::new());
+    let ee = Arc::clone(&enroll_entered);
+    let ea = Arc::clone(&enroll_all_in);
+    let er = Arc::clone(&enroll_release);
+    let routes = RouteGroups {
+        application: OpenApiRouter::default()
+            .route(
+                "/v1/test/hold",
+                post(hold).layer(Extension(Arc::clone(&hold_gate))),
+            )
+            .route("/v1/test/ok", get(|| async { StatusCode::NO_CONTENT })),
+        control: OpenApiRouter::default().route("/v1/test/control", post(control)),
+        enrollment_exchange: OpenApiRouter::default().route(
+            "/v1/enrollment/exchange",
+            post(move |EnrollmentCaller(_): EnrollmentCaller| {
+                let ee = Arc::clone(&ee);
+                let ea = Arc::clone(&ea);
+                let er = Arc::clone(&er);
+                async move {
+                    if ee.fetch_add(1, Ordering::SeqCst) + 1 == 4 {
+                        ea.notify_one();
+                    }
+                    er.notified().await;
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        ),
+        ..RouteGroups::default()
+    };
+    let router = assemble(state.clone(), 8101, routes).unwrap();
+
+    let held = tokio::spawn(send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/v1/test/hold",
+            Some(&fixture.api),
+            Body::empty(),
+        ),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), hold_gate.entered.notified())
+        .await
+        .unwrap();
+    // Principal A is rejected by its per-principal cap while principal B still succeeds.
+    problem(
+        send(
+            router.clone(),
+            request(
+                Method::GET,
+                "/v1/test/ok",
+                Some(&fixture.api),
+                Body::empty(),
+            ),
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        code::OVERLOADED,
+    )
+    .await;
+    assert_eq!(
+        send(
+            router.clone(),
+            request(
+                Method::GET,
+                "/v1/test/ok",
+                Some(&second_bearer),
+                Body::empty()
+            ),
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    hold_gate.release.notify_one();
+    assert_eq!(held.await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    // 4 concurrent enrollment exchanges for one ticket fill the per-enrollment cap;
+    // the 5th gets 503 overloaded while an application API request still succeeds.
+    let mut exchanges = Vec::new();
+    for _ in 0..4 {
+        exchanges.push(tokio::spawn(send(
+            router.clone(),
+            request(
+                Method::POST,
+                "/v1/enrollment/exchange",
+                Some(&fixture.enrollment),
+                Body::empty(),
+            ),
+        )));
+    }
+    tokio::time::timeout(Duration::from_secs(5), enroll_all_in.notified())
+        .await
+        .unwrap();
+    problem(
+        send(
+            router.clone(),
+            request(
+                Method::POST,
+                "/v1/enrollment/exchange",
+                Some(&fixture.enrollment),
+                Body::empty(),
+            ),
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        code::OVERLOADED,
+    )
+    .await;
+    assert_eq!(
+        send(
+            router.clone(),
+            request(
+                Method::GET,
+                "/v1/test/ok",
+                Some(&second_bearer),
+                Body::empty()
+            ),
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    enroll_release.notify_waiters();
+    for task in exchanges {
+        assert_eq!(task.await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+
+    // 2. Saturating all 6 general ReadPool readers must NOT block control-lane auth.
+    let pool_entered = Arc::new(AtomicUsize::new(0));
+    let pool_all_in = Arc::new(Notify::new());
+    let pool_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let mut blockers = Vec::new();
+    for _ in 0..6 {
+        let storage = state.storage.clone();
+        let pe = Arc::clone(&pool_entered);
+        let pa = Arc::clone(&pool_all_in);
+        let pr = Arc::clone(&pool_release);
+        blockers.push(tokio::spawn(async move {
+            storage
+                .read_snapshot(move |_conn| {
+                    if pe.fetch_add(1, Ordering::SeqCst) + 1 == 6 {
+                        pa.notify_one();
+                    }
+                    let (lock, cv) = &*pr;
+                    drop(
+                        cv.wait_timeout_while(
+                            lock.lock().unwrap(),
+                            Duration::from_secs(5),
+                            |released| !*released,
+                        )
+                        .unwrap(),
+                    );
+                    Ok::<_, StorageError>(())
+                })
+                .await
+                .unwrap();
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), pool_all_in.notified())
+        .await
+        .unwrap();
+    // Control lane uses its dedicated control_pre_auth + control ReadPool readers.
+    let control_res = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(
+            router.clone(),
+            request(
+                Method::POST,
+                "/v1/test/control",
+                Some(&fixture.api),
+                Body::empty(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(control_res.status(), StatusCode::NO_CONTENT);
+    drop(control_res);
+    *pool_release.0.lock().unwrap() = true;
+    pool_release.1.notify_all();
+    for task in blockers {
+        task.await.unwrap();
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn openapi_metadata_caps_extensions_and_live_response_schemas() {
+    use efferian_authz::AuthzError;
+    use efferian_protocol::AccountNotBoundReason;
+
+    let err_res = ApiError::from(AuthzError::AccountNotBound {
+        reason: AccountNotBoundReason::MissingBinding,
+    })
+    .into_response();
+    assert_eq!(err_res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(err_res.headers()[CONTENT_TYPE], "application/problem+json");
+    let err_bytes = err_res.into_body().collect().await.unwrap().to_bytes();
+    let problem: ProblemDetails = serde_json::from_slice(&err_bytes).unwrap();
+    assert_eq!(problem.code, code::ACCOUNT_NOT_BOUND);
+    assert_eq!(
+        problem.extensions.get("reason"),
+        Some(&serde_json::json!("missing_binding"))
+    );
+
+    let doc_value: serde_json::Value = serde_json::to_value(openapi_doc()).unwrap();
+    for (path, path_item) in doc_value["paths"].as_object().unwrap() {
+        for method in ["get", "post", "put", "delete", "patch"] {
+            if let Some(op) = path_item.get(method) {
+                let tags = op["tags"].as_array().unwrap();
+                assert!(!tags.is_empty(), "missing tag on {method} {path}");
+                for (status, resp) in op["responses"].as_object().unwrap() {
+                    let desc = resp["description"].as_str().unwrap_or("");
+                    assert!(
+                        !desc.is_empty(),
+                        "empty description on {method} {path} {status}"
+                    );
+                }
+                if let Some(params) = op.get("parameters").and_then(|v| v.as_array()) {
+                    for param in params {
+                        if param["name"] == "limit" {
+                            assert_eq!(param["schema"]["minimum"].as_f64(), Some(1.0));
+                            assert_eq!(param["schema"]["maximum"].as_f64(), Some(200.0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let schemas = &doc_value["components"]["schemas"];
+    assert_eq!(
+        schemas["MintToken"]["properties"]["allowed_profiles"]["maxItems"].as_u64(),
+        Some(256)
+    );
+    assert_eq!(
+        schemas["MintToken"]["properties"]["allowed_nodes"]["maxItems"].as_u64(),
+        Some(256)
+    );
+    assert_eq!(
+        schemas["PrincipalPut"]["properties"]["allowed_node_tags"]["maxItems"].as_u64(),
+        Some(64)
+    );
+    assert_eq!(
+        schemas["MintEnrollment"]["properties"]["tags"]["maxItems"].as_u64(),
+        Some(64)
+    );
+
+    // Validate live serialized Hub responses against their generated OpenAPI schemas.
+    let fixture = Fixture::new();
+    let hub = router(fixture.state.clone(), 8101).unwrap();
+    for (path, bearer) in [
+        ("/v1/health", None),
+        ("/v1/info", None),
+        ("/v1/admin/status", Some(&fixture.api)),
+        ("/v1/me", Some(&fixture.api)),
+    ] {
+        let res = send(
+            hub.clone(),
+            request(Method::GET, path, bearer, Body::empty()),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let schema_ref = doc_value["paths"][path]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["$ref"]
+            .as_str()
+            .unwrap();
+        let validator = jsonschema::validator_for(&serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": schema_ref,
+            "components": doc_value["components"],
+        }))
+        .unwrap();
+        assert!(
+            validator.is_valid(&body),
+            "{path} failed {schema_ref}: {body}"
+        );
+    }
     fixture.finish().await;
 }

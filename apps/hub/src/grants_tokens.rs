@@ -18,15 +18,19 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::http::{
-    ApiCaller, ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, AppState, EmptyBody, RouteGroups,
+    ApiCaller, ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, AppState, EmptyBody, OperatorScope,
+    Page, RouteGroups, checked_page_limit, point_missing, reject_narrowed_admin,
+    require_unrestricted_operator,
 };
-use crate::operations::{active_token_count, is_valid_token_label};
-use crate::principals::{Page, checked_page_limit, point_missing, reject_narrowed_admin};
-use crate::storage::{PriorityKind, WriteTxError, id, read_principal, scalar, scalar_text};
-use crate::vault::{
-    IssuedCredential,
-    auth::{optional_json, optional_scalar, read_grant_scope, refresh_api},
+use crate::operations::{active_token_count, normalize_token_label};
+use crate::storage::{
+    PriorityKind, WriteTxError, id, optional_json, optional_scalar, read_grant_scope,
+    read_principal, scalar, scalar_text,
 };
+use crate::vault::{IssuedCredential, auth::refresh_api};
+
+const MAX_TOKEN_SCOPE_PROFILES: usize = 256;
+const MAX_TOKEN_SCOPE_NODES: usize = 256;
 
 pub(crate) fn routes() -> RouteGroups {
     RouteGroups {
@@ -68,8 +72,10 @@ struct MintToken {
     principal_id: PrincipalId,
     label: String,
     max_capability: Option<Capability>,
-    allowed_profiles: Option<BTreeSet<ProfileId>>,
-    allowed_nodes: Option<BTreeSet<NodeId>>,
+    #[schema(max_items = 256)]
+    allowed_profiles: Option<Vec<ProfileId>>,
+    #[schema(max_items = 256)]
+    allowed_nodes: Option<Vec<NodeId>>,
     #[serde(default)]
     withhold_sensitive: bool,
     expires_at_ms: Option<i64>,
@@ -112,19 +118,16 @@ struct PutGrantResult {
 }
 
 #[utoipa::path(
-    get, path = "/v1/tokens",
+    get, path = "/v1/tokens", tag = "Tokens",
     security(("api_bearer" = [])),
     params(
-        ("limit" = Option<u16>, Query, description = "Page size from 1 to 200 (default 50)"),
+        ("limit" = Option<u16>, Query, minimum = 1, maximum = 200, description = "Page size from 1 to 200 (default 50)"),
         ("cursor" = Option<TokenId>, Query, description = "Exclusive token ID cursor"),
         ("principal_id" = Option<PrincipalId>, Query, description = "Filter by token subject"),
     ),
     responses(
-        (status = 200, body = Page<TokenMetadata>),
-        (status = 400, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 200, description = "Visible tokens page", body = Page<TokenMetadata>),
+        (status = 404, description = "Filtered principal does not exist", body = ProblemDetails, content_type = "application/problem+json"),
     ),
 )]
 async fn list_tokens(
@@ -144,7 +147,7 @@ async fn list_tokens(
                 query,
                 limit,
                 SubjectMetadata::Tokens,
-                TOKEN_LIST,
+                &TOKEN_QUERIES,
                 token_row,
             )
         })
@@ -153,16 +156,13 @@ async fn list_tokens(
 }
 
 #[utoipa::path(
-    post, path = "/v1/tokens",
+    post, path = "/v1/tokens", tag = "Tokens",
     security(("api_bearer" = [])),
     request_body = MintToken,
     responses(
-        (status = 201, body = MintedToken),
-        (status = 400, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 409, body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 201, description = "API token issued", body = MintedToken),
+        (status = 404, description = "Target principal does not exist", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Active token quota exceeded", body = ProblemDetails, content_type = "application/problem+json"),
     ),
 )]
 async fn mint_token(
@@ -179,9 +179,12 @@ async fn mint_token(
         withhold_sensitive,
         expires_at_ms,
     } = body;
-    if !is_valid_token_label(&label) {
-        return Err(ApiError::bad_input());
-    }
+    let label = normalize_token_label(&label)
+        .ok_or_else(ApiError::bad_input)?
+        .to_owned();
+    let allowed_profiles = bounded_set(allowed_profiles, MAX_TOKEN_SCOPE_PROFILES)?;
+    let allowed_nodes = bounded_set(allowed_nodes, MAX_TOKEN_SCOPE_NODES)?;
+
     // The principal prefix identifies the token family without a preflight lookup.
     let token_id = match principal_id.prefix() {
         PrincipalPrefix::Sp => TokenId::new_service(),
@@ -217,7 +220,7 @@ async fn mint_token(
             let conn = tx.conn();
             let now = tx.now_ms();
             let ctx = refresh_api(conn, &caller.credential, now)?;
-            reject_narrowed_admin(&ctx)?;
+            require_unrestricted_operator(&ctx, OperatorScope::TokenMint)?;
             let target =
                 read_principal(conn, principal_id)?.ok_or_else(|| point_missing(&ctx, true))?;
             let managed_nodes = if ctx.caller.is_orchestrator
@@ -230,10 +233,9 @@ async fn mint_token(
             } else {
                 BTreeSet::new()
             };
-            authorize_token_mint(&ctx, &target, &request, &policy, &managed_nodes)
-                .map_err(ApiError::from)?;
+            authorize_token_mint(&ctx, &target, &request, &policy, &managed_nodes)?;
             if target.disabled_at_ms.is_some() {
-                return Err(ApiError::from(AuthzError::PrincipalDisabled).into());
+                return Err(AuthzError::PrincipalDisabled.into());
             }
             if active_token_count(conn, principal_id, now)? >= max_active_tokens {
                 return Err(ApiError::conflict(error_codes::QUOTA_EXCEEDED).into());
@@ -243,26 +245,26 @@ async fn mint_token(
                     "token family does not match principal kind",
                 ));
             }
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO auth_tokens (token_id, principal_id, created_by, label, key_id,
                 verifier_hmac, max_capability, allowed_profiles_json, allowed_nodes_json,
                 withhold_sensitive, expires_at_ms, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![
-                    token_id.to_string(),
-                    principal_id.to_string(),
-                    ctx.caller.principal_id.to_string(),
-                    label,
-                    key_id,
-                    verifier,
-                    max_capability_text,
-                    profiles_json,
-                    nodes_json,
-                    request.withhold_sensitive,
-                    request.expires_at_ms,
-                    now,
-                ],
-            )?;
+            )?
+            .execute(params![
+                token_id.to_string(),
+                principal_id.to_string(),
+                ctx.caller.principal_id.to_string(),
+                label,
+                key_id,
+                verifier.as_str(),
+                max_capability_text,
+                profiles_json,
+                nodes_json,
+                request.withhold_sensitive,
+                request.expires_at_ms,
+                now,
+            ])?;
             Ok(())
         })
         .await?;
@@ -276,15 +278,12 @@ async fn mint_token(
 }
 
 #[utoipa::path(
-    post, path = "/v1/tokens/{id}/revoke",
+    post, path = "/v1/tokens/{id}/revoke", tag = "Tokens",
     security(("api_bearer" = [])),
     params(("id" = TokenId, Path, description = "Token ID")),
     responses(
-        (status = 204),
-        (status = 400, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 204, description = "Token revoked"),
+        (status = 404, description = "Token does not exist", body = ProblemDetails, content_type = "application/problem+json"),
     ),
 )]
 async fn revoke_token(
@@ -297,20 +296,19 @@ async fn revoke_token(
         .execute_priority::<_, ApiError, _>(PriorityKind::RevokeToken, move |tx| {
             let conn = tx.conn();
             let ctx = refresh_api(conn, &caller.credential, tx.now_ms())?;
-            reject_narrowed_admin(&ctx)?;
+            require_unrestricted_operator(&ctx, OperatorScope::SubjectOperator)?;
             let principal_id = conn
-                .query_row(
+                .prepare_cached(
                     "SELECT t.principal_id FROM auth_tokens t
-             JOIN hub_meta h ON h.id = 1
-             WHERE t.token_id = ?1 AND t.principal_id IS NOT h.gc_purging_principal_id",
-                    [token_id.to_string()],
-                    |row| id(row, 0),
-                )
+                     JOIN hub_meta h ON h.id = 1
+                     WHERE t.token_id = ?1 AND t.principal_id IS NOT h.gc_purging_principal_id",
+                )?
+                .query_row([token_id.to_string()], |row| id(row, 0))
                 .optional()?
                 .ok_or_else(|| point_missing(&ctx, true))?;
             let target =
                 read_principal(conn, principal_id)?.ok_or_else(|| point_missing(&ctx, true))?;
-            authorize_token_revoke(&ctx, &target).map_err(ApiError::from)?;
+            authorize_token_revoke(&ctx, &target)?;
             tx.revoke_token(ActorId::Principal(ctx.caller.principal_id), token_id)?;
             Ok(())
         })
@@ -319,19 +317,16 @@ async fn revoke_token(
 }
 
 #[utoipa::path(
-    get, path = "/v1/grants",
+    get, path = "/v1/grants", tag = "Grants",
     security(("api_bearer" = [])),
     params(
-        ("limit" = Option<u16>, Query, description = "Page size from 1 to 200 (default 50)"),
+        ("limit" = Option<u16>, Query, minimum = 1, maximum = 200, description = "Page size from 1 to 200 (default 50)"),
         ("cursor" = Option<GrantId>, Query, description = "Exclusive grant ID cursor"),
         ("principal_id" = Option<PrincipalId>, Query, description = "Filter by grant subject"),
     ),
     responses(
-        (status = 200, body = Page<GrantMetadata>),
-        (status = 400, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 200, description = "Visible grants page", body = Page<GrantMetadata>),
+        (status = 404, description = "Filtered principal does not exist", body = ProblemDetails, content_type = "application/problem+json"),
     ),
 )]
 async fn list_grants(
@@ -351,7 +346,7 @@ async fn list_grants(
                 query,
                 limit,
                 SubjectMetadata::Grants,
-                GRANT_LIST,
+                &GRANT_QUERIES,
                 grant_row,
             )
         })
@@ -360,16 +355,13 @@ async fn list_grants(
 }
 
 #[utoipa::path(
-    put, path = "/v1/grants",
+    put, path = "/v1/grants", tag = "Grants",
     security(("api_bearer" = [])),
     request_body = PutGrant,
     responses(
-        (status = 200, body = PutGrantResult),
-        (status = 201, body = PutGrantResult),
-        (status = 400, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 200, description = "Grant already existed", body = PutGrantResult),
+        (status = 201, description = "Grant created", body = PutGrantResult),
+        (status = 404, description = "Target principal or profile does not exist", body = ProblemDetails, content_type = "application/problem+json"),
     ),
 )]
 async fn put_grant(
@@ -381,82 +373,96 @@ async fn put_grant(
         return Err(ApiError::bad_input());
     }
     let new_id = GrantId::new();
-    let (status, result) = app.storage.execute_work::<_, ApiError, _>(std::mem::size_of::<PutGrant>(), move |tx| {
-        let conn = tx.conn();
-        let ctx = refresh_api(conn, &caller.credential, tx.now_ms())?;
-        if request.capability == Capability::Admin {
-            authorize_admin(&ctx).map_err(ApiError::from)?;
-        } else {
-            reject_narrowed_admin(&ctx)?;
-            if request.scope == GrantScope::Global && authorize_admin(&ctx).is_err() {
-                return Err(ApiError::forbidden().into());
+    let (status, result) = app
+        .storage
+        .execute_work::<_, ApiError, _>(std::mem::size_of::<PutGrant>(), move |tx| {
+            let conn = tx.conn();
+            let ctx = refresh_api(conn, &caller.credential, tx.now_ms())?;
+            if request.capability == Capability::Admin {
+                authorize_admin(&ctx)?;
+            } else if request.scope == GrantScope::Global {
+                reject_narrowed_admin(&ctx)?;
+                if authorize_admin(&ctx).is_err() {
+                    return Err(ApiError::forbidden().into());
+                }
+            } else {
+                require_unrestricted_operator(&ctx, OperatorScope::SubjectOperator)?;
             }
-        }
 
-        let target = read_principal(conn, request.principal_id)?
-            .ok_or_else(|| point_missing(&ctx, true))?;
-        let view = GrantView { scope: request.scope, capability: request.capability };
-        authorize_grant_mutation(&ctx, &target, view, GrantMutation::Put)
-            .map_err(ApiError::from)?;
-        if let GrantScope::Profile(profile_id) = request.scope {
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM profiles WHERE profile_id = ?1)",
-                [profile_id.to_string()],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                return Err(ApiError::not_found().into());
-            }
-        }
-
-        let principal_id = request.principal_id.to_string();
-        let scope_kind = request.scope.scope_kind_str();
-        let scope_id = request.scope.scope_id_string();
-        let capability = scalar_text(request.capability)?;
-        let created = conn.execute(
-            "INSERT INTO grants (grant_id, principal_id, scope_kind, scope_id, capability, created_by, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT (principal_id, scope_kind, scope_id, capability) DO NOTHING",
-            params![
-                new_id.to_string(), principal_id, scope_kind, scope_id, capability,
-                ctx.caller.principal_id.to_string(), tx.now_ms(),
-            ],
-        )? != 0;
-        let (status, outcome, grant_id) = if created {
-            (StatusCode::CREATED, GrantOutcome::Created, new_id)
-        } else {
-            let id = conn.query_row(
-                "SELECT grant_id FROM grants
-                 WHERE principal_id = ?1 AND scope_kind = ?2 AND scope_id = ?3 AND capability = ?4",
-                params![principal_id, scope_kind, scope_id, capability],
-                |row| id(row, 0),
-            )?;
-            (StatusCode::OK, GrantOutcome::Unchanged, id)
-        };
-        Ok((status, PutGrantResult {
-            outcome,
-            grant: GrantMetadata {
-                grant_id,
-                principal_id: request.principal_id,
+            let target = read_principal(conn, request.principal_id)?
+                .ok_or_else(|| point_missing(&ctx, true))?;
+            let view = GrantView {
                 scope: request.scope,
                 capability: request.capability,
-            },
-        }))
-    }).await?;
+            };
+            authorize_grant_mutation(&ctx, &target, view, GrantMutation::Put)?;
+            if let GrantScope::Profile(profile_id) = request.scope {
+                let exists: bool = conn
+                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM profiles WHERE profile_id = ?1)")?
+                    .query_row([profile_id.to_string()], |row| row.get(0))?;
+                if !exists {
+                    return Err(ApiError::not_found().into());
+                }
+            }
+
+            let principal_id = request.principal_id.to_string();
+            let scope_kind = request.scope.scope_kind_str();
+            let scope_id = request.scope.scope_id_string();
+            let capability = scalar_text(request.capability)?;
+            let created = conn
+                .prepare_cached(
+                    "INSERT INTO grants (grant_id, principal_id, scope_kind, scope_id, capability, created_by, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT (principal_id, scope_kind, scope_id, capability) DO NOTHING",
+                )?
+                .execute(params![
+                    new_id.to_string(),
+                    principal_id,
+                    scope_kind,
+                    scope_id,
+                    capability,
+                    ctx.caller.principal_id.to_string(),
+                    tx.now_ms(),
+                ])?
+                != 0;
+            let (status, outcome, grant_id) = if created {
+                (StatusCode::CREATED, GrantOutcome::Created, new_id)
+            } else {
+                let id = conn
+                    .prepare_cached(
+                        "SELECT grant_id FROM grants
+                         WHERE principal_id = ?1 AND scope_kind = ?2 AND scope_id = ?3 AND capability = ?4",
+                    )?
+                    .query_row(params![principal_id, scope_kind, scope_id, capability], |row| {
+                        id(row, 0)
+                    })?;
+                (StatusCode::OK, GrantOutcome::Unchanged, id)
+            };
+            Ok((
+                status,
+                PutGrantResult {
+                    outcome,
+                    grant: GrantMetadata {
+                        grant_id,
+                        principal_id: request.principal_id,
+                        scope: request.scope,
+                        capability: request.capability,
+                    },
+                },
+            ))
+        })
+        .await?;
     Ok((status, Json(result)))
 }
 
 #[utoipa::path(
-    delete, path = "/v1/grants/{id}",
+    delete, path = "/v1/grants/{id}", tag = "Grants",
     security(("api_bearer" = [])),
     params(("id" = GrantId, Path, description = "Grant ID")),
     responses(
-        (status = 204),
-        (status = 400, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = ProblemDetails, content_type = "application/problem+json"),
-        (status = 409, body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 204, description = "Grant deleted"),
+        (status = 404, description = "Grant does not exist", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Cannot remove the last global admin grant", body = ProblemDetails, content_type = "application/problem+json"),
     ),
 )]
 async fn delete_grant(
@@ -469,14 +475,18 @@ async fn delete_grant(
         .execute_priority::<_, ApiError, _>(PriorityKind::RevokeGrant, move |tx| {
             let conn = tx.conn();
             let ctx = refresh_api(conn, &caller.credential, tx.now_ms())?;
-            reject_narrowed_admin(&ctx)?;
-            let grant = conn.query_row(
-            "SELECT g.grant_id, g.principal_id, g.scope_kind, g.scope_id, g.capability FROM grants g
-             JOIN hub_meta h ON h.id = 1
-             WHERE g.grant_id = ?1 AND g.principal_id IS NOT h.gc_purging_principal_id",
-            [grant_id.to_string()],
-            |row| grant_row(row).map(|(_, grant)| grant),
-        ).optional()?.ok_or_else(|| point_missing(&ctx, true))?;
+            require_unrestricted_operator(&ctx, OperatorScope::SubjectOperator)?;
+            let grant = conn
+                .prepare_cached(
+                    "SELECT g.grant_id, g.principal_id, g.scope_kind, g.scope_id, g.capability
+                     FROM grants g JOIN hub_meta h ON h.id = 1
+                     WHERE g.grant_id = ?1 AND g.principal_id IS NOT h.gc_purging_principal_id",
+                )?
+                .query_row([grant_id.to_string()], |row| {
+                    grant_row(row).map(|(_, grant)| grant)
+                })
+                .optional()?
+                .ok_or_else(|| point_missing(&ctx, true))?;
 
             let target = read_principal(conn, grant.principal_id)?
                 .ok_or_else(|| point_missing(&ctx, true))?;
@@ -484,8 +494,7 @@ async fn delete_grant(
                 scope: grant.scope,
                 capability: grant.capability,
             };
-            authorize_grant_mutation(&ctx, &target, view, GrantMutation::Remove)
-                .map_err(ApiError::from)?;
+            authorize_grant_mutation(&ctx, &target, view, GrantMutation::Remove)?;
             tx.revoke_grant(grant_id)?;
             Ok(())
         })
@@ -493,15 +502,65 @@ async fn delete_grant(
     Ok(StatusCode::NO_CONTENT)
 }
 
-const TOKEN_LIST: (&str, &str) = (
-    "SELECT r.token_id, r.principal_id, r.label, r.max_capability, r.allowed_profiles_json,
-            r.allowed_nodes_json, r.withhold_sensitive, r.created_at_ms, r.expires_at_ms, r.revoked_at_ms
+struct SubjectQueries {
+    by_subject: &'static str,
+    admin: &'static str,
+    member: &'static str,
+    orchestrator: &'static str,
+}
+
+macro_rules! subject_queries {
+    ($select:literal, $id:literal) => {
+        SubjectQueries {
+            by_subject: concat!(
+                $select,
+                " WHERE r.principal_id = ?3 AND ",
+                $id,
+                " COLLATE BINARY > ?1 ORDER BY ",
+                $id,
+                " COLLATE BINARY ASC LIMIT ?2"
+            ),
+            admin: concat!(
+                $select,
+                " WHERE r.principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1) AND ",
+                $id,
+                " COLLATE BINARY > ?1 ORDER BY ",
+                $id,
+                " COLLATE BINARY ASC LIMIT ?2"
+            ),
+            member: concat!(
+                $select,
+                " WHERE r.principal_id IN (SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1 \
+                  WHERE p.principal_id IS NOT h.gc_purging_principal_id \
+                    AND (p.principal_id = ?3 OR (p.kind = 'agent' AND p.owner_principal_id = ?3))) AND ",
+                $id,
+                " COLLATE BINARY > ?1 ORDER BY ",
+                $id,
+                " COLLATE BINARY ASC LIMIT ?2"
+            ),
+            orchestrator: concat!(
+                $select,
+                " WHERE r.principal_id IN (SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1 \
+                  WHERE p.principal_id IS NOT h.gc_purging_principal_id AND p.kind = 'agent' \
+                    AND p.owner_principal_id IS NULL AND p.managed_by_principal_id = ?3) AND ",
+                $id,
+                " COLLATE BINARY > ?1 ORDER BY ",
+                $id,
+                " COLLATE BINARY ASC LIMIT ?2"
+            ),
+        }
+    };
+}
+
+const TOKEN_QUERIES: SubjectQueries = subject_queries!(
+    "SELECT r.token_id, r.principal_id, r.label, r.max_capability, r.allowed_profiles_json, \
+            r.allowed_nodes_json, r.withhold_sensitive, r.created_at_ms, r.expires_at_ms, r.revoked_at_ms \
      FROM auth_tokens r",
-    "r.token_id",
+    "r.token_id"
 );
-const GRANT_LIST: (&str, &str) = (
+const GRANT_QUERIES: SubjectQueries = subject_queries!(
     "SELECT r.grant_id, r.principal_id, r.scope_kind, r.scope_id, r.capability FROM grants r",
-    "r.grant_id",
+    "r.grant_id"
 );
 
 fn read_subject_page<Id: ToString, Item>(
@@ -510,44 +569,27 @@ fn read_subject_page<Id: ToString, Item>(
     query: SubjectPageQuery<Id>,
     limit: usize,
     metadata: SubjectMetadata,
-    (select, id): (&str, &str),
+    queries: &SubjectQueries,
     mut decode: impl FnMut(&Row<'_>) -> rusqlite::Result<(PrincipalId, Item)>,
 ) -> ApiResult<Vec<Item>> {
     let mut checked = BTreeSet::new();
     let caller = ctx.caller.principal_id;
-    // A subject filter can use the principal index directly. An unfiltered
-    // delegate page starts with the subjects that delegate can see.
-    let (visibility, subject) = if let Some(subject) = query.principal_id {
+    let (sql, subject) = if let Some(subject) = query.principal_id {
         let target = read_principal(conn, subject)?.ok_or_else(|| point_missing(ctx, false))?;
         authorize_subject_metadata_read(ctx, &target, metadata)?;
         checked.insert(subject);
-        ("r.principal_id = ?3", Some(subject))
+        (queries.by_subject, Some(subject))
     } else if authorize_admin(ctx).is_ok() {
-        (
-            "r.principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1)",
-            None,
-        )
+        (queries.admin, None)
     } else if ctx.caller.kind == PrincipalKind::Member {
-        (
-            "r.principal_id IN (SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1
-          WHERE p.principal_id IS NOT h.gc_purging_principal_id
-            AND (p.principal_id = ?3 OR (p.kind = 'agent' AND p.owner_principal_id = ?3)))",
-            Some(caller),
-        )
+        (queries.member, Some(caller))
     } else if ctx.caller.is_orchestrator {
-        (
-            "r.principal_id IN (SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1
-          WHERE p.principal_id IS NOT h.gc_purging_principal_id AND p.kind = 'agent'
-            AND p.owner_principal_id IS NULL AND p.managed_by_principal_id = ?3)",
-            Some(caller),
-        )
+        (queries.orchestrator, Some(caller))
     } else {
         return Ok(Vec::new());
     };
 
-    let mut stmt = conn.prepare_cached(&format!(
-        "{select} WHERE {visibility} AND {id} COLLATE BINARY > ?1 ORDER BY {id} COLLATE BINARY ASC LIMIT ?2"
-    ))?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let cursor = query.cursor.map(|id| id.to_string()).unwrap_or_default();
     let mut rows = match subject {
         Some(subject) => stmt.query(params![cursor, limit + 1, subject.to_string()])?,
@@ -563,6 +605,16 @@ fn read_subject_page<Id: ToString, Item>(
         items.push(item);
     }
     Ok(items)
+}
+
+fn bounded_set<T: Ord>(values: Option<Vec<T>>, max: usize) -> ApiResult<Option<BTreeSet<T>>> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    if values.len() > max {
+        return Err(ApiError::bad_input());
+    }
+    Ok(Some(values.into_iter().collect()))
 }
 
 fn token_row(row: &Row<'_>) -> rusqlite::Result<(PrincipalId, TokenMetadata)> {

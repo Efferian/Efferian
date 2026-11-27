@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use axum::{
     Extension, Json,
@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
+use efferian_authz::authorize_admin;
 use efferian_protocol::{HubId, PROBLEM_JSON_MEDIA_TYPE, ProblemDetails};
 use http::{
     HeaderMap, StatusCode,
@@ -24,7 +25,10 @@ use utoipa::{
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::{ApiError, ApiResult, AppState};
+use crate::storage::StorageStatus;
+use crate::vault::auth::refresh_api;
+
+use super::{ApiCaller, ApiResult, AppState, RouteGroups};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -53,6 +57,13 @@ pub(super) fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(health))
         .routes(routes!(info))
         .routes(routes!(openapi))
+}
+
+pub(super) fn admin_routes() -> RouteGroups {
+    RouteGroups {
+        application: OpenApiRouter::new().routes(routes!(admin_status)),
+        ..RouteGroups::default()
+    }
 }
 
 pub(super) fn document_boundary_errors(doc: &mut utoipa::openapi::OpenApi) {
@@ -151,8 +162,9 @@ struct HubHealth {
 #[utoipa::path(
     get,
     path = "/v1/health",
+    tag = "System",
     security(),
-    responses((status = 200, body = HubHealth))
+    responses((status = 200, description = "The Hub is alive", body = HubHealth))
 )]
 async fn health() -> Json<HubHealth> {
     Json(HubHealth { status: "ok" })
@@ -167,8 +179,9 @@ struct HubInfo {
 #[utoipa::path(
     get,
     path = "/v1/info",
+    tag = "System",
     security(),
-    responses((status = 200, body = HubInfo))
+    responses((status = 200, description = "Hub identity and version", body = HubInfo))
 )]
 async fn info(State(state): State<AppState>) -> Json<HubInfo> {
     Json(HubInfo {
@@ -177,9 +190,49 @@ async fn info(State(state): State<AppState>) -> Json<HubInfo> {
     })
 }
 
+#[derive(Serialize, ToSchema)]
+struct AdminStatus {
+    #[serde(flatten)]
+    storage: StorageStatus,
+    gc_error_count: u64,
+    online_nodes_count: usize,
+    upstream_pool_connections: usize,
+    active_upstream_executions: usize,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/admin/status",
+    tag = "System",
+    responses((status = 200, description = "Current Hub storage and runtime status", body = AdminStatus)),
+    security(("api_bearer" = []))
+)]
+async fn admin_status(
+    State(state): State<AppState>,
+    ApiCaller(caller): ApiCaller,
+) -> ApiResult<Json<AdminStatus>> {
+    let clock = state.clock;
+    let storage = state
+        .storage
+        .status_snapshot_with(move |conn| -> ApiResult<()> {
+            let ctx = refresh_api(conn, &caller.credential, clock.wall_now_ms())?;
+            authorize_admin(&ctx)?;
+            Ok(())
+        })
+        .await?;
+    Ok(Json(AdminStatus {
+        storage,
+        gc_error_count: state.storage.gc_error_count(),
+        online_nodes_count: state.bridge.online_nodes_count(),
+        upstream_pool_connections: 0,
+        active_upstream_executions: 0,
+    }))
+}
+
 #[utoipa::path(
     get,
     path = "/v1/openapi.json",
+    tag = "System",
     security(),
     responses(
         (status = 200, description = "OpenAPI 3.1 document", content_type = "application/json",
@@ -189,10 +242,9 @@ async fn info(State(state): State<AppState>) -> Json<HubInfo> {
     )
 )]
 async fn openapi(
-    Extension(artifact): Extension<Arc<OnceLock<OpenApiArtifact>>>,
+    Extension(artifact): Extension<Arc<OpenApiArtifact>>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let artifact = artifact.get().ok_or_else(ApiError::internal)?;
     if etag_matches(&headers, artifact.etag.as_bytes()) {
         return Ok((StatusCode::NOT_MODIFIED, [(ETAG, artifact.etag.as_str())]).into_response());
     }

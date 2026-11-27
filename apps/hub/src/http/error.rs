@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 
 use axum::Json;
@@ -17,12 +18,13 @@ use crate::vault::{VaultError, auth::CredentialError};
 pub type ApiResult<T> = Result<T, ApiError>;
 
 /// An HTTP problem whose public fields never include raw request data or storage errors.
-#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[error("{status}: {code}")]
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     retryable: bool,
+    extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl ApiError {
@@ -31,11 +33,17 @@ impl ApiError {
             status,
             code,
             retryable: false,
+            extensions: BTreeMap::new(),
         }
     }
 
     pub const fn retryable(mut self) -> Self {
         self.retryable = true;
+        self
+    }
+
+    pub fn with_extension(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.extensions.insert(key.into(), value);
         self
     }
 
@@ -84,13 +92,16 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let problem = ProblemDetails::new(
+        let mut problem = ProblemDetails::new(
             self.status.as_u16(),
             self.code,
             self.status.canonical_reason().unwrap_or("Request failed"),
             self.retryable,
             TraceId::new(),
         );
+        for (key, value) in self.extensions {
+            problem = problem.with_extension(key, value);
+        }
         let mut response = (self.status, Json(problem)).into_response();
         let headers = response.headers_mut();
         headers.insert(
@@ -111,7 +122,13 @@ impl From<AuthzError> for ApiError {
     fn from(error: AuthzError) -> Self {
         let status =
             StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        Self::new(status, error.code())
+        let mut api = Self::new(status, error.code());
+        if let AuthzError::AccountNotBound { reason } = error
+            && let Ok(value) = serde_json::to_value(reason)
+        {
+            api = api.with_extension("reason", value);
+        }
+        api
     }
 }
 
@@ -169,6 +186,12 @@ impl From<WriteError<ApiError>> for ApiError {
 impl From<ApiError> for WriteTxError<ApiError> {
     fn from(error: ApiError) -> Self {
         Self::Domain(error)
+    }
+}
+
+impl From<AuthzError> for WriteTxError<ApiError> {
+    fn from(error: AuthzError) -> Self {
+        Self::Domain(error.into())
     }
 }
 

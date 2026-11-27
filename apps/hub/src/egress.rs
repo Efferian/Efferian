@@ -11,6 +11,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Body, Client, ClientBuilder, Response};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_IDLE_PER_HOST: usize = 32;
 
 #[derive(Clone)]
 pub struct EgressClient {
@@ -44,8 +45,14 @@ impl EgressClient {
         Ok(Self { client, policy })
     }
 
+    #[allow(dead_code, reason = "egress policy validation seam for #6")]
+    pub fn policy(&self) -> &EgressPolicy {
+        &self.policy
+    }
+
     /// Send to an upstream selected by URL. The URL supplies the HTTP authority
     /// and the TLS identity for the same connection.
+    #[allow(dead_code, reason = "upstream HTTP transport seam for #6/#8")]
     pub async fn send(
         &self,
         method: Method,
@@ -78,6 +85,7 @@ fn client_builder(policy: Arc<EgressPolicy>, resolver: Arc<dyn Resolve>) -> Clie
         .no_deflate()
         .no_zstd()
         .connect_timeout(CONNECT_TIMEOUT)
+        .pool_max_idle_per_host(MAX_IDLE_PER_HOST)
         .dns_resolver(Arc::new(ValidatingDnsResolver { policy, resolver }))
 }
 

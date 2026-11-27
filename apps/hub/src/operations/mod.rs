@@ -2,7 +2,7 @@
 
 mod output;
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use crate::storage::{
 use crate::vault::auth::{CredentialError, grant_views};
 use crate::vault::{IssuedCredential, Vault, VaultError, VaultKeys};
 
-use output::{FileOutput, TokenOutput, absent, create_private_file};
+use output::{FileOutput, TokenOutputPlan, absent, publish_private_file};
 
 const DATABASE: &str = "hub.sqlite3";
 const MASTER_KEY: &str = "hub.master.key";
@@ -143,25 +143,11 @@ pub fn init(
     let clock = SystemStorageClock::new()?;
     let mut lock = storage::acquire_state_lock(state_dir)?;
     preflight_init(lock.path())?;
-    let output = TokenOutput::preflight(lock.path(), out)?;
+    let output = TokenOutputPlan::preflight(lock.path(), out)?.reserve()?;
 
     let mut master_key = Zeroizing::new([0; 32]);
     getrandom::fill(master_key.as_mut()).map_err(|_| OperationError::KeyRandomness)?;
-    let key_path = lock.path().join(MASTER_KEY);
-    let mut key_file = create_private_file(&key_path)?;
-    key_file
-        .write_all(master_key.as_ref())
-        .and_then(|()| key_file.sync_all())
-        .map_err(|error| path_io("write and sync master key", &key_path, error))?;
-    File::open(lock.path())
-        .and_then(|dir| dir.sync_all())
-        .map_err(|error| {
-            path_io(
-                "sync state directory after creating master key",
-                lock.path(),
-                error,
-            )
-        })?;
+    publish_private_file(lock.path(), MASTER_KEY, master_key.as_ref())?;
 
     let keys = VaultKeys::derive(master_key)?;
     let admin_id = PrincipalId::new_for_kind(PrincipalKind::Admin);
@@ -209,8 +195,14 @@ pub fn open_existing(
     existing_state_dir(state_dir)?;
     for name in [DATABASE, MASTER_KEY] {
         let path = state_dir.join(name);
-        fs::symlink_metadata(&path)
+        let metadata = fs::symlink_metadata(&path)
             .map_err(|error| path_io("inspect first-run state", &path, error))?;
+        if !metadata.is_file() {
+            return Err(OperationError::InvalidOutput {
+                path,
+                reason: "expected a regular file",
+            });
+        }
     }
     let lock = storage::acquire_state_lock(state_dir)?;
     let bytes = Zeroizing::new(PrivateFs::read_private_file(
@@ -238,12 +230,12 @@ pub fn create_token(
     max_active_tokens: usize,
 ) -> Result<(), OperationError> {
     validate_resource_name(principal).map_err(|_| OperationError::InvalidPrincipalName)?;
-    if !is_valid_token_label(label) {
-        return Err(OperationError::InvalidTokenLabel);
-    }
+    let label = normalize_token_label(label).ok_or(OperationError::InvalidTokenLabel)?;
     if max_active_tokens == 0 {
         return Err(OperationError::InvalidTokenLimit);
     }
+    existing_state_dir(state_dir)?;
+    let output_plan = TokenOutputPlan::preflight(state_dir, out)?;
     let clock: Arc<dyn StorageClock> = Arc::new(SystemStorageClock::new()?);
     let (opened, vault) = open_existing(
         state_dir,
@@ -251,7 +243,7 @@ pub fn create_token(
         storage_config,
         Arc::clone(&clock),
     )?;
-    let output = TokenOutput::preflight(state_dir, out)?;
+    let output = output_plan.reserve()?;
     let token_id = TokenId::new_for_kind(PrincipalKind::Admin);
     let credential = vault.issue_token(token_id)?;
     let outcome = opened.run_offline_tx(|tx| -> Result<(), OperationError> {
@@ -276,6 +268,7 @@ pub fn create_token(
 }
 
 pub fn snapshot(state_dir: &Path, out: &Path) -> Result<(), OperationError> {
+    existing_state_dir(state_dir)?;
     let output = FileOutput::preflight(state_dir, out)?;
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -315,7 +308,19 @@ fn preflight_init(state_dir: &Path) -> Result<(), OperationError> {
 }
 
 fn existing_state_dir(state_dir: &Path) -> Result<(), OperationError> {
-    match fs::symlink_metadata(state_dir) {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = state_dir.as_os_str().as_bytes();
+    let trimmed = if raw.iter().all(|&b| b == b'/') {
+        if raw.is_empty() { raw } else { b"/" }
+    } else {
+        let end = raw
+            .iter()
+            .rposition(|&b| b != b'/')
+            .map_or(0, |index| index + 1);
+        &raw[..end]
+    };
+    let check_path = Path::new(std::ffi::OsStr::from_bytes(trimmed));
+    match fs::symlink_metadata(check_path) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(OperationError::InvalidExistingStateDir),
         Err(error) => Err(path_io(
@@ -389,16 +394,21 @@ fn insert_admin_token(
             principal_id.to_string(),
             label,
             credential.key_id,
-            credential.verifier,
+            credential.verifier.as_str(),
             now_ms
         ],
     )
 }
 
-pub(crate) fn is_valid_token_label(label: &str) -> bool {
-    label.len() <= 128
-        && !label.trim().is_empty()
-        && !label.bytes().any(|byte| byte.is_ascii_control())
+pub(crate) fn normalize_token_label(label: &str) -> Option<&str> {
+    if label.bytes().any(|byte| byte.is_ascii_control()) {
+        return None;
+    }
+    let trimmed = label.trim();
+    if !(1..=128).contains(&trimmed.len()) {
+        return None;
+    }
+    Some(trimmed)
 }
 
 pub(crate) fn active_token_count(
@@ -406,12 +416,11 @@ pub(crate) fn active_token_count(
     principal_id: PrincipalId,
     now_ms: i64,
 ) -> rusqlite::Result<usize> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT COUNT(*) FROM auth_tokens WHERE principal_id = ?1 AND revoked_at_ms IS NULL
            AND (expires_at_ms IS NULL OR expires_at_ms > ?2)",
-        params![principal_id.to_string(), now_ms],
-        |row| row.get(0),
-    )
+    )?
+    .query_row(params![principal_id.to_string(), now_ms], |row| row.get(0))
 }
 
 fn path_io(action: &'static str, path: &Path, source: io::Error) -> OperationError {

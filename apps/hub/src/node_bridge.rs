@@ -1,11 +1,15 @@
 //! Synchronous control surface for the node bridge.
 
-use efferian_protocol::NodeId;
+use efferian_protocol::{BRIDGE_CLOSE_NODE_REVOKED, BRIDGE_CLOSE_SUPERSEDED, NodeId};
 use serde::Serialize;
 use utoipa::ToSchema;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[allow(
+    dead_code,
+    reason = "Syncing and Ready variants are constructed by #7 bridge"
+)]
 pub enum NodeLiveStatus {
     Offline,
     Syncing,
@@ -19,10 +23,11 @@ pub enum BridgeCloseReason {
 }
 
 impl BridgeCloseReason {
+    #[allow(dead_code, reason = "WebSocket close code seam for #7")]
     pub const fn code(self) -> u16 {
         match self {
-            Self::Superseded => 4001,
-            Self::NodeRevoked => 4003,
+            Self::Superseded => BRIDGE_CLOSE_SUPERSEDED,
+            Self::NodeRevoked => BRIDGE_CLOSE_NODE_REVOKED,
         }
     }
 }

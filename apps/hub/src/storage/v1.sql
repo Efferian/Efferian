@@ -31,6 +31,11 @@ CREATE TABLE principals (
     CHECK (allowed_node_tags_json = '[]' OR is_orchestrator = 1),
     CHECK (observe_executions = 0 OR kind = 'service')
 );
+CREATE INDEX idx_principals_owner ON principals(owner_principal_id, principal_id);
+CREATE INDEX idx_principals_managed_by ON principals(managed_by_principal_id, principal_id);
+CREATE INDEX idx_principals_disabled_agents
+    ON principals(disabled_at_ms, principal_id)
+    WHERE kind = 'agent' AND managed_by_principal_id IS NOT NULL AND disabled_at_ms IS NOT NULL;
 
 
 CREATE TABLE auth_tokens (
@@ -49,7 +54,10 @@ CREATE TABLE auth_tokens (
     created_at_ms         INTEGER NOT NULL
 );
 CREATE INDEX idx_auth_tokens_created_by ON auth_tokens(created_by);
-CREATE INDEX idx_auth_tokens_principal ON auth_tokens(principal_id);
+CREATE INDEX idx_auth_tokens_principal ON auth_tokens(principal_id, token_id);
+CREATE INDEX idx_auth_tokens_principal_active
+    ON auth_tokens(principal_id, expires_at_ms)
+    WHERE revoked_at_ms IS NULL;
 CREATE INDEX idx_auth_tokens_expires ON auth_tokens(expires_at_ms) WHERE expires_at_ms IS NOT NULL;
 CREATE INDEX idx_auth_tokens_revoked ON auth_tokens(revoked_at_ms) WHERE revoked_at_ms IS NOT NULL;
 
@@ -71,6 +79,9 @@ CREATE TABLE node_enrollments (
         OR (target_node_name IS NULL AND target_node_id IS NOT NULL))
 );
 CREATE INDEX idx_node_enrollments_expires ON node_enrollments(expires_at_ms);
+CREATE INDEX idx_node_enrollments_target_node ON node_enrollments(target_node_id);
+CREATE INDEX idx_node_enrollments_created_by ON node_enrollments(created_by);
+CREATE INDEX idx_node_enrollments_managed_by ON node_enrollments(managed_by_principal_id);
 
 
 CREATE TABLE nodes (
@@ -92,6 +103,7 @@ CREATE TABLE nodes (
     updated_at_ms             INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX idx_nodes_active_name ON nodes(name) WHERE revoked_at_ms IS NULL;
+CREATE INDEX idx_nodes_managed_by ON nodes(managed_by_principal_id, node_id);
 
 
 CREATE TABLE upstreams (
@@ -123,6 +135,7 @@ CREATE TABLE accounts (
 );
 CREATE UNIQUE INDEX idx_accounts_shared_slug ON accounts(slug) WHERE visibility = 'shared';
 CREATE UNIQUE INDEX idx_accounts_private_owner_slug ON accounts(owner_principal_id, slug) WHERE visibility = 'private';
+CREATE INDEX idx_accounts_owner ON accounts(owner_principal_id);
 
 
 CREATE TABLE account_bindings (
@@ -144,6 +157,7 @@ CREATE TABLE tools (
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL
 );
+CREATE INDEX idx_tools_created_by ON tools(created_by);
 
 
 CREATE TABLE tool_revisions (
@@ -178,6 +192,7 @@ CREATE TABLE profile_editions (
     bindings_json   TEXT    NOT NULL,
     PRIMARY KEY (profile_id, version)
 );
+CREATE INDEX idx_profile_editions_published_by ON profile_editions(published_by);
 
 
 CREATE TABLE grants (
@@ -192,7 +207,11 @@ CREATE TABLE grants (
     CHECK ((scope_kind = 'global' AND scope_id = '') OR (scope_kind = 'profile' AND scope_id != '')),
     CHECK (capability != 'admin' OR scope_kind = 'global')
 );
-CREATE INDEX idx_grants_principal ON grants(principal_id);
+CREATE INDEX idx_grants_principal ON grants(principal_id, grant_id);
+CREATE INDEX idx_grants_created_by ON grants(created_by);
+CREATE INDEX idx_grants_global_admin
+    ON grants(principal_id)
+    WHERE scope_kind = 'global' AND scope_id = '' AND capability = 'admin';
 
 
 CREATE TABLE executions (

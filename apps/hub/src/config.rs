@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use efferian_authz::{MAX_ORCHESTRATOR_AGENT_TOKEN_TTL_MS, MAX_ORCHESTRATOR_ENROLLMENT_TTL_MS};
 use efferian_protocol::ssrf::EgressPolicy;
 use serde::{Deserialize, Deserializer};
 
@@ -51,7 +52,7 @@ impl FromStr for Authority {
 }
 
 fn parse_port(raw: &str) -> Result<u16, InvalidAuthority> {
-    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+    if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(InvalidAuthority);
     }
     raw.parse().map_err(|_| InvalidAuthority)
@@ -89,36 +90,17 @@ impl FromStr for Origin {
         if !https && !scheme.eq_ignore_ascii_case("http") {
             return Err(InvalidOrigin);
         }
-        Ok(Self {
-            https,
-            authority: authority.parse().map_err(|_| InvalidOrigin)?,
-        })
+        let mut authority: Authority = authority.parse().map_err(|_| InvalidOrigin)?;
+        if (https && authority.port == Some(443)) || (!https && authority.port == Some(80)) {
+            authority.port = None;
+        }
+        Ok(Self { https, authority })
     }
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("expected an HTTP or HTTPS origin with no path, query, or fragment")]
 pub struct InvalidOrigin;
-
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Synchronous {
-    #[default]
-    Full,
-    Normal,
-}
-
-impl FromStr for Synchronous {
-    type Err = ();
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        match raw {
-            "full" => Ok(Self::Full),
-            "normal" => Ok(Self::Normal),
-            _ => Err(()),
-        }
-    }
-}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -130,7 +112,7 @@ pub struct Config {
     #[serde(deserialize_with = "deserialize_list")]
     pub allowed_origins: Vec<Origin>,
     pub max_active_tokens_per_principal: usize,
-    sqlite_synchronous: Synchronous,
+    sqlite_synchronous: SqliteSynchronous,
     max_page_count: u32,
     allowed_egress_cidrs: Vec<String>,
     allow_insecure_http_egress: bool,
@@ -155,7 +137,7 @@ impl Default for Config {
             allowed_hosts: Vec::new(),
             allowed_origins: Vec::new(),
             max_active_tokens_per_principal: 64,
-            sqlite_synchronous: Synchronous::Full,
+            sqlite_synchronous: SqliteSynchronous::Full,
             max_page_count: StorageConfig::default().max_page_count,
             allowed_egress_cidrs: Vec::new(),
             allow_insecure_http_egress: false,
@@ -193,7 +175,9 @@ pub enum ConfigError {
     InvalidToml,
     #[error("invalid Hub setting: {0}")]
     InvalidSetting(&'static str),
-    #[error("set the Hub state directory with --state-dir or EFFERIAN_HUB_STATE_DIR")]
+    #[error(
+        "set the Hub state directory with --state-dir, EFFERIAN_HUB_STATE_DIR, or state_dir in --config"
+    )]
     MissingStateDir,
     #[error("non-loopback listen requires a nonempty allowed_hosts list")]
     MissingAllowedHosts,
@@ -324,10 +308,7 @@ impl Config {
 
     pub fn storage_config(&self) -> StorageConfig {
         StorageConfig {
-            synchronous: match self.sqlite_synchronous {
-                Synchronous::Full => SqliteSynchronous::Full,
-                Synchronous::Normal => SqliteSynchronous::Normal,
-            },
+            synchronous: self.sqlite_synchronous,
             max_page_count: self.max_page_count,
             ..StorageConfig::default()
         }
@@ -395,12 +376,15 @@ impl Config {
                 return Err(ConfigError::InvalidSetting(key));
             }
         }
-        if self.orchestrator_agent_token_ttl_ms <= 0 {
+        if !(1..=MAX_ORCHESTRATOR_AGENT_TOKEN_TTL_MS)
+            .contains(&self.orchestrator_agent_token_ttl_ms)
+        {
             return Err(ConfigError::InvalidSetting(
                 "orchestrator_agent_token_ttl_ms",
             ));
         }
-        if self.orchestrator_enrollment_ttl_ms <= 0 {
+        if !(1..=MAX_ORCHESTRATOR_ENROLLMENT_TTL_MS).contains(&self.orchestrator_enrollment_ttl_ms)
+        {
             return Err(ConfigError::InvalidSetting(
                 "orchestrator_enrollment_ttl_ms",
             ));
@@ -449,12 +433,13 @@ pub fn parse_csv<T: FromStr>(raw: &str) -> Result<Vec<T>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestDir;
 
     #[test]
     fn authorities_use_exact_normalized_hosts_and_ports() -> Result<(), Box<dyn std::error::Error>>
     {
         assert_eq!(
-            "EXAMPLE.test:0443".parse::<Authority>()?,
+            "EXAMPLE.test:443".parse::<Authority>()?,
             "example.test:443".parse()?
         );
         assert_eq!("[0::1]:8080".parse::<Authority>()?, "[::1]:8080".parse()?);
@@ -463,7 +448,19 @@ mod tests {
             "example.test:443".parse()?
         );
         for raw in [
-            "", "a: ", "a:", "a:b", "a@b", "a.b.", "[::1%lo]", "[::1]foo", "::1",
+            "",
+            "a: ",
+            "a:",
+            "a:0",
+            "a:0443",
+            "a:00008101",
+            "a:65536",
+            "a:b",
+            "a@b",
+            "a.b.",
+            "[::1%lo]",
+            "[::1]foo",
+            "::1",
         ] {
             assert!(raw.parse::<Authority>().is_err(), "{raw}");
         }
@@ -471,6 +468,24 @@ mod tests {
             "HTTPS://EXAMPLE.test:8443".parse::<Origin>()?,
             "https://example.test:8443".parse()?
         );
+        assert_eq!(
+            "https://example.test:443".parse::<Origin>()?,
+            "https://example.test".parse()?
+        );
+        assert_eq!(
+            "http://example.test:80".parse::<Origin>()?,
+            "http://example.test".parse()?
+        );
+        assert_ne!(
+            "https://example.test:80".parse::<Origin>()?,
+            "https://example.test".parse()?
+        );
+        assert_ne!(
+            "http://example.test:443".parse::<Origin>()?,
+            "http://example.test".parse()?
+        );
+        assert!("https://example.test:0443".parse::<Origin>().is_err());
+        assert!("https://example.test:0".parse::<Origin>().is_err());
         assert!("https://example.test/".parse::<Origin>().is_err());
         assert!(parse_csv::<Authority>("a, b").is_err());
         assert!(parse_csv::<Authority>("a,").is_err());
@@ -478,7 +493,17 @@ mod tests {
     }
 
     #[test]
-    fn cli_overrides_environment_and_invalid_lower_sources_fail() -> Result<(), ConfigError> {
+    fn config_precedence_and_bounds_are_enforced() -> crate::test_support::TestResult {
+        let dir = TestDir::new("config")?;
+        let toml = dir.join("hub.toml");
+        fs::write(
+            &toml,
+            "state_dir = \"toml-state\"\n\
+             max_active_tokens_per_principal = 60\n\
+             max_app_requests = 128\n\
+             sqlite_synchronous = \"full\"\n\
+             orchestrator_agent_token_ttl_ms = 60000\n",
+        )?;
         let env = |key: &str| match key {
             "EFFERIAN_HUB_STATE_DIR" => Some("env-state".into()),
             "EFFERIAN_HUB_MAX_ACTIVE_TOKENS_PER_PRINCIPAL" => Some("65".into()),
@@ -486,7 +511,7 @@ mod tests {
             _ => None,
         };
         let config = Config::load_with(
-            None,
+            Some(&toml),
             Overrides {
                 state_dir: Some("flag-state".into()),
                 max_active_tokens_per_principal: Some(66),
@@ -494,9 +519,14 @@ mod tests {
             },
             env,
         )?;
+        // CLI > env > TOML > default
         assert_eq!(config.state_dir()?, Path::new("flag-state"));
         assert_eq!(config.max_active_tokens_per_principal, 66);
         assert_eq!(config.listen, SocketAddr::from((Ipv6Addr::LOCALHOST, 0)));
+        assert_eq!(config.max_app_requests, 128);
+        assert_eq!(config.sqlite_synchronous, SqliteSynchronous::Full);
+        assert_eq!(config.orchestrator_agent_token_ttl_ms, 60_000);
+        assert_eq!(config.max_control_requests, 64);
         assert_eq!(
             config.allowed_hosts_for_port(38123),
             parse_csv::<Authority>("127.0.0.1:38123,localhost:38123,[::1]:38123")?
@@ -508,7 +538,7 @@ mod tests {
         };
         assert!(
             Config::load_with(
-                None,
+                Some(&toml),
                 Overrides {
                     max_active_tokens_per_principal: Some(66),
                     ..Overrides::default()
@@ -517,6 +547,28 @@ mod tests {
             )
             .is_err()
         );
+
+        let bad_cases: &[fn(&mut Config)] = &[
+            |c| c.max_tcp_connections = 0,
+            |c| c.max_tcp_connections = tokio::sync::Semaphore::MAX_PERMITS + 1,
+            |c| c.max_pre_auth_in_flight = 0,
+            |c| c.max_app_requests = 0,
+            |c| c.max_control_requests = 0,
+            |c| c.max_requests_per_principal = 0,
+            |c| c.max_managed_agents_per_member = 0,
+            |c| c.max_managed_agents_per_orchestrator = 0,
+            |c| c.max_active_nodes_per_orchestrator = 0,
+            |c| c.max_pending_enrollments_per_issuer = 0,
+            |c| c.orchestrator_agent_token_ttl_ms = 0,
+            |c| c.orchestrator_agent_token_ttl_ms = MAX_ORCHESTRATOR_AGENT_TOKEN_TTL_MS + 1,
+            |c| c.orchestrator_enrollment_ttl_ms = 0,
+            |c| c.orchestrator_enrollment_ttl_ms = MAX_ORCHESTRATOR_ENROLLMENT_TTL_MS + 1,
+        ];
+        for mutate in bad_cases {
+            let mut candidate = Config::default();
+            mutate(&mut candidate);
+            assert!(candidate.validate_values().is_err());
+        }
         Ok(())
     }
 }

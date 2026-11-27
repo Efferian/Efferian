@@ -4,20 +4,17 @@ mod data;
 mod introspection;
 
 use axum::{Json, extract::State};
-use efferian_authz::{
-    AuthContext, AuthzError, PrincipalAccess, authorize_admin, authorize_principal_manage,
-};
-use efferian_protocol::{ActorId, PrincipalId, validate_resource_name};
+use efferian_authz::{PrincipalAccess, authorize_principal_manage};
+use efferian_protocol::{ActorId, PrincipalId, ProblemDetails, validate_resource_name};
 use http::StatusCode;
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::http::{
-    ApiCaller, ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, AppState, EmptyBody, RouteGroups,
+    ApiCaller, ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, AppState, EmptyBody, OperatorScope,
+    Page, PageQuery, RouteGroups, point_missing, require_unrestricted_operator,
 };
 use crate::node_bridge::BridgeCloseReason;
-use crate::storage::{PriorityKind, read_principal};
+use crate::storage::{PriorityKind, WriteTxError, read_principal};
 use crate::vault::auth::refresh_api;
 
 use self::data::{Principal, PrincipalPut, PrincipalPutResponse, upsert_principal};
@@ -28,82 +25,22 @@ pub(crate) fn routes() -> RouteGroups {
             .routes(routes!(list))
             .routes(routes!(get, put, delete))
             .routes(routes!(enable))
-            .routes(introspection::me_route())
-            .routes(introspection::status_route()),
+            .routes(introspection::me_route()),
         control: OpenApiRouter::new().routes(routes!(disable)),
         ..RouteGroups::default()
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PageQuery<Id> {
-    pub limit: Option<u16>,
-    pub cursor: Option<Id>,
-}
-
-impl<Id> PageQuery<Id> {
-    pub fn checked_limit(&self) -> ApiResult<usize> {
-        checked_page_limit(self.limit)
-    }
-}
-
-pub(crate) fn checked_page_limit(limit: Option<u16>) -> ApiResult<usize> {
-    let limit = limit.unwrap_or(50);
-    if !(1..=200).contains(&limit) {
-        return Err(ApiError::bad_input());
-    }
-    Ok(usize::from(limit))
-}
-
-#[derive(Serialize, ToSchema)]
-pub(crate) struct Page<T> {
-    pub items: Vec<T>,
-    pub next_cursor: Option<String>,
-}
-
-impl<T> Page<T> {
-    pub fn from_rows<Id: ToString>(
-        mut items: Vec<T>,
-        limit: usize,
-        id: impl FnOnce(&T) -> Id,
-    ) -> Self {
-        let next_cursor = if items.len() > limit {
-            items.truncate(limit);
-            items.last().map(|item| id(item).to_string())
-        } else {
-            None
-        };
-        Self { items, next_cursor }
-    }
-}
-
-pub(crate) fn point_missing(ctx: &AuthContext, mutating: bool) -> ApiError {
-    match authorize_admin(ctx) {
-        Ok(()) => ApiError::not_found(),
-        Err(error @ AuthzError::UnrestrictedTokenRequired) if mutating => error.into(),
-        Err(_) => ApiError::forbidden(),
-    }
-}
-
-pub(crate) fn reject_narrowed_admin(ctx: &AuthContext) -> ApiResult<()> {
-    if let Err(error @ AuthzError::UnrestrictedTokenRequired) = authorize_admin(ctx) {
-        return Err(error.into());
-    }
-    Ok(())
-}
-
 #[utoipa::path(
     get,
     path = "/v1/principals",
+    tag = "Principals",
     params(
         ("limit" = Option<u16>, Query, minimum = 1, maximum = 200, description = "Page size (default 50)"),
         ("cursor" = Option<PrincipalId>, Query, description = "Return items after this principal ID")
     ),
     responses(
-        (status = 200, body = Page<Principal>),
-        (status = 400, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json")
+        (status = 200, description = "Visible principals page", body = Page<Principal>)
     ),
     security(("api_bearer" = []))
 )]
@@ -128,13 +65,11 @@ async fn list(
 #[utoipa::path(
     get,
     path = "/v1/principals/{principal_ref}",
+    tag = "Principals",
     params(("principal_ref" = String, Path, description = "Principal name")),
     responses(
-        (status = 200, body = Principal),
-        (status = 400, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json")
+        (status = 200, description = "Principal metadata", body = Principal),
+        (status = 404, description = "Principal does not exist", body = ProblemDetails, content_type = "application/problem+json")
     ),
     security(("api_bearer" = []))
 )]
@@ -161,16 +96,14 @@ async fn get(
 #[utoipa::path(
     put,
     path = "/v1/principals/{principal_ref}",
+    tag = "Principals",
     params(("principal_ref" = String, Path, description = "Principal name")),
     request_body = PrincipalPut,
     responses(
-        (status = 200, body = PrincipalPutResponse),
-        (status = 201, body = PrincipalPutResponse),
-        (status = 400, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 409, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json")
+        (status = 200, description = "Principal updated or unchanged", body = PrincipalPutResponse),
+        (status = 201, description = "Principal created", body = PrincipalPutResponse),
+        (status = 404, description = "Referenced parent principal does not exist", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Quota or Hub identity conflict", body = ProblemDetails, content_type = "application/problem+json")
     ),
     security(("api_bearer" = []))
 )]
@@ -197,14 +130,12 @@ async fn put(
 #[utoipa::path(
     post,
     path = "/v1/principals/{id}/disable",
+    tag = "Principals",
     params(("id" = PrincipalId, Path, description = "Principal ID")),
     responses(
-        (status = 204),
-        (status = 400, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 409, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json")
+        (status = 204, description = "Principal disabled"),
+        (status = 404, description = "Principal does not exist", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Cannot disable the last active global administrator", body = ProblemDetails, content_type = "application/problem+json")
     ),
     security(("api_bearer" = []))
 )]
@@ -219,11 +150,10 @@ async fn disable(
         .storage
         .execute_priority(PriorityKind::DisablePrincipal, move |tx| {
             let ctx = refresh_api(tx.conn(), &caller.credential, tx.now_ms())?;
-            reject_narrowed_admin(&ctx)?;
+            require_unrestricted_operator(&ctx, OperatorScope::SubjectOperator)?;
             let target =
                 read_principal(tx.conn(), principal)?.ok_or_else(|| point_missing(&ctx, true))?;
-            authorize_principal_manage(&ctx, &target, PrincipalAccess::Disable)
-                .map_err(ApiError::from)?;
+            authorize_principal_manage(&ctx, &target, PrincipalAccess::Disable)?;
             if let Some(revoked) =
                 tx.disable_principal(ActorId::Principal(ctx.caller.principal_id), principal)?
                 && !revoked.is_empty()
@@ -234,7 +164,7 @@ async fn disable(
                     }
                 });
             }
-            Ok::<_, crate::storage::WriteTxError<ApiError>>(())
+            Ok::<_, WriteTxError<ApiError>>(())
         })
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -243,13 +173,11 @@ async fn disable(
 #[utoipa::path(
     post,
     path = "/v1/principals/{id}/enable",
+    tag = "Principals",
     params(("id" = PrincipalId, Path, description = "Principal ID")),
     responses(
-        (status = 204),
-        (status = 400, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json")
+        (status = 204, description = "Principal enabled"),
+        (status = 404, description = "Principal does not exist", body = ProblemDetails, content_type = "application/problem+json")
     ),
     security(("api_bearer" = []))
 )]
@@ -263,11 +191,10 @@ async fn enable(
         .storage
         .execute_work(0, move |tx| {
             let ctx = refresh_api(tx.conn(), &caller.credential, tx.now_ms())?;
-            reject_narrowed_admin(&ctx)?;
+            require_unrestricted_operator(&ctx, OperatorScope::SubjectOperator)?;
             let target =
                 read_principal(tx.conn(), principal)?.ok_or_else(|| point_missing(&ctx, true))?;
-            authorize_principal_manage(&ctx, &target, PrincipalAccess::Enable)
-                .map_err(ApiError::from)?;
+            authorize_principal_manage(&ctx, &target, PrincipalAccess::Enable)?;
             data::enable_principal(tx, &target)
         })
         .await?;
@@ -277,14 +204,12 @@ async fn enable(
 #[utoipa::path(
     delete,
     path = "/v1/principals/{principal_ref}",
+    tag = "Principals",
     params(("principal_ref" = PrincipalId, Path, description = "Principal ID")),
     responses(
-        (status = 204),
-        (status = 400, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 401, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 403, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 404, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json"),
-        (status = 409, body = efferian_protocol::ProblemDetails, content_type = "application/problem+json")
+        (status = 204, description = "Principal deleted"),
+        (status = 404, description = "Principal does not exist", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Principal is active, not a managed agent, or still referenced", body = ProblemDetails, content_type = "application/problem+json")
     ),
     security(("api_bearer" = []))
 )]
@@ -298,11 +223,10 @@ async fn delete(
         .storage
         .execute_work(0, move |tx| {
             let ctx = refresh_api(tx.conn(), &caller.credential, tx.now_ms())?;
-            reject_narrowed_admin(&ctx)?;
+            require_unrestricted_operator(&ctx, OperatorScope::SubjectOperator)?;
             let target =
                 read_principal(tx.conn(), principal)?.ok_or_else(|| point_missing(&ctx, true))?;
-            authorize_principal_manage(&ctx, &target, PrincipalAccess::Delete)
-                .map_err(ApiError::from)?;
+            authorize_principal_manage(&ctx, &target, PrincipalAccess::Delete)?;
             data::delete_principal(tx, &target)
         })
         .await?;

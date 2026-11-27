@@ -17,7 +17,7 @@ Omit `--admin-token-out` or pass `-` to receive the initial token on stdout exac
 
 ## Configure access
 
-Serve accepts an optional `--config PATH` to read a flat TOML file. Offline token recovery accepts the same file, including the SQLite page budget. Command flags take precedence over environment variables, then TOML, then defaults. Each TOML key has an environment variable consisting of `EFFERIAN_HUB_` followed by the uppercase key. Host and origin lists use TOML arrays or comma-separated values with no empty elements or whitespace around each element in the environment and flags.
+Serve accepts an optional `--config PATH` to read a flat TOML file. Offline token recovery accepts the same file, including the SQLite page budget. Command flags take precedence over environment variables, then TOML, then defaults. Each TOML key has an environment variable consisting of `EFFERIAN_HUB_` followed by the uppercase key. Host, origin, and egress CIDR lists (`allowed_hosts`, `allowed_origins`, `allowed_egress_cidrs`) use TOML arrays or comma-separated values with no empty elements or whitespace around each element in the environment and flags.
 
 | Setting | Default | Flag where available |
 | --- | --- | --- |
@@ -39,12 +39,12 @@ Serve accepts an optional `--config PATH` to read a flat TOML file. Offline toke
 | `max_managed_agents_per_orchestrator` | `256` | |
 | `max_active_nodes_per_orchestrator` | `256` | |
 | `max_pending_enrollments_per_issuer` | `64` | |
-| `orchestrator_agent_token_ttl_ms` | `86400000` | |
-| `orchestrator_enrollment_ttl_ms` | `900000` | |
+| `orchestrator_agent_token_ttl_ms` | `86400000` (max `86400000`) | |
+| `orchestrator_enrollment_ttl_ms` | `900000` (max `900000`) | |
 
-The Hub serves HTTP/1. Terminate external TLS at a trusted reverse proxy and forward an allowed Host authority. Any non-loopback listener requires an explicit, nonempty `allowed_hosts` list. Match the authority exactly, including a port when clients send one. Loopback defaults are `127.0.0.1:<port>`, `localhost:<port>` and `[::1]:<port>`. The health probe accepts any syntactically valid Host. Origin checks apply whenever a client supplies an Origin header. Use exact HTTP or HTTPS origins with no path. A client can pin the Hub identity by sending the expected Hub ID in `X-Efferian-Hub`.
+The Hub serves HTTP/1. Terminate external TLS at a trusted reverse proxy and forward an allowed Host authority. Any non-loopback listener requires an explicit, nonempty `allowed_hosts` list. Match the authority exactly, including a port when clients send one (canonical ports `1..=65535` without leading zeros). Loopback defaults are `127.0.0.1:<port>`, `localhost:<port>` and `[::1]:<port>`. The health probe accepts any syntactically valid Host. Origin checks apply whenever a client supplies an Origin header. Use HTTP or HTTPS origins with no path; default scheme ports (`:443` for `https`, `:80` for `http`) are normalized. A client can pin the Hub identity by sending the expected Hub ID in `X-Efferian-Hub`.
 
-Administrators can manage principals, grants and API tokens at `/v1/principals`, `/v1/grants` and `/v1/tokens`. Grants are allow-only. Tokens can narrow their principal's access. Member and orchestrator delegation stays within managed resources and token scope. Promoting a service to orchestrator returns `409 quota_exceeded` when its existing managed agents exceed the configured limit. Disabled agents count until they are deleted or claimed by garbage collection. A mutation that would remove the last active human Admin with a global admin grant returns `409 last_admin`.
+Administrators can manage principals, grants and API tokens at `/v1/principals`, `/v1/grants` and `/v1/tokens`. Grants are allow-only. Tokens can narrow their principal's access (up to 256 entries each in `allowed_profiles` and `allowed_nodes`; up to 64 entries in `allowed_node_tags` and enrollment `tags`). Token labels are trimmed and must be 1 to 128 bytes without ASCII control characters. In `GET /v1/me`, `owned_agents` follows `GET /v1/principals` visibility (populated for unrestricted global Administrators and Members). Member and orchestrator delegation stays within managed resources and token scope. Promoting a service to orchestrator returns `409 quota_exceeded` when its existing managed agents exceed the configured limit. Disabled agents count until they are deleted or claimed by garbage collection. A mutation that would remove the last active human Admin with a global admin grant returns `409 last_admin`.
 
 In a node credential incident, revoke the node with `POST /v1/nodes/{id}/revoke`. This revokes unconsumed tickets targeting that node and marks its active executions unknown. After restoring the node host, an unrestricted global Admin can mint a fresh ticket at `POST /v1/nodes/{id}/reenroll-tokens`. Exchange it at `POST /v1/enrollment/exchange` to rotate the node credential and preserve its ID and tags. Use the credential class specified for each operation.
 

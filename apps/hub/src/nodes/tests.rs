@@ -1,166 +1,25 @@
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::sync::Arc;
 
-use axum::Router;
-use axum::body::{Body, to_bytes};
-use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use efferian_protocol::{
-    HubId, NodeId, PrincipalId, PrincipalKind, ProfileId, TokenId, ToolId, error_codes,
+    NodeId, PrincipalId, PrincipalKind, ProfileId, TokenId, ToolId, error_codes,
 };
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
-use tower_service::Service;
 
 use crate::config::Config;
-use crate::egress::EgressClient;
-use crate::http::{self, AppState};
-use crate::node_bridge::{BridgeCloseReason, NodeBridgeControl, NodeLiveStatus};
-use crate::operations;
-use crate::storage::{
-    OpenMode, ShutdownReport, StorageClock, StorageError, StorageRuntime, WriteTxError,
-};
+use crate::node_bridge::{BridgeCloseReason, NodeBridgeControl};
+use crate::test_support::{ClosedSession, TestHub, TestResult};
 use crate::vault::auth::{CredentialError, authenticate_node};
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-struct ManualClock(AtomicI64);
-
-impl StorageClock for ManualClock {
-    fn wall_now_ms(&self) -> i64 {
-        self.0.load(Ordering::SeqCst)
-    }
-
-    fn monotonic_now(&self) -> Result<Duration, StorageError> {
-        Ok(Duration::ZERO)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ClosedSession {
-    node_id: NodeId,
-    through_epoch: u64,
-    reason: BridgeCloseReason,
-    committed_epoch: Option<i64>,
-    committed_revocation: Option<i64>,
-}
-
-struct RecordingBridge {
-    database: PathBuf,
-    sessions: Mutex<BTreeMap<NodeId, u64>>,
-    closes: Mutex<Vec<ClosedSession>>,
-}
-
-impl RecordingBridge {
-    fn sessions(&self) -> MutexGuard<'_, BTreeMap<NodeId, u64>> {
-        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn closes(&self) -> MutexGuard<'_, Vec<ClosedSession>> {
-        self.closes.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl NodeBridgeControl for RecordingBridge {
-    fn live_status(&self, node_id: NodeId) -> NodeLiveStatus {
-        if self.sessions().contains_key(&node_id) {
-            NodeLiveStatus::Ready
-        } else {
-            NodeLiveStatus::Offline
-        }
-    }
-
-    fn online_nodes_count(&self) -> usize {
-        self.sessions().len()
-    }
-
-    fn close_session(&self, node_id: NodeId, through_epoch: u64, reason: BridgeCloseReason) {
-        let observed: rusqlite::Result<(Option<i64>, Option<i64>)> =
-            Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY).and_then(
-                |conn| {
-                    conn.query_row(
-                        "SELECT session_epoch, revoked_at_ms FROM nodes WHERE node_id = ?1",
-                        [node_id.to_string()],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                },
-            );
-        let (committed_epoch, committed_revocation) = observed.unwrap_or_default();
-        self.closes().push(ClosedSession {
-            node_id,
-            through_epoch,
-            reason,
-            committed_epoch,
-            committed_revocation,
-        });
-        let mut sessions = self.sessions();
-        if sessions
-            .get(&node_id)
-            .is_some_and(|epoch| *epoch <= through_epoch)
-        {
-            sessions.remove(&node_id);
-        }
-    }
-}
-
-struct TestDir(PathBuf);
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
-    router: Router,
-    state: AppState,
-    runtime: StorageRuntime,
-    admin: String,
-    bridge: Arc<RecordingBridge>,
-    clock: Arc<ManualClock>,
-    _dir: TestDir,
+    hub: TestHub,
 }
 
 impl Fixture {
-    fn new(config: Config) -> TestResult<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let dir = TestDir(std::env::temp_dir().join(format!("efferian-nodes-{}", HubId::new())));
-        let output = dir.0.join("admin.token");
-        let storage_config = config.storage_config();
-        operations::init(&dir.0, "admin", &output, &storage_config)?;
-        let token = std::fs::read_to_string(output)?;
-        let clock = Arc::new(ManualClock(AtomicI64::new(10_000)));
-        let (opened, vault) = operations::open_existing(
-            &dir.0,
-            OpenMode::ServeAutoMigrate,
-            &storage_config,
-            clock.clone(),
-        )?;
-        let (storage, runtime) = opened.migrate_and_start_runtime()?;
-        let bridge = Arc::new(RecordingBridge {
-            database: dir.0.join("hub.sqlite3"),
-            sessions: Mutex::default(),
-            closes: Mutex::default(),
-        });
-        let state = AppState {
-            storage,
-            vault,
-            clock: clock.clone(),
-            egress: EgressClient::new(config.egress_policy()?)?,
-            config: Arc::new(config),
-            bridge: bridge.clone(),
-        };
-        let router = http::router(state.clone(), 8080)?;
+    async fn new(config: Config) -> TestResult<Self> {
         Ok(Self {
-            router,
-            state,
-            runtime,
-            admin: token.trim_end().to_owned(),
-            bridge,
-            clock,
-            _dir: dir,
+            hub: TestHub::start("nodes", config, 10_000).await?,
         })
     }
 
@@ -171,26 +30,7 @@ impl Fixture {
         token: &str,
         json: Option<Value>,
     ) -> TestResult<(StatusCode, Value)> {
-        let mut req = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", "localhost:8080")
-            .header("authorization", format!("Bearer {token}"));
-        let body = if let Some(json) = json {
-            req = req.header("content-type", "application/json");
-            Body::from(serde_json::to_vec(&json)?)
-        } else {
-            Body::empty()
-        };
-        let response = self.router.clone().call(req.body(body)?).await?;
-        let status = response.status();
-        let body = to_bytes(response.into_body(), 256 * 1024).await?;
-        let data = if body.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&body)?
-        };
-        Ok((status, data))
+        self.hub.request(method, uri, token, json).await
     }
 
     async fn mint(&self, token: &str, name: &str) -> TestResult<String> {
@@ -211,7 +51,7 @@ impl Fixture {
             .request(
                 Method::POST,
                 &format!("/v1/nodes/{node_id}/reenroll-tokens"),
-                &self.admin,
+                &self.hub.admin_token,
                 Some(json!({"ttl_ms": ttl_ms})),
             )
             .await?;
@@ -249,21 +89,22 @@ impl Fixture {
         self.request(
             Method::DELETE,
             &format!("/v1/nodes/{node}"),
-            &self.admin,
+            &self.hub.admin_token,
             None,
         )
         .await
     }
 
     async fn token_active(&self, token: &str) -> TestResult<bool> {
-        let vault = Arc::clone(&self.state.vault);
+        let vault = Arc::clone(&self.hub.state.vault);
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
             HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
         let bearer = crate::vault::auth::ParsedBearer::from_headers(&headers)?;
-        self.state
+        self.hub
+            .state
             .storage
             .read_snapshot(move |conn| match authenticate_node(&vault, conn, bearer) {
                 Ok(_) => Ok(true),
@@ -278,35 +119,36 @@ impl Fixture {
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<()> + Send + 'static,
     ) -> TestResult {
-        self.state
-            .storage
-            .execute_work(
-                0,
-                move |tx| -> Result<_, WriteTxError<std::convert::Infallible>> {
-                    Ok(f(tx.conn())?)
-                },
-            )
-            .await?;
-        Ok(())
+        self.hub.write(f).await
     }
 
     async fn orchestrator(&self) -> TestResult<(PrincipalId, String)> {
+        self.orchestrator_with("orchestrator", false).await
+    }
+
+    async fn orchestrator_with(
+        &self,
+        name: &'static str,
+        narrowed: bool,
+    ) -> TestResult<(PrincipalId, String)> {
         let kind = PrincipalKind::Service;
         let principal = PrincipalId::new_for_kind(kind);
         let token_id = TokenId::new_for_kind(kind);
-        let issued = self.state.vault.issue_token(token_id)?;
+        let issued = self.hub.state.vault.issue_token(token_id)?;
+        let verifier = issued.verifier.as_str().to_owned();
         let raw = issued.secret.expose_secret().to_owned();
         self.write(move |conn| {
             conn.execute(
                 "INSERT INTO principals
                     (principal_id, kind, name, is_orchestrator, allowed_node_tags_json, created_at_ms, updated_at_ms)
-                 VALUES (?1, 'service', 'orchestrator', 1, '[\"alpha\",\"sandbox\"]', 1, 1)",
-                [principal.to_string()],
+                 VALUES (?1, 'service', ?2, 1, '[\"alpha\",\"sandbox\"]', 1, 1)",
+                params![principal.to_string(), name],
             )?;
             conn.execute(
-                "INSERT INTO auth_tokens (token_id, principal_id, created_by, label, key_id, verifier_hmac, created_at_ms)
-                 VALUES (?1, ?2, ?2, 'orchestrator', ?3, ?4, 1)",
-                params![token_id.to_string(), principal.to_string(), issued.key_id, issued.verifier],
+                "INSERT INTO auth_tokens (token_id, principal_id, created_by, label, key_id,
+                                          verifier_hmac, withhold_sensitive, created_at_ms)
+                 VALUES (?1, ?2, ?2, 'orchestrator', ?3, ?4, ?5, 1)",
+                params![token_id.to_string(), principal.to_string(), issued.key_id, verifier, narrowed],
             )?;
             Ok(())
         }).await?;
@@ -314,8 +156,7 @@ impl Fixture {
     }
 
     async fn shutdown(self) {
-        let report = self.runtime.shutdown().await;
-        assert!(matches!(report, ShutdownReport::Complete), "{report:?}");
+        self.hub.shutdown().await;
     }
 }
 
@@ -332,8 +173,8 @@ fn response_node(value: &Value) -> TestResult<NodeId> {
 
 #[tokio::test]
 async fn revoke_and_reenroll_preserve_identity_with_a_commit_fenced_session() -> TestResult {
-    let hub = Fixture::new(Config::default())?;
-    let first_ticket = hub.mint(&hub.admin, "release-node").await?;
+    let hub = Fixture::new(Config::default()).await?;
+    let first_ticket = hub.mint(&hub.hub.admin_token, "release-node").await?;
     let (status, body) = hub
         .request(
             Method::POST,
@@ -350,11 +191,11 @@ async fn revoke_and_reenroll_preserve_identity_with_a_commit_fenced_session() ->
     let node = response_node(&first)?;
     let old_token = json_string(&first, "node_token")?;
     assert!(hub.token_active(&old_token).await?);
-    hub.bridge.sessions().insert(node, 0);
+    hub.hub.bridge.sessions().insert(node, 0);
 
     let (before_revoke, _) = hub.rotate(node, 9).await?;
     assert_eq!(
-        hub.revoke(node, &hub.admin).await?.0,
+        hub.revoke(node, &hub.hub.admin_token).await?.0,
         StatusCode::NO_CONTENT
     );
     assert_eq!(
@@ -362,12 +203,12 @@ async fn revoke_and_reenroll_preserve_identity_with_a_commit_fenced_session() ->
         StatusCode::UNAUTHORIZED
     );
     assert!(!hub.token_active(&old_token).await?);
-    let (status, summary) = hub.read(node, &hub.admin).await?;
+    let (status, summary) = hub.read(node, &hub.hub.admin_token).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(summary["live_status"], "offline");
     let (between_revokes, _) = hub.rotate(node, 9).await?;
     assert_eq!(
-        hub.revoke(node, &hub.admin).await?.0,
+        hub.revoke(node, &hub.hub.admin_token).await?.0,
         StatusCode::NO_CONTENT
     );
     assert_eq!(
@@ -381,7 +222,7 @@ async fn revoke_and_reenroll_preserve_identity_with_a_commit_fenced_session() ->
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response_node(&second)?, node);
     assert_eq!(
-        hub.read(node, &hub.admin).await?.1["tags"],
+        hub.read(node, &hub.hub.admin_token).await?.1["tags"],
         json!(["alpha", "sandbox"])
     );
     assert!(!hub.token_active(&old_token).await?);
@@ -390,7 +231,7 @@ async fn revoke_and_reenroll_preserve_identity_with_a_commit_fenced_session() ->
             .await?
     );
     assert_eq!(hub.exchange(&ticket).await?.0, StatusCode::UNAUTHORIZED);
-    let closes = hub.bridge.closes().clone();
+    let closes = hub.hub.bridge.closes().clone();
     assert_eq!(
         closes,
         vec![
@@ -417,19 +258,23 @@ async fn revoke_and_reenroll_preserve_identity_with_a_commit_fenced_session() ->
             },
         ],
     );
-    hub.bridge.sessions().insert(node, 1);
-    hub.bridge
+    hub.hub.bridge.sessions().insert(node, 1);
+    hub.hub
+        .bridge
         .close_session(node, 0, BridgeCloseReason::NodeRevoked);
-    assert_eq!(hub.read(node, &hub.admin).await?.1["live_status"], "ready");
+    assert_eq!(
+        hub.read(node, &hub.hub.admin_token).await?.1["live_status"],
+        "ready"
+    );
 
     assert_eq!(
-        hub.revoke(node, &hub.admin).await?.0,
+        hub.revoke(node, &hub.hub.admin_token).await?.0,
         StatusCode::NO_CONTENT
     );
-    hub.clock.0.store(9000, Ordering::SeqCst);
+    hub.hub.clock.set(9000);
     let (ticket, expires) = hub.rotate(node, 1).await?;
     assert_eq!(expires, 9001);
-    hub.clock.0.store(9001, Ordering::SeqCst);
+    hub.hub.clock.set(9001);
     assert_eq!(hub.exchange(&ticket).await?.0, StatusCode::UNAUTHORIZED);
     let (ticket, _) = hub.rotate(node, 1).await?;
     let (status, body) = hub.exchange(&ticket).await?;
@@ -442,9 +287,9 @@ async fn revoke_and_reenroll_preserve_identity_with_a_commit_fenced_session() ->
 
 #[tokio::test]
 async fn simultaneous_exchanges_and_active_name_conflict_are_atomic() -> TestResult {
-    let hub = Fixture::new(Config::default())?;
-    let ticket = hub.mint(&hub.admin, "runner").await?;
-    let alternate = hub.mint(&hub.admin, "runner").await?;
+    let hub = Fixture::new(Config::default()).await?;
+    let ticket = hub.mint(&hub.hub.admin_token, "runner").await?;
+    let alternate = hub.mint(&hub.hub.admin_token, "runner").await?;
     let (first, second) = tokio::join!(hub.exchange(&ticket), hub.exchange(&ticket));
     let (first, second) = (first?, second?);
     let (accepted, rejected) = if first.0 == StatusCode::OK {
@@ -459,7 +304,7 @@ async fn simultaneous_exchanges_and_active_name_conflict_are_atomic() -> TestRes
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(response["code"], error_codes::NODE_NAME_IN_USE);
     assert_eq!(
-        hub.revoke(node, &hub.admin).await?.0,
+        hub.revoke(node, &hub.hub.admin_token).await?.0,
         StatusCode::NO_CONTENT
     );
     let (reenroll, _) = hub.rotate(node, 15_000).await?;
@@ -474,14 +319,14 @@ async fn simultaneous_exchanges_and_active_name_conflict_are_atomic() -> TestRes
         .request(
             Method::POST,
             &format!("/v1/nodes/{node}/reenroll-tokens"),
-            &hub.admin,
+            &hub.hub.admin_token,
             Some(json!({})),
         )
         .await?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(response["code"], error_codes::NODE_NAME_IN_USE);
     assert_eq!(
-        hub.revoke(replacement, &hub.admin).await?.0,
+        hub.revoke(replacement, &hub.hub.admin_token).await?.0,
         StatusCode::NO_CONTENT
     );
     let (status, response) = hub.exchange(&reenroll).await?;
@@ -496,7 +341,7 @@ async fn node_visibility_and_quota_apply_before_returning_metadata() -> TestResu
     let mut config = Config::default();
     config.max_active_nodes_per_orchestrator = 1;
     config.max_pending_enrollments_per_issuer = 2;
-    let hub = Fixture::new(config)?;
+    let hub = Fixture::new(config).await?;
     let (orchestrator, credential) = hub.orchestrator().await?;
     let first = hub.mint(&credential, "orchestrated-one").await?;
     let second = hub.mint(&credential, "orchestrated-two").await?;
@@ -522,7 +367,7 @@ async fn node_visibility_and_quota_apply_before_returning_metadata() -> TestResu
     assert_eq!(conflict.0, StatusCode::CONFLICT);
     assert_eq!(conflict.1["code"], error_codes::QUOTA_EXCEEDED);
     let own = response_node(&success.1)?;
-    let foreign = hub.mint(&hub.admin, "admin-node").await?;
+    let foreign = hub.mint(&hub.hub.admin_token, "admin-node").await?;
     let (status, response) = hub.exchange(&foreign).await?;
     assert_eq!(status, StatusCode::OK);
     let foreign = response_node(&response)?;
@@ -547,7 +392,7 @@ async fn node_visibility_and_quota_apply_before_returning_metadata() -> TestResu
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        hub.read(NodeId::new(), &hub.admin).await?.0,
+        hub.read(NodeId::new(), &hub.hub.admin_token).await?.0,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
@@ -579,13 +424,13 @@ async fn node_visibility_and_quota_apply_before_returning_metadata() -> TestResu
 
 #[tokio::test]
 async fn deleting_a_revoked_node_respects_reversible_catalog_references() -> TestResult {
-    let hub = Fixture::new(Config::default())?;
-    let ticket = hub.mint(&hub.admin, "fixed-node").await?;
+    let hub = Fixture::new(Config::default()).await?;
+    let ticket = hub.mint(&hub.hub.admin_token, "fixed-node").await?;
     let (_, result) = hub.exchange(&ticket).await?;
     let node = response_node(&result)?;
     assert_eq!(hub.delete(node).await?.0, StatusCode::CONFLICT);
     assert_eq!(
-        hub.revoke(node, &hub.admin).await?.0,
+        hub.revoke(node, &hub.hub.admin_token).await?.0,
         StatusCode::NO_CONTENT
     );
 
@@ -686,7 +531,10 @@ async fn deleting_a_revoked_node_respects_reversible_catalog_references() -> Tes
     })
     .await?;
     assert_eq!(hub.delete(node).await?.0, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(hub.read(node, &hub.admin).await?.0, StatusCode::OK);
+    assert_eq!(
+        hub.read(node, &hub.hub.admin_token).await?.0,
+        StatusCode::OK
+    );
 
     let other_definition = command_definition(json!({"kind": "tag", "tag": "alpha"})).to_string();
     hub.write(move |conn| {
@@ -698,7 +546,224 @@ async fn deleting_a_revoked_node_respects_reversible_catalog_references() -> Tes
     })
     .await?;
     assert_eq!(hub.delete(node).await?.0, StatusCode::NO_CONTENT);
-    assert_eq!(hub.read(node, &hub.admin).await?.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        hub.read(node, &hub.hub.admin_token).await?.0,
+        StatusCode::NOT_FOUND
+    );
+    hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn narrowed_anti_oracle_live_rotation_at_quota_and_tags_cap() -> TestResult {
+    let mut config = Config::default();
+    config.max_active_nodes_per_orchestrator = 1;
+    let hub = Fixture::new(config).await?;
+    let (orch_id, orch_token) = hub.orchestrator_with("orch", false).await?;
+    let (_, narrow_orch_token) = hub.orchestrator_with("narrow-orch", true).await?;
+
+    // Mint a narrowed admin token.
+    let (status, narrowed_admin) = hub
+        .request(
+            Method::POST,
+            "/v1/tokens",
+            &hub.hub.admin_token,
+            Some(json!({
+                "principal_id": hub.hub.admin_id,
+                "label": "narrow-admin",
+                "withhold_sensitive": true,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let narrow_admin_token = json_string(&narrowed_admin, "token")?;
+
+    // 1. Tags cap: 65 tags rejected with 400, 64 tags accepted.
+    let tags_65: Vec<String> = (0..65).map(|i| format!("t-{i}")).collect();
+    let (status, err) = hub
+        .request(
+            Method::POST,
+            "/v1/enrollment/tokens",
+            &hub.hub.admin_token,
+            Some(json!({"target_node_name": "too-many", "tags": tags_65})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], error_codes::INVALID_INPUT);
+    let tags_64: Vec<String> = (0..64).map(|i| format!("t-{i}")).collect();
+    let (status, _) = hub
+        .request(
+            Method::POST,
+            "/v1/enrollment/tokens",
+            &hub.hub.admin_token,
+            Some(json!({"target_node_name": "exact-64", "tags": tags_64})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 2. Live rotation of active orchestrator node at full quota preserves identity & bumps epoch.
+    let ticket = hub.mint(&orch_token, "managed-one").await?;
+    let (status, enrolled) = hub.exchange(&ticket).await?;
+    assert_eq!(status, StatusCode::OK);
+    let node = response_node(&enrolled)?;
+    hub.hub.bridge.sessions().insert(node, 0);
+
+    let (rotate_ticket, _) = hub.rotate(node, 15_000).await?;
+    let (status, rotated) = hub.exchange(&rotate_ticket).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response_node(&rotated)?, node);
+    let (_, summary) = hub.read(node, &hub.hub.admin_token).await?;
+    assert_eq!(summary["name"], "managed-one");
+    assert_eq!(summary["tags"], json!(["alpha", "sandbox"]));
+    assert_eq!(summary["managed_by_principal_id"], orch_id.to_string());
+    let closes = hub.hub.bridge.closes().clone();
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0].reason, BridgeCloseReason::Superseded);
+    assert_eq!(closes[0].through_epoch, 0);
+    assert_eq!(closes[0].committed_epoch, Some(1));
+
+    // 3. Anti-oracle: narrowed admin & narrowed orchestrator get uniform token_narrowed on node ops.
+    for token in [&narrow_admin_token, &narrow_orch_token] {
+        for target in [node, NodeId::new()] {
+            let (status, err) = hub.revoke(target, token).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
+            let (status, err) = hub
+                .request(Method::DELETE, &format!("/v1/nodes/{target}"), token, None)
+                .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
+        }
+    }
+    for target in [node, NodeId::new()] {
+        let (status, err) = hub.read(target, &narrow_admin_token).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(err["code"], error_codes::FORBIDDEN);
+        let (status, err) = hub
+            .request(
+                Method::POST,
+                &format!("/v1/nodes/{target}/reenroll-tokens"),
+                &narrow_admin_token,
+                Some(json!({})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(err["code"], error_codes::TOKEN_NARROWED);
+    }
+
+    // 4. mint_reenrollment with active demoted service succeeds (201), disabled manager fails (403 managed_by_disabled).
+    hub.write(move |conn| {
+        conn.execute(
+            "UPDATE principals SET is_orchestrator = 0, allowed_node_tags_json = '[]' WHERE principal_id = ?1",
+            [orch_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let (status, _) = hub
+        .request(
+            Method::POST,
+            &format!("/v1/nodes/{node}/reenroll-tokens"),
+            &hub.hub.admin_token,
+            Some(json!({})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    hub.write(move |conn| {
+        conn.execute(
+            "UPDATE principals SET disabled_at_ms = 1000 WHERE principal_id = ?1",
+            [orch_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let (status, err) = hub
+        .request(
+            Method::POST,
+            &format!("/v1/nodes/{node}/reenroll-tokens"),
+            &hub.hub.admin_token,
+            Some(json!({})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(err["code"], error_codes::MANAGED_BY_DISABLED);
+    hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_node_handles_active_execution_disabled_edition_and_corrupt_profile() -> TestResult {
+    let hub = Fixture::new(Config::default()).await?;
+    let ticket = hub.mint(&hub.hub.admin_token, "ref-node").await?;
+    let (_, enrolled) = hub.exchange(&ticket).await?;
+    let node = response_node(&enrolled)?;
+    assert_eq!(
+        hub.revoke(node, &hub.hub.admin_token).await?.0,
+        StatusCode::NO_CONTENT
+    );
+
+    // 1. Active execution blocks DELETE with 409 resource_in_use.
+    let admin = hub.hub.admin_id;
+    let tool = ToolId::new();
+    let profile = ProfileId::new();
+    let binding_json = binding(tool, 1, Some(node)).to_string();
+    let other_def = command_definition(json!({"kind": "tag", "tag": "alpha"})).to_string();
+    hub.write(move |conn| {
+        conn.execute(
+            "INSERT INTO executions (execution_id, invoke_kind, request_id, request_digest,
+                caller_principal_id, caller_token_id, tool_id, tool_version, public_name,
+                executor_kind, node_id, state, deadline_at_ms, created_at_ms,
+                result_expires_at_ms, expires_at_ms)
+             SELECT 'exec_active', 'tool_test', 'req_1', 'd', principal_id, token_id, ?1, 1, 't',
+                    'node', ?2, 'running', 1000, 1000, 2000, 2000
+             FROM auth_tokens WHERE label = 'bootstrap'",
+            params![tool.to_string(), node.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    assert_resource_in_use(hub.delete(node).await?);
+
+    // 2. Finish execution; add a disabled current profile edition referencing the node -> DELETE allowed!
+    // First test fail-closed on missing edition (published_version = 99 with no matching edition row).
+    hub.write(move |conn| {
+        conn.execute("UPDATE executions SET state = 'succeeded'", [])?;
+        conn.execute(
+            "INSERT INTO tools (tool_id, slug, kind, created_by, current_version, created_at_ms, updated_at_ms)
+             VALUES (?1, 't', 'command', ?2, 1, 1, 1)",
+            params![tool.to_string(), admin.to_string()],
+        )?;
+        conn.execute(
+            "INSERT INTO tool_revisions (tool_id, version, input_schema_sha256, created_at_ms, definition_json)
+             VALUES (?1, 1, 'x', 1, ?2)",
+            params![tool.to_string(), other_def],
+        )?;
+        conn.execute(
+            "INSERT INTO profiles (profile_id, slug, discovery_mode, published_version, created_at_ms, updated_at_ms)
+             VALUES (?1, 'prof', 'full', 99, 1, 1)",
+            [profile.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    assert_eq!(hub.delete(node).await?.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Now point published_version to a disabled edition referencing `node`: must allow deletion.
+    hub.write(move |conn| {
+        conn.execute(
+            "INSERT INTO profile_editions (profile_id, version, discovery_mode, published_by,
+                                           published_at_ms, disabled_at_ms, bindings_json)
+             VALUES (?1, 1, 'full', ?2, 1, 1000, ?3)",
+            params![profile.to_string(), admin.to_string(), binding_json],
+        )?;
+        conn.execute(
+            "UPDATE profiles SET published_version = 1 WHERE profile_id = ?1",
+            [profile.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    assert_eq!(hub.delete(node).await?.0, StatusCode::NO_CONTENT);
     hub.shutdown().await;
     Ok(())
 }

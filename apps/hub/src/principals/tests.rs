@@ -1,61 +1,34 @@
-use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Body;
 use efferian_protocol::PrincipalKind::{Admin, Agent, Member, Service};
 use efferian_protocol::{
-    GrantId, HubId, PrincipalKind, ProfileId, SecretString, TokenId, ToolDefinition, ToolId,
-    ToolSpec, UpstreamAccountMode, UpstreamId,
+    GrantId, HubId, NodeId, PrincipalKind, ProfileId, SecretString, TokenId, ToolDefinition,
+    ToolId, ToolSpec, UpstreamAccountMode, UpstreamId,
 };
-use http::{Method, Request, StatusCode};
-use http_body_util::BodyExt;
+use http::{Method, StatusCode};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
-use tower_service::Service as _;
 use zeroize::Zeroizing;
 
 use crate::config::Config;
 use crate::egress::EgressClient;
 use crate::http::{AppState, router};
-use crate::node_bridge::OfflineNodeBridge;
+use crate::node_bridge::{BridgeCloseReason, NodeBridgeControl};
 use crate::storage::{
-    OpenMode, ShutdownReport, StorageClock, StorageConfig, StorageError, StorageRuntime,
+    OpenMode, RevocationReason, ShutdownReport, StorageClock, StorageConfig, StorageRuntime,
     acquire_state_lock, create_staged, open_existing,
 };
+use crate::test_support::{ManualClock, RecordingBridge, TestDir, TestResult, send_json};
 use crate::vault::VaultKeys;
 
 use super::data::principal_kind_name;
 use super::*;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-struct TestDir(PathBuf);
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 struct TestPrincipal {
     id: PrincipalId,
     token: SecretString,
-}
-
-struct TestClock(AtomicI64);
-
-impl StorageClock for TestClock {
-    fn wall_now_ms(&self) -> i64 {
-        self.0.load(Ordering::Acquire)
-    }
-
-    fn monotonic_now(&self) -> Result<Duration, StorageError> {
-        Ok(Duration::ZERO)
-    }
 }
 
 struct Fixture {
@@ -63,7 +36,8 @@ struct Fixture {
     state: AppState,
     runtime: StorageRuntime,
     principals: Vec<TestPrincipal>,
-    clock: Arc<TestClock>,
+    bridge: Arc<RecordingBridge>,
+    clock: Arc<ManualClock>,
     _directory: TestDir,
 }
 
@@ -75,14 +49,14 @@ impl Fixture {
     ) -> TestResult<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let hub_id = HubId::new();
-        let directory = TestDir(std::env::temp_dir().join(format!("efferian-principals-{hub_id}")));
+        let directory = TestDir::new("principals")?;
         let keys = VaultKeys::derive(Zeroizing::new([3; 32]))?;
         let mut lock = acquire_state_lock(&directory.0)?;
         let schema = StorageConfig {
             gc_interval: Duration::from_secs(60 * 60),
             ..config.storage_config()
         };
-        let clock = Arc::new(TestClock(AtomicI64::new(1_000)));
+        let clock = Arc::new(ManualClock::new(1_000));
         let principals = create_staged(
             &mut lock,
             keys.new_hub_identity(hub_id),
@@ -115,7 +89,7 @@ impl Fixture {
                             token.to_string(),
                             id.to_string(),
                             issued.key_id,
-                            issued.verifier,
+                            issued.verifier.as_str(),
                             narrowed,
                         ],
                     )?;
@@ -131,16 +105,17 @@ impl Fixture {
             OpenMode::ServeAutoMigrate,
             keys.expected_hub_identity(),
             &schema,
-            clock.clone(),
+            Arc::clone(&clock) as Arc<dyn StorageClock>,
         )?;
         let (storage, runtime) = opened.migrate_and_start_runtime()?;
+        let bridge = Arc::new(RecordingBridge::new(directory.join("hub.sqlite3")));
         let state = AppState {
             storage,
             vault: Arc::new(keys.bind_hub(hub_id)),
-            clock: clock.clone(),
+            clock: Arc::clone(&clock) as Arc<dyn StorageClock>,
             egress: EgressClient::new(config.egress_policy()?)?,
             config: Arc::new(config),
-            bridge: Arc::new(OfflineNodeBridge),
+            bridge: Arc::clone(&bridge) as Arc<dyn NodeBridgeControl>,
         };
         let api = router(state.clone(), 8080)?;
         Ok(Self {
@@ -148,6 +123,7 @@ impl Fixture {
             state,
             runtime,
             principals,
+            bridge,
             clock,
             _directory: directory,
         })
@@ -160,30 +136,14 @@ impl Fixture {
         path: &str,
         body: Option<Value>,
     ) -> TestResult<(StatusCode, Value)> {
-        let builder = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("host", "localhost:8080")
-            .header(
-                "authorization",
-                format!("Bearer {}", self.principals[subject].token.expose_secret()),
-            );
-        let request = if let Some(body) = body {
-            builder
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))?
-        } else {
-            builder.body(Body::empty())?
-        };
-        let response = self.api.clone().call(request).await?;
-        let status = response.status();
-        let bytes = response.into_body().collect().await?.to_bytes();
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes)?
-        };
-        Ok((status, body))
+        send_json(
+            &self.api,
+            method,
+            path,
+            self.principals[subject].token.expose_secret(),
+            body,
+        )
+        .await
     }
 
     async fn stop(self) -> TestResult {
@@ -272,7 +232,7 @@ async fn delegated_replacement_quota_and_purging_visibility() -> TestResult {
     let winner_name = serde_json::from_value::<String>(created.1["principal"]["name"].clone())?;
     let winner_path = format!("/v1/principals/{winner_name}");
 
-    fixture.clock.0.store(2_000, Ordering::Release);
+    fixture.clock.set(2_000);
     let (status, updated) = fixture
         .call(1, Method::PUT, &winner_path, Some(json!({})))
         .await?;
@@ -281,7 +241,7 @@ async fn delegated_replacement_quota_and_purging_visibility() -> TestResult {
     assert_eq!(updated["principal"]["inherit_owner_bindings"], false);
     assert_eq!(updated["principal"]["updated_at_ms"], 2_000);
 
-    fixture.clock.0.store(3_000, Ordering::Release);
+    fixture.clock.set(3_000);
     let (status, unchanged) = fixture
         .call(1, Method::PUT, &winner_path, Some(json!({})))
         .await?;
@@ -365,7 +325,7 @@ async fn promotion_checks_the_current_managed_agent_quota() -> TestResult {
         .await?;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    fixture.clock.0.store(2_000, Ordering::Release);
+    fixture.clock.set(2_000);
     let promote = || {
         fixture.call(
             0,
@@ -688,5 +648,339 @@ async fn demotion_invalidates_managed_agent_authentication_and_retains_admin_con
         .call(0, Method::GET, "/v1/principals/managed", None)
         .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    fixture.stop().await
+}
+
+#[tokio::test]
+async fn narrowed_and_non_global_anti_oracle_and_me_owned_agents() -> TestResult {
+    let fixture = Fixture::start(
+        Config::default(),
+        &[
+            ("global-admin", Admin, false),
+            ("narrow-admin", Admin, true),
+            ("plain-admin", Admin, false),
+            ("member", Member, false),
+            ("narrow-member", Member, true),
+            ("narrow-orch", Service, true),
+            ("agent", Agent, false),
+        ],
+        |tx, subjects| {
+            let global_admin = subjects[0].id.to_string();
+            let narrow_admin = subjects[1].id.to_string();
+            let plain_admin = subjects[2].id.to_string();
+            let member = subjects[3].id.to_string();
+            let narrow_member = subjects[4].id.to_string();
+            let narrow_orch = subjects[5].id.to_string();
+            // Remove global admin grant from plain-admin so it is an Admin without global admin grant.
+            tx.execute("DELETE FROM grants WHERE principal_id = ?1", [&plain_admin])?;
+            tx.execute(
+                "UPDATE principals SET is_orchestrator = 1 WHERE principal_id = ?1",
+                [&narrow_orch],
+            )?;
+            // Seed one owned agent for each of global-admin, narrow-admin, plain-admin, member, narrow-member, and narrow-orch.
+            for (owner, manager, name) in [
+                (&global_admin, &global_admin, "ga-agent"),
+                (&narrow_admin, &narrow_admin, "na-agent"),
+                (&plain_admin, &plain_admin, "pa-agent"),
+                (&member, &member, "m-agent"),
+                (&narrow_member, &narrow_member, "nm-agent"),
+                (&member, &narrow_orch, "orch-agent"),
+            ] {
+                tx.execute(
+                    "INSERT INTO principals (principal_id, name, kind, owner_principal_id,
+                                             managed_by_principal_id, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, 'agent', ?3, ?4, 1000, 1000)",
+                    params![PrincipalId::new_agent().to_string(), name, owner, manager],
+                )?;
+            }
+            // Seed a non-upstream command tool bound to a profile visible to member to verify /v1/me skips it.
+            let profile = ProfileId::new();
+            let cmd_tool = ToolId::new();
+            tx.execute(
+                "INSERT INTO tools (tool_id, slug, kind, created_by, current_version, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'cmd', 'command', ?2, 1, 1000, 1000)",
+                params![cmd_tool.to_string(), global_admin],
+            )?;
+            tx.execute(
+                "INSERT INTO tool_revisions (tool_id, version, input_schema_sha256, created_at_ms, definition_json)
+                 VALUES (?1, 1, 'x', 1000, '{\"spec\":{\"kind\":\"command\"}}')",
+                [cmd_tool.to_string()],
+            )?;
+            tx.execute(
+                "INSERT INTO profiles (profile_id, slug, discovery_mode, published_version, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'cmd-prof', 'full', 1, 1000, 1000)",
+                [profile.to_string()],
+            )?;
+            tx.execute(
+                "INSERT INTO profile_editions (profile_id, version, discovery_mode, published_by, published_at_ms, bindings_json)
+                 VALUES (?1, 1, 'full', ?2, 1000, ?3)",
+                params![
+                    profile.to_string(),
+                    global_admin,
+                    json!([{"public_name": "run", "tool_id": cmd_tool, "tool_version": 1}]).to_string()
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO grants (grant_id, principal_id, scope_kind, scope_id, capability, created_by, created_at_ms)
+                 VALUES (?1, ?2, 'profile', ?3, 'discover', ?4, 1000)",
+                params![GrantId::new().to_string(), member, profile.to_string(), global_admin],
+            )?;
+            // Give agent an allowed_nodes restriction to check /v1/me early return.
+            tx.execute(
+                "UPDATE auth_tokens SET allowed_nodes_json = '[]' WHERE principal_id = ?1",
+                [subjects[6].id.to_string()],
+            )?;
+            Ok(())
+        },
+    )?;
+
+    // 1. /v1/me owned_agents matches authorize_principal_manage(Read).
+    let (_, me_ga) = fixture.call(0, Method::GET, "/v1/me", None).await?;
+    assert_eq!(me_ga["owned_agents"].as_array().map(Vec::len), Some(1));
+    let (_, me_na) = fixture.call(1, Method::GET, "/v1/me", None).await?;
+    assert_eq!(me_na["owned_agents"], json!([]));
+    let (_, me_pa) = fixture.call(2, Method::GET, "/v1/me", None).await?;
+    assert_eq!(me_pa["owned_agents"], json!([]));
+    let (_, me_m) = fixture.call(3, Method::GET, "/v1/me", None).await?;
+    assert_eq!(me_m["owned_agents"].as_array().map(Vec::len), Some(2));
+    assert_eq!(me_m["caller_bound_upstreams"], json!([]));
+    let (_, me_nm) = fixture.call(4, Method::GET, "/v1/me", None).await?;
+    assert_eq!(me_nm["owned_agents"].as_array().map(Vec::len), Some(1));
+    let (_, me_no) = fixture.call(5, Method::GET, "/v1/me", None).await?;
+    assert_eq!(me_no["owned_agents"], json!([]));
+    let (_, me_ag) = fixture.call(6, Method::GET, "/v1/me", None).await?;
+    assert_eq!(me_ag["owned_agents"], json!([]));
+    assert_eq!(me_ag["caller_bound_upstreams"], json!([]));
+
+    // 2. Anti-oracle: narrowed callers get identical 403 token_narrowed across owned/foreign/missing targets.
+    let id_by_name = |name: &'static str| {
+        let storage = fixture.state.storage.clone();
+        async move {
+            storage
+                .read_snapshot(move |conn| {
+                    conn.query_row(
+                        "SELECT principal_id FROM principals WHERE name = ?1",
+                        [name],
+                        |row| crate::storage::id::<PrincipalId>(row, 0),
+                    )
+                    .map_err(crate::storage::StorageError::from)
+                })
+                .await
+        }
+    };
+    let na_agent_id = id_by_name("na-agent").await?;
+    let m_agent_id = id_by_name("m-agent").await?;
+    let nm_agent_id = id_by_name("nm-agent").await?;
+    let orch_agent_id = id_by_name("orch-agent").await?;
+    let missing_id = PrincipalId::new_agent();
+
+    for (subject, owned_name, foreign_name, owned_id, foreign_id) in [
+        (1, "na-agent", "m-agent", na_agent_id, m_agent_id),
+        (4, "nm-agent", "m-agent", nm_agent_id, m_agent_id),
+        (5, "orch-agent", "m-agent", orch_agent_id, m_agent_id),
+    ] {
+        for name in [owned_name, foreign_name, "nonexistent-name"] {
+            let (status, err) = fixture
+                .call(
+                    subject,
+                    Method::PUT,
+                    &format!("/v1/principals/{name}"),
+                    Some(json!({})),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{subject} PUT {name}");
+            assert_eq!(err["code"], "token_narrowed", "{subject} PUT {name}");
+        }
+        for id in [owned_id, foreign_id, missing_id] {
+            for (method, suffix) in [
+                (Method::POST, "/disable"),
+                (Method::POST, "/enable"),
+                (Method::DELETE, ""),
+            ] {
+                let (status, err) = fixture
+                    .call(
+                        subject,
+                        method,
+                        &format!("/v1/principals/{id}{suffix}"),
+                        None,
+                    )
+                    .await?;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{subject} {id}{suffix}");
+                assert_eq!(err["code"], "token_narrowed", "{subject} {id}{suffix}");
+            }
+        }
+    }
+    // Narrowed admin GET returns 403 forbidden uniformly for existing and missing (matches authorize_principal_manage(Read)).
+    for target in ["na-agent", "nonexistent-name"] {
+        let (status, err) = fixture
+            .call(1, Method::GET, &format!("/v1/principals/{target}"), None)
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(err["code"], "forbidden");
+    }
+    // Plain admin (without global admin grant) gets uniform 403 forbidden for foreign and missing.
+    for target in ["m-agent", "nonexistent-name"] {
+        let (status, err) = fixture
+            .call(2, Method::GET, &format!("/v1/principals/{target}"), None)
+            .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(err["code"], "forbidden");
+    }
+
+    fixture.stop().await
+}
+
+#[tokio::test]
+async fn disable_closes_managed_nodes_demotion_emits_signal_delete_restrict_and_tags_cap()
+-> TestResult {
+    let fixture = Fixture::start(
+        Config::default(),
+        &[("operator", Admin, false), ("orch", Service, false)],
+        |tx, subjects| {
+            tx.execute(
+                "UPDATE principals SET is_orchestrator = 1 WHERE principal_id = ?1",
+                [subjects[1].id.to_string()],
+            )?;
+            Ok(())
+        },
+    )?;
+    let orch = fixture.principals[1].id;
+
+    // 1. allowed_node_tags cardinality cap: 65 rejected with 400, 64 accepted.
+    let tags_65: Vec<String> = (0..65).map(|i| format!("tag-{i}")).collect();
+    let (status, err) = fixture
+        .call(
+            0,
+            Method::PUT,
+            "/v1/principals/orch",
+            Some(json!({"kind": "service", "is_orchestrator": true, "allowed_node_tags": tags_65})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["code"], "invalid_input");
+    let tags_64: Vec<String> = (0..64).map(|i| format!("tag-{i}")).collect();
+    let (status, _) = fixture
+        .call(
+            0,
+            Method::PUT,
+            "/v1/principals/orch",
+            Some(json!({"kind": "service", "is_orchestrator": true, "allowed_node_tags": tags_64})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // 2. Demotion emits PrincipalPermissionsReduced; unchanged PUT emits nothing.
+    let mut revocations = fixture.state.storage.subscribe_revocations()?;
+    let (status, _) = fixture
+        .call(
+            0,
+            Method::PUT,
+            "/v1/principals/orch",
+            Some(json!({"kind": "service", "is_orchestrator": false})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let signal = revocations.try_recv()?;
+    assert_eq!(
+        signal.reason,
+        RevocationReason::PrincipalPermissionsReduced(orch)
+    );
+    let (status, unchanged) = fixture
+        .call(
+            0,
+            Method::PUT,
+            "/v1/principals/orch",
+            Some(json!({"kind": "service", "is_orchestrator": false})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(unchanged["outcome"], "unchanged");
+    assert!(revocations.try_recv().is_err());
+
+    // 3. Disabling principal closes active managed nodes on the bridge with committed epoch.
+    let node = NodeId::new();
+    let issued_node = fixture.state.vault.issue_node(node)?;
+    let verifier = issued_node.verifier.as_str().to_owned();
+    fixture
+        .state
+        .storage
+        .execute_work(0, move |tx| {
+            tx.conn().execute(
+                "INSERT INTO nodes (node_id, name, key_id, credential_hmac, managed_by_principal_id,
+                                    session_epoch, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'managed', 1, ?2, ?3, 4, 1000, 1000)",
+                params![node.to_string(), verifier, orch.to_string()],
+            )?;
+            Ok::<_, crate::storage::WriteTxError<std::convert::Infallible>>(())
+        })
+        .await?;
+    fixture.bridge.sessions().insert(node, 4);
+    let (status, _) = fixture
+        .call(
+            0,
+            Method::POST,
+            &format!("/v1/principals/{orch}/disable"),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let closes = fixture.bridge.closes().clone();
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0].node_id, node);
+    assert_eq!(closes[0].through_epoch, 4);
+    assert_eq!(closes[0].reason, BridgeCloseReason::NodeRevoked);
+
+    // 4. DELETE principal blocked by accounts and executions returns 409 resource_in_use.
+    let blocked_acc = PrincipalId::new_user();
+    let blocked_exec = PrincipalId::new_user();
+    let tok_exec = TokenId::new_user_or_agent();
+    let issued_tok = fixture.state.vault.issue_token(tok_exec)?;
+    let tok_verifier = issued_tok.verifier.as_str().to_owned();
+    fixture
+        .state
+        .storage
+        .execute_work(0, move |tx| {
+            for (pid, name) in [(blocked_acc, "acc-owner"), (blocked_exec, "exec-caller")] {
+                tx.conn().execute(
+                    "INSERT INTO principals (principal_id, name, kind, disabled_at_ms, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, 'member', 1000, 1000, 1000)",
+                    params![pid.to_string(), name],
+                )?;
+            }
+            tx.conn().execute(
+                "INSERT INTO accounts (account_id, slug, owner_principal_id, visibility, kind,
+                                       sealed_secret_blob, created_at_ms, updated_at_ms)
+                 VALUES ('acc_1', 'acc-1', ?1, 'private', 'secret_kv', X'01', 1000, 1000)",
+                [blocked_acc.to_string()],
+            )?;
+            tx.conn().execute(
+                "INSERT INTO auth_tokens (token_id, principal_id, created_by, label, key_id, verifier_hmac, created_at_ms)
+                 VALUES (?1, ?2, ?2, 'x', 1, ?3, 1000)",
+                params![tok_exec.to_string(), blocked_exec.to_string(), tok_verifier],
+            )?;
+            tx.conn().execute(
+                "INSERT INTO executions (execution_id, invoke_kind, request_id, request_digest,
+                    caller_principal_id, caller_token_id, tool_id, tool_version, public_name,
+                    executor_kind, node_id, state, deadline_at_ms, created_at_ms,
+                    result_expires_at_ms, expires_at_ms)
+                 VALUES ('exec_1', 'tool_test', 'req_1', 'd', ?1, ?2, 'tool_1', 1, 't',
+                         'node', ?3, 'succeeded', 1000, 1000, 2000, 2000)",
+                params![blocked_exec.to_string(), tok_exec.to_string(), node.to_string()],
+            )?;
+            Ok::<_, crate::storage::WriteTxError<std::convert::Infallible>>(())
+        })
+        .await?;
+    for blocked in [blocked_acc, blocked_exec] {
+        let (status, err) = fixture
+            .call(
+                0,
+                Method::DELETE,
+                &format!("/v1/principals/{blocked}"),
+                None,
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{blocked}");
+        assert_eq!(err["code"], "resource_in_use", "{blocked}");
+    }
     fixture.stop().await
 }

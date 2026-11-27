@@ -11,12 +11,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::config::Config;
-use crate::http::{ApiError, ApiResult};
+use crate::http::{ApiError, ApiResult, Page, point_missing};
 use crate::storage::{
     StorageError, WriteTx, WriteTxError, id, json, opt_id, read_principal, scalar,
 };
 
-use super::{Page, point_missing};
+pub(crate) const MAX_NODE_TAGS: usize = 64;
 
 #[derive(Serialize, ToSchema)]
 pub(super) struct Principal {
@@ -97,17 +97,25 @@ impl Principal {
     }
 }
 
-const SELECT_PRINCIPAL: &str = "SELECT p.principal_id, p.name, p.kind, p.owner_principal_id, \
-    p.managed_by_principal_id, p.inherit_owner_bindings, p.is_orchestrator, p.allowed_node_tags_json, \
-    p.observe_executions, p.disabled_at_ms, p.created_at_ms, p.updated_at_ms \
-    FROM principals p JOIN hub_meta h ON h.id = 1 \
-    WHERE p.principal_id IS NOT h.gc_purging_principal_id";
+macro_rules! select_principal {
+    ($filter:literal) => {
+        concat!(
+            "SELECT p.principal_id, p.name, p.kind, p.owner_principal_id, ",
+            "p.managed_by_principal_id, p.inherit_owner_bindings, p.is_orchestrator, ",
+            "p.allowed_node_tags_json, p.observe_executions, p.disabled_at_ms, ",
+            "p.created_at_ms, p.updated_at_ms ",
+            "FROM principals p JOIN hub_meta h ON h.id = 1 ",
+            "WHERE p.principal_id IS NOT h.gc_purging_principal_id ",
+            $filter
+        )
+    };
+}
 
 pub(super) fn principal_by_name(
     conn: &Connection,
     name: &str,
 ) -> Result<Option<Principal>, StorageError> {
-    let mut stmt = conn.prepare_cached(&format!("{SELECT_PRINCIPAL} AND p.name = ?1"))?;
+    let mut stmt = conn.prepare_cached(select_principal!("AND p.name = ?1"))?;
     let mut rows = stmt.query([name])?;
     rows.next()?.map(Principal::read).transpose()
 }
@@ -116,9 +124,24 @@ pub(super) fn principal_by_id(
     conn: &Connection,
     principal: PrincipalId,
 ) -> Result<Option<Principal>, StorageError> {
-    let mut stmt = conn.prepare_cached(&format!("{SELECT_PRINCIPAL} AND p.principal_id = ?1"))?;
+    let mut stmt = conn.prepare_cached(select_principal!("AND p.principal_id = ?1"))?;
     let mut rows = stmt.query([principal.to_string()])?;
     rows.next()?.map(Principal::read).transpose()
+}
+
+pub(super) fn owned_agent_principals(
+    conn: &Connection,
+    owner: PrincipalId,
+) -> Result<Vec<Principal>, StorageError> {
+    let mut stmt = conn.prepare_cached(select_principal!(
+        "AND p.kind = 'agent' AND p.owner_principal_id = ?1 ORDER BY p.principal_id COLLATE BINARY ASC"
+    ))?;
+    let mut rows = stmt.query([owner.to_string()])?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next()? {
+        items.push(Principal::read(row)?);
+    }
+    Ok(items)
 }
 
 pub(super) fn list_principals(
@@ -127,28 +150,51 @@ pub(super) fn list_principals(
     cursor: Option<&str>,
     limit: usize,
 ) -> ApiResult<Page<Principal>> {
-    // Keep this visibility predicate aligned with authorize_principal_manage(Read)
-    // so filtering never excludes an eligible row from a page window.
-    let mut stmt = conn.prepare_cached(&format!(
-        "{SELECT_PRINCIPAL} AND p.principal_id COLLATE BINARY > ?1
-         AND (?3 OR p.principal_id = ?2 OR (p.kind = 'agent' AND
-              ((?4 AND p.owner_principal_id = ?2)
-               OR (?5 AND p.owner_principal_id IS NULL AND p.managed_by_principal_id = ?2))))
-         ORDER BY p.principal_id COLLATE BINARY ASC LIMIT ?6"
-    ))?;
-    let mut rows = stmt.query(params![
-        cursor.unwrap_or_default(),
-        ctx.caller.principal_id.to_string(),
-        authorize_admin(ctx).is_ok(),
-        ctx.caller.kind == PrincipalKind::Member,
-        ctx.caller.is_orchestrator,
-        limit + 1
-    ])?;
+    // Keep each SQL branch aligned with authorize_principal_manage(Read) so
+    // SQLite uses principal/parent indexes and never truncates page windows.
+    let cursor = cursor.unwrap_or_default();
+    let fetch_limit = limit + 1;
     let mut items = Vec::new();
-    while let Some(row) = rows.next()? {
-        let principal = Principal::read(row)?;
-        authorize_principal_manage(ctx, &principal.view(), PrincipalAccess::Read)?;
-        items.push(principal);
+    if authorize_admin(ctx).is_ok() {
+        let mut stmt = conn.prepare_cached(select_principal!(
+            "AND p.principal_id COLLATE BINARY > ?1 ORDER BY p.principal_id COLLATE BINARY ASC LIMIT ?2"
+        ))?;
+        let mut rows = stmt.query(params![cursor, fetch_limit])?;
+        while let Some(row) = rows.next()? {
+            let principal = Principal::read(row)?;
+            authorize_principal_manage(ctx, &principal.view(), PrincipalAccess::Read)?;
+            items.push(principal);
+        }
+    } else {
+        let sql = if ctx.caller.kind == PrincipalKind::Member {
+            select_principal!(
+                "AND p.principal_id COLLATE BINARY > ?1 \
+                 AND (p.principal_id = ?2 OR (p.kind = 'agent' AND p.owner_principal_id = ?2)) \
+                 ORDER BY p.principal_id COLLATE BINARY ASC LIMIT ?3"
+            )
+        } else if ctx.caller.is_orchestrator {
+            select_principal!(
+                "AND p.principal_id COLLATE BINARY > ?1 \
+                 AND (p.principal_id = ?2 OR (p.kind = 'agent' AND p.owner_principal_id IS NULL AND p.managed_by_principal_id = ?2)) \
+                 ORDER BY p.principal_id COLLATE BINARY ASC LIMIT ?3"
+            )
+        } else {
+            select_principal!(
+                "AND p.principal_id = ?2 AND p.principal_id COLLATE BINARY > ?1 \
+                 ORDER BY p.principal_id COLLATE BINARY ASC LIMIT ?3"
+            )
+        };
+        let mut stmt = conn.prepare_cached(sql)?;
+        let mut rows = stmt.query(params![
+            cursor,
+            ctx.caller.principal_id.to_string(),
+            fetch_limit
+        ])?;
+        while let Some(row) = rows.next()? {
+            let principal = Principal::read(row)?;
+            authorize_principal_manage(ctx, &principal.view(), PrincipalAccess::Read)?;
+            items.push(principal);
+        }
     }
     Ok(Page::from_rows(items, limit, |p| p.principal_id))
 }
@@ -202,6 +248,7 @@ pub(super) struct PrincipalPut {
     #[serde(default)]
     is_orchestrator: bool,
     #[serde(default)]
+    #[schema(max_items = 64)]
     allowed_node_tags: Vec<String>,
     #[serde(default)]
     observe_executions: bool,
@@ -253,6 +300,9 @@ impl PrincipalPut {
             }
             _ => return Err(ApiError::forbidden()),
         };
+        if self.allowed_node_tags.len() > MAX_NODE_TAGS {
+            return Err(ApiError::bad_input());
+        }
         let view = PrincipalView {
             principal_id,
             kind,
@@ -501,10 +551,18 @@ pub(super) fn delete_principal(tx: &mut WriteTx<'_>, target: &PrincipalView) -> 
     {
         return Err(in_use().into());
     }
+    let target_id = target.principal_id.to_string();
+    let has_executions: bool = tx
+        .conn()
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM executions WHERE caller_principal_id = ?1)")?
+        .query_row([&target_id], |row| row.get(0))?;
+    if has_executions {
+        return Err(in_use().into());
+    }
     let result = tx
         .conn()
         .prepare_cached("DELETE FROM principals WHERE principal_id = ?1")?
-        .execute([target.principal_id.to_string()]);
+        .execute([target_id]);
     // SQLite reports an ON DELETE RESTRICT action as SQLITE_CONSTRAINT_TRIGGER.
     // The Hub schema has no application triggers.
     match result {

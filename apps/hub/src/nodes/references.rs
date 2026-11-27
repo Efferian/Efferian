@@ -1,52 +1,77 @@
 use std::collections::HashSet;
 
 use efferian_protocol::{
-    NodeId, ProfileToolBinding, TargetSelector, ToolDefinition, validate_profile_bindings,
+    NodeId, ProfileToolBinding, TargetSelector, ToolDefinition, ToolId, validate_profile_bindings,
 };
 use rusqlite::{Connection, params};
 
-use crate::storage::{WriteTxError, json};
+use crate::http::{ApiError, ApiResult};
+use crate::storage::{StorageError, id, json};
 
 use super::NodeWriteResult;
 
 pub(super) fn node_in_use(conn: &Connection, node_id: NodeId) -> NodeWriteResult<bool> {
-    let active: bool = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM executions WHERE node_id = ?1 AND state IN ('accepted', 'running')
-        )",
-        [node_id.to_string()],
-        |row| row.get(0),
-    )?;
-    Ok(active
-        || current_tools_use_node(conn, node_id)?
-        || profile_bindings_use_node(conn, node_id)?)
+    node_in_use_inner(conn, node_id).map_err(Into::into)
 }
 
-fn current_tools_use_node(conn: &Connection, node_id: NodeId) -> NodeWriteResult<bool> {
+pub(super) fn node_in_use_ro(conn: &Connection, node_id: NodeId) -> ApiResult<bool> {
+    node_in_use_inner(conn, node_id).map_err(ApiError::from)
+}
+
+fn node_in_use_inner(conn: &Connection, node_id: NodeId) -> Result<bool, StorageError> {
+    let active: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(
+                SELECT 1 FROM executions WHERE node_id = ?1 AND state IN ('accepted', 'running')
+            )",
+        )?
+        .query_row([node_id.to_string()], |row| row.get(0))?;
+    if active {
+        return Ok(true);
+    }
+    let mut checked_revisions = HashSet::new();
+    Ok(
+        current_tools_use_node(conn, node_id, &mut checked_revisions)?
+            || profile_bindings_use_node(conn, node_id, &mut checked_revisions)?,
+    )
+}
+
+fn current_tools_use_node(
+    conn: &Connection,
+    node_id: NodeId,
+    checked_revisions: &mut HashSet<(ToolId, u64)>,
+) -> Result<bool, StorageError> {
     // A missing revision is an invalid catalog entry. Select it as NULL so
     // decoding fails closed instead of silently treating the tool as unrelated.
     let mut statement = conn.prepare_cached(
-        "SELECT r.definition_json FROM tools t LEFT JOIN tool_revisions r
+        "SELECT t.tool_id, t.current_version, r.definition_json
+         FROM tools t LEFT JOIN tool_revisions r
            ON r.tool_id = t.tool_id AND r.version = t.current_version",
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        if targets_node(json(row, 0)?, node_id)? {
+        let tool_id: ToolId = id(row, 0)?;
+        let version: u64 = row.get(1)?;
+        if targets_node(json(row, 2)?, node_id)? {
             return Ok(true);
         }
+        checked_revisions.insert((tool_id, version));
     }
     Ok(false)
 }
 
-fn profile_bindings_use_node(conn: &Connection, node_id: NodeId) -> NodeWriteResult<bool> {
+fn profile_bindings_use_node(
+    conn: &Connection,
+    node_id: NodeId,
+    checked_revisions: &mut HashSet<(ToolId, u64)>,
+) -> Result<bool, StorageError> {
     let mut statement = conn.prepare_cached(
         "SELECT draft_bindings_json FROM profiles
          UNION ALL
          SELECT e.bindings_json FROM profiles p LEFT JOIN profile_editions e
            ON e.profile_id = p.profile_id AND e.version = p.published_version
-         WHERE p.published_version > 0 AND e.disabled_at_ms IS NULL",
+         WHERE p.published_version != 0 AND e.disabled_at_ms IS NULL",
     )?;
-    let mut checked_revisions = HashSet::new();
     let mut revisions = conn.prepare_cached(
         "SELECT definition_json FROM tool_revisions WHERE tool_id = ?1 AND version = ?2",
     )?;
@@ -54,7 +79,7 @@ fn profile_bindings_use_node(conn: &Connection, node_id: NodeId) -> NodeWriteRes
     while let Some(row) = rows.next()? {
         let bindings: Vec<ProfileToolBinding> = json(row, 0)?;
         validate_profile_bindings(&bindings)
-            .map_err(|_| WriteTxError::InvalidDatabase("invalid profile bindings"))?;
+            .map_err(|_| StorageError::InvalidDatabase("invalid profile bindings"))?;
         for binding in bindings {
             if binding.fixed_node_id == Some(node_id) {
                 return Ok(true);
@@ -74,12 +99,12 @@ fn profile_bindings_use_node(conn: &Connection, node_id: NodeId) -> NodeWriteRes
     Ok(false)
 }
 
-fn targets_node(definition: ToolDefinition, node_id: NodeId) -> NodeWriteResult<bool> {
+fn targets_node(definition: ToolDefinition, node_id: NodeId) -> Result<bool, StorageError> {
     let Some(selector) = definition.spec.target_selector() else {
         return Ok(false);
     };
     selector
         .validate()
-        .map_err(|_| WriteTxError::InvalidDatabase("invalid tool target selector"))?;
+        .map_err(|_| StorageError::InvalidDatabase("invalid tool target selector"))?;
     Ok(matches!(selector, TargetSelector::Fixed { node_ids } if node_ids.contains(&node_id)))
 }

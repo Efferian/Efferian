@@ -56,6 +56,12 @@ pub struct VaultKeys {
     fingerprint: SecretBytes,
 }
 
+impl fmt::Debug for VaultKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultKeys").finish_non_exhaustive()
+    }
+}
+
 impl VaultKeys {
     pub fn derive(master_key: SecretBytes) -> Result<Self, VaultError> {
         // RFC 5869: an absent salt is HashLen zero octets. All outputs here
@@ -103,14 +109,6 @@ impl VaultKeys {
         self.issue(CredentialFamily::Token, id)
     }
 
-    pub fn issue_enrollment(&self, id: EnrollmentId) -> Result<IssuedCredential, VaultError> {
-        self.issue(CredentialFamily::Enrollment, id)
-    }
-
-    pub fn issue_node(&self, id: NodeId) -> Result<IssuedCredential, VaultError> {
-        self.issue(CredentialFamily::Node, id)
-    }
-
     fn issue(
         &self,
         family: CredentialFamily,
@@ -120,15 +118,15 @@ impl VaultKeys {
         let mut secret_bytes = Zeroizing::new([0; 32]);
         fill_random(&mut *secret_bytes)?;
         let verifier = self.compute_verifier(family, &id, &secret_bytes)?;
-        let mut secret = String::with_capacity("eff_".len() + id.len() + 1 + 64);
+        let mut secret = Zeroizing::new(String::with_capacity("eff_".len() + id.len() + 1 + 64));
         secret.push_str("eff_");
         secret.push_str(&id);
         secret.push('.');
         push_hex(&mut secret, secret_bytes.as_slice());
         Ok(IssuedCredential {
             key_id: ACTIVE_KEY_ID,
-            verifier: encode_hex(verifier.as_slice()),
-            secret: SecretString::new(secret),
+            verifier: Zeroizing::new(encode_hex(verifier.as_slice())),
+            secret: SecretString::new(std::mem::take(&mut *secret)),
         })
     }
 
@@ -161,7 +159,16 @@ pub struct Vault {
     keys: VaultKeys,
 }
 
+impl fmt::Debug for Vault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Vault")
+            .field("hub_id", &self.hub_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy)]
+#[allow(dead_code, reason = "account Vault AAD seam for #6")]
 pub struct AccountAad {
     pub account_id: AccountId,
     pub secret_version: NonZeroU64,
@@ -169,6 +176,7 @@ pub struct AccountAad {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code, reason = "execution Vault AAD seam for #6")]
 pub struct ExecutionAad {
     pub execution_id: ExecutionId,
     pub caller_principal_id: PrincipalId,
@@ -176,7 +184,7 @@ pub struct ExecutionAad {
 
 pub struct IssuedCredential {
     pub key_id: u16,
-    pub verifier: String,
+    pub verifier: Zeroizing<String>,
     pub secret: SecretString,
 }
 
@@ -196,26 +204,24 @@ enum CredentialFamily {
 }
 
 impl Vault {
-    pub fn hub_id(&self) -> HubId {
-        self.hub_id
-    }
-
     pub fn issue_token(&self, id: TokenId) -> Result<IssuedCredential, VaultError> {
         self.keys.issue_token(id)
     }
 
     pub fn issue_enrollment(&self, id: EnrollmentId) -> Result<IssuedCredential, VaultError> {
-        self.keys.issue_enrollment(id)
+        self.keys.issue(CredentialFamily::Enrollment, id)
     }
 
     pub fn issue_node(&self, id: NodeId) -> Result<IssuedCredential, VaultError> {
-        self.keys.issue_node(id)
+        self.keys.issue(CredentialFamily::Node, id)
     }
 
+    #[allow(dead_code, reason = "account Vault seam for #6")]
     pub fn seal_account(&self, aad: &AccountAad, plaintext: &[u8]) -> Result<Vec<u8>, VaultError> {
         self.seal(&self.account_aad(aad), plaintext)
     }
 
+    #[allow(dead_code, reason = "account Vault seam for #6")]
     pub fn open_account(
         &self,
         aad: &AccountAad,
@@ -224,6 +230,7 @@ impl Vault {
         self.open(&self.account_aad(aad), envelope)
     }
 
+    #[allow(dead_code, reason = "execution Vault seam for #6")]
     pub fn seal_execution(
         &self,
         aad: &ExecutionAad,
@@ -232,6 +239,7 @@ impl Vault {
         self.seal(&self.execution_aad(aad), plaintext)
     }
 
+    #[allow(dead_code, reason = "execution Vault seam for #6")]
     pub fn open_execution(
         &self,
         aad: &ExecutionAad,
@@ -242,11 +250,19 @@ impl Vault {
 
     /// Run outside the SQLite actor. Ownership keeps the plaintext zeroizing
     /// even when a caller cancels while the blocking task is running.
+    #[allow(dead_code, reason = "async execution Vault seam for #6")]
     pub async fn seal_execution_async(
         self: &Arc<Self>,
         aad: ExecutionAad,
         plaintext: Zeroizing<Vec<u8>>,
     ) -> Result<Vec<u8>, VaultError> {
+        if plaintext
+            .len()
+            .checked_add(OVERHEAD)
+            .is_none_or(|size| size > MAX_WORK_BYTES)
+        {
+            return Err(VaultError::PayloadTooLarge);
+        }
         if plaintext.len() < CRYPTO_OFFLOAD_BYTES {
             return self.seal_execution(&aad, &plaintext);
         }
@@ -257,11 +273,15 @@ impl Vault {
     }
 
     /// Run outside the SQLite actor.
+    #[allow(dead_code, reason = "async execution Vault seam for #6")]
     pub async fn open_execution_async(
         self: &Arc<Self>,
         aad: ExecutionAad,
         envelope: Vec<u8>,
     ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        if envelope.len() > MAX_WORK_BYTES {
+            return Err(VaultError::PayloadTooLarge);
+        }
         if envelope.len() < CRYPTO_OFFLOAD_BYTES {
             return self.open_execution(&aad, &envelope);
         }

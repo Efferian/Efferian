@@ -28,12 +28,14 @@ const TABLES: [&str; 15] = [
     "upstreams",
 ];
 
-const INDEXES: [&str; 16] = [
+const INDEXES: [&str; 29] = [
+    "idx_accounts_owner",
     "idx_accounts_private_owner_slug",
     "idx_accounts_shared_slug",
     "idx_auth_tokens_created_by",
     "idx_auth_tokens_expires",
     "idx_auth_tokens_principal",
+    "idx_auth_tokens_principal_active",
     "idx_auth_tokens_revoked",
     "idx_executions_active_deadline",
     "idx_executions_active_node",
@@ -42,9 +44,20 @@ const INDEXES: [&str; 16] = [
     "idx_executions_created",
     "idx_executions_expires",
     "idx_executions_result_expires",
+    "idx_grants_created_by",
+    "idx_grants_global_admin",
     "idx_grants_principal",
+    "idx_node_enrollments_created_by",
     "idx_node_enrollments_expires",
+    "idx_node_enrollments_managed_by",
+    "idx_node_enrollments_target_node",
     "idx_nodes_active_name",
+    "idx_nodes_managed_by",
+    "idx_principals_disabled_agents",
+    "idx_principals_managed_by",
+    "idx_principals_owner",
+    "idx_profile_editions_published_by",
+    "idx_tools_created_by",
 ];
 
 #[tokio::test]
@@ -96,13 +109,32 @@ async fn gate_sqlite_hygiene() -> TestResult {
             )?;
             assert_eq!(count, 0);
         }
-        let mut stmt = conn.prepare(
-            "SELECT name FROM pragma_index_info('idx_executions_result_expires') ORDER BY seqno",
-        )?;
-        let columns = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        assert_eq!(columns, ["result_expires_at_ms", "execution_id"]);
+        for (index, expected_columns) in [
+            (
+                "idx_executions_result_expires",
+                ["result_expires_at_ms", "execution_id"].as_slice(),
+            ),
+            (
+                "idx_auth_tokens_principal",
+                ["principal_id", "token_id"].as_slice(),
+            ),
+            (
+                "idx_grants_principal",
+                ["principal_id", "grant_id"].as_slice(),
+            ),
+            (
+                "idx_nodes_managed_by",
+                ["managed_by_principal_id", "node_id"].as_slice(),
+            ),
+        ] {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT name FROM pragma_index_info('{index}') ORDER BY seqno"
+            ))?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(columns, expected_columns, "{index}");
+        }
         Ok::<_, StorageError>(())
     })?;
     assert!(matches!(result.checkpoint, WalCheckpointOutcome::Truncated));

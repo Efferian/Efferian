@@ -24,7 +24,7 @@ fn database(vault: &Vault) -> Connection {
         "INSERT INTO hub_meta (id, hub_id, master_key_fingerprint, created_at_ms, updated_at_ms)
          VALUES (1, ?1, ?2, ?3, ?3)",
         params![
-            vault.hub_id().to_string(),
+            vault.hub_id.to_string(),
             vault.keys.expected_hub_identity().master_key_fingerprint,
             NOW
         ],
@@ -117,7 +117,7 @@ fn token(
             id.to_string(),
             principal_id.to_string(),
             issued.key_id,
-            issued.verifier,
+            issued.verifier.as_str(),
             NOW
         ],
     )
@@ -247,7 +247,7 @@ fn api_auth_reads_only_and_checks_mac_before_disabled_or_expired_status() {
         }]
     );
     assert_eq!(conn.total_changes(), changes);
-    assert!(!format!("{:?}", accepted.credential).contains(&issued.verifier));
+    assert!(!format!("{:?}", accepted.credential).contains(issued.verifier.as_str()));
 
     conn.execute_batch("PRAGMA query_only = OFF;").unwrap();
     conn.execute(
@@ -283,7 +283,7 @@ fn api_auth_reads_only_and_checks_mac_before_disabled_or_expired_status() {
         .unwrap();
     conn.execute(
         "UPDATE auth_tokens SET expires_at_ms = NULL, verifier_hmac = ?1",
-        [&wrong_secret.verifier],
+        [wrong_secret.verifier.as_str()],
     )
     .unwrap();
     assert_unauthenticated(refresh_api(&conn, &accepted.credential, NOW));
@@ -353,7 +353,7 @@ fn new_managed_enrollment_requires_the_issuers_current_tag_allowlist() {
          VALUES (?1, ?2, 'node', ?3, ?3, '[\"private\"]', ?4, ?5)",
         params![
             id.to_string(),
-            issued.verifier,
+            issued.verifier.as_str(),
             manager.to_string(),
             NOW + 100,
             NOW
@@ -388,7 +388,12 @@ fn enrollment_and_node_auth_recheck_current_rows_and_active_managers() {
         "INSERT INTO nodes (node_id, name, key_id, credential_hmac, managed_by_principal_id,
                             revoked_at_ms, created_at_ms, updated_at_ms)
          VALUES (?1, 'node', 1, ?2, ?3, ?4, ?4, ?4)",
-        params![node_id.to_string(), node.verifier, manager.to_string(), NOW],
+        params![
+            node_id.to_string(),
+            node.verifier.as_str(),
+            manager.to_string(),
+            NOW
+        ],
     )
     .unwrap();
     let enrollment_id = EnrollmentId::new();
@@ -399,7 +404,7 @@ fn enrollment_and_node_auth_recheck_current_rows_and_active_managers() {
          VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
         params![
             enrollment_id.to_string(),
-            issued.verifier,
+            issued.verifier.as_str(),
             node_id.to_string(),
             admin.to_string(),
             NOW + 100,
@@ -453,8 +458,216 @@ fn enrollment_and_node_auth_recheck_current_rows_and_active_managers() {
     assert_unauthenticated(recheck_enrollment(&conn, &enrollment.credential, NOW));
 
     let rotated = vault.issue_node(node_id).unwrap();
-    conn.execute("UPDATE nodes SET credential_hmac = ?1", [&rotated.verifier])
-        .unwrap();
+    conn.execute(
+        "UPDATE nodes SET credential_hmac = ?1",
+        [rotated.verifier.as_str()],
+    )
+    .unwrap();
     assert_unauthenticated(recheck_node(&conn, &authenticated_node));
     node_from_headers(&vault, &conn, &headers(&rotated.secret)).unwrap();
+}
+
+#[test]
+fn parsed_bearer_debug_edge_headers_corrupt_macs_and_node_manager_order() {
+    let vault = test_vault();
+    let conn = database(&vault);
+    let admin = global_admin(&conn);
+    let (id, issued) = token(&vault, &conn, admin, PrincipalKind::Admin);
+
+    let parsed = ParsedBearer::<TokenId>::from_headers(&headers(&issued.secret)).unwrap();
+    let debug = format!("{parsed:?}");
+    let secret_hex = issued.secret.expose_secret().split_once('.').unwrap().1;
+    assert!(debug.starts_with("ParsedBearer { id: ") && debug.ends_with(", .. }"));
+    assert!(!debug.contains(secret_hex));
+    assert!(!debug.contains(&format!("{:?}", parsed.secret.as_slice())));
+
+    // Non-UTF8, leading space, non-v7 UUID, and uppercase UUID must fail parsing cleanly.
+    let mut non_utf8 = HeaderMap::new();
+    non_utf8.insert(
+        AUTHORIZATION,
+        HeaderValue::from_bytes(b"Bearer \xff\xfe").unwrap(),
+    );
+    assert_unauthenticated(ParsedBearer::<TokenId>::from_headers(&non_utf8));
+    let raw = issued.secret.expose_secret();
+    for bad in [
+        format!(" Bearer {raw}"),
+        format!("Bearer eff_tok_00000000000000000000000000000000.{secret_hex}"),
+        format!(
+            "Bearer eff_{}.{secret_hex}",
+            id.to_string().to_ascii_uppercase()
+        ),
+    ] {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, HeaderValue::from_str(&bad).unwrap());
+        assert_unauthenticated(ParsedBearer::<TokenId>::from_headers(&h));
+    }
+
+    // Corrupted stored verifier_hmac must still run the dummy MAC path and return Unauthenticated.
+    for bad_hmac in ["short", &"g".repeat(64), &"A".repeat(64)] {
+        conn.execute(
+            "UPDATE auth_tokens SET verifier_hmac = ?1 WHERE token_id = ?2",
+            params![bad_hmac, id.to_string()],
+        )
+        .unwrap();
+        MAC_CHECKS.with(|checks| checks.set(0));
+        assert_unauthenticated(api_from_headers(
+            &vault,
+            &conn,
+            &headers(&issued.secret),
+            NOW,
+        ));
+        MAC_CHECKS.with(|checks| assert_eq!(checks.get(), 1));
+    }
+
+    // Node auth checks MAC before revealing disabled manager status.
+    let manager = principal(&conn, "disabled-manager", PrincipalKind::Service);
+    conn.execute(
+        "UPDATE principals SET disabled_at_ms = ?1 WHERE principal_id = ?2",
+        params![NOW, manager.to_string()],
+    )
+    .unwrap();
+    let node_id = NodeId::new();
+    let valid_node = vault.issue_node(node_id).unwrap();
+    let wrong_node = vault.issue_node(node_id).unwrap();
+    conn.execute(
+        "INSERT INTO nodes (node_id, name, key_id, credential_hmac, managed_by_principal_id,
+                            created_at_ms, updated_at_ms)
+         VALUES (?1, 'managed-node', 1, ?2, ?3, ?4, ?4)",
+        params![
+            node_id.to_string(),
+            valid_node.verifier.as_str(),
+            manager.to_string(),
+            NOW
+        ],
+    )
+    .unwrap();
+    assert_unauthenticated(node_from_headers(
+        &vault,
+        &conn,
+        &headers(&wrong_node.secret),
+    ));
+    assert!(matches!(
+        node_from_headers(&vault, &conn, &headers(&valid_node.secret)),
+        Err(CredentialError::Authz(AuthzError::ManagedByDisabled))
+    ));
+}
+
+#[test]
+fn corrupt_scope_or_duplicate_token_sets_return_from_sql_conversion_failure() {
+    let vault = test_vault();
+    let conn = database(&vault);
+    let admin = global_admin(&conn);
+    let (tok_id, issued) = token(&vault, &conn, admin, PrincipalKind::Admin);
+    let auth = api_from_headers(&vault, &conn, &headers(&issued.secret), NOW).unwrap();
+
+    // Duplicate ID in allowed_profiles_json must fail with FromSqlConversionFailure, not InvalidQuery.
+    let profile = efferian_protocol::ProfileId::new();
+    let dup = serde_json::to_string(&[profile, profile]).unwrap();
+    conn.execute(
+        "UPDATE auth_tokens SET allowed_profiles_json = ?1 WHERE token_id = ?2",
+        params![dup, tok_id.to_string()],
+    )
+    .unwrap();
+    assert!(matches!(
+        refresh_api(&conn, &auth.credential, NOW),
+        Err(CredentialError::Storage(StorageError::Sqlite(
+            rusqlite::Error::FromSqlConversionFailure(..)
+        )))
+    ));
+
+    // Reset token scope, then inject an invalid grants row by temporarily recreating grants without CHECK.
+    conn.execute(
+        "UPDATE auth_tokens SET allowed_profiles_json = NULL WHERE token_id = ?1",
+        [tok_id.to_string()],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         ALTER TABLE grants RENAME TO grants_checked;
+         CREATE TABLE grants (
+             grant_id TEXT PRIMARY KEY,
+             principal_id TEXT NOT NULL,
+             scope_kind TEXT NOT NULL,
+             scope_id TEXT NOT NULL DEFAULT '',
+             capability TEXT NOT NULL,
+             created_by TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         INSERT INTO grants SELECT * FROM grants_checked;
+         UPDATE grants SET scope_id = 'unexpected' WHERE scope_kind = 'global';
+         PRAGMA foreign_keys = ON;",
+    )
+    .unwrap();
+    assert!(matches!(
+        refresh_api(&conn, &auth.credential, NOW),
+        Err(CredentialError::Storage(StorageError::Sqlite(
+            rusqlite::Error::FromSqlConversionFailure(..)
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn db_actor_stays_healthy_after_corrupt_token_scope_decode_failure() {
+    use crate::config::Config;
+    use crate::storage::{WriteError, WriteTxError};
+    use crate::test_support::TestHub;
+
+    let hub = TestHub::start("auth-savepoint", Config::default(), NOW)
+        .await
+        .unwrap();
+    let bearer = ParsedBearer::<TokenId>::from_headers(&headers(&SecretString::new(
+        hub.admin_token.clone(),
+    )))
+    .unwrap();
+    let vault = std::sync::Arc::clone(&hub.state.vault);
+    let authed = hub
+        .state
+        .storage
+        .read_snapshot(move |conn| authenticate_api(&vault, conn, bearer, NOW))
+        .await
+        .unwrap();
+    let tok_id = authed.credential.id();
+    let profile = efferian_protocol::ProfileId::new();
+    let dup = serde_json::to_string(&[profile, profile]).unwrap();
+    hub.write(move |conn| {
+        conn.execute(
+            "UPDATE auth_tokens SET allowed_profiles_json = ?1 WHERE token_id = ?2",
+            params![dup, tok_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let cred = authed.credential;
+    let err = hub
+        .state
+        .storage
+        .execute_work(0, move |tx| -> Result<(), WriteTxError<CredentialError>> {
+            refresh_api(tx.conn(), &cred, NOW).map_err(|error| match error {
+                CredentialError::Storage(storage) => WriteTxError::from(storage),
+                other => WriteTxError::Domain(other),
+            })?;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        WriteError::Storage(StorageError::Sqlite(
+            rusqlite::Error::FromSqlConversionFailure(..)
+        ))
+    ));
+
+    // A subsequent write transaction on the same DbActor commits cleanly.
+    hub.write(move |conn| {
+        conn.execute(
+            "UPDATE auth_tokens SET allowed_profiles_json = NULL WHERE token_id = ?1",
+            [tok_id.to_string()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    hub.shutdown().await;
 }
