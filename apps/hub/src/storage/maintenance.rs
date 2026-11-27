@@ -118,7 +118,6 @@ pub(super) struct Maintenance {
     live_events_count: usize,
     event_write_debt: usize,
     next_lane: usize,
-    unsampled_bytes: usize,
     unsampled_commits: usize,
 }
 
@@ -147,7 +146,6 @@ impl Maintenance {
             live_events_count,
             event_write_debt: 0,
             next_lane: 0,
-            unsampled_bytes: 0,
             unsampled_commits: 0,
         })
     }
@@ -184,18 +182,15 @@ impl Maintenance {
                     .event_write_debt
                     .saturating_add(appended_events.min(excess).saturating_add(1));
             }
-            self.unsampled_bytes += bytes;
             self.unsampled_commits += 1;
             if bytes != 0 {
                 self.soft_exhausted = false;
                 self.soft_reclaim_pending = true;
             }
         }
-        if !committed
-            || resample
-            || self.unsampled_bytes >= MAX_WORK_BYTES
-            || self.unsampled_commits >= SAMPLE_COMMITS
-        {
+        // One sample per payload batch catches a watermark crossing even
+        // when a small database can absorb only one more such write.
+        if !committed || resample || bytes != 0 || self.unsampled_commits >= SAMPLE_COMMITS {
             self.sample(db)?;
         }
         Ok(())
@@ -209,7 +204,6 @@ impl Maintenance {
             self.soft_reclaim_pending |= !self.soft_active;
             self.soft_active = true;
         }
-        self.unsampled_bytes = 0;
         self.unsampled_commits = 0;
         Ok(())
     }

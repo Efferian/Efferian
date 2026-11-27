@@ -767,10 +767,11 @@ impl Mailbox {
         let subscription_count = state.subscriptions.len().min(MAX_COMMANDS);
         turn.subscriptions
             .extend(state.subscriptions.drain(..subscription_count));
-        let work_ready = (!defer_work || state.shutting_down) && !state.work.is_empty();
+        let work_waiting = !state.work.is_empty();
+        let work_ready = work_waiting && (!defer_work || state.shutting_down);
         if !state.priority.is_empty() && (!work_ready || state.priority_streak < PRIORITY_BURST) {
-            state.priority_streak = if work_ready {
-                state.priority_streak + 1
+            state.priority_streak = if work_waiting {
+                (state.priority_streak + 1).min(PRIORITY_BURST)
             } else {
                 0
             };

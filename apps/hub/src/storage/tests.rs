@@ -1703,8 +1703,22 @@ async fn revocation_is_observable_at_the_instant_the_outbox_wakes_a_subscriber()
 
 #[tokio::test]
 async fn large_receipts_make_progress_at_the_soft_watermark_while_ttl_advances() -> TestResult {
+    check_receipt_pressure(4350, 12_000_000, 1, 75..85).await
+}
+
+#[tokio::test]
+async fn writer_samples_a_payload_batch_crossing_the_soft_watermark() -> TestResult {
+    check_receipt_pressure(4096, 10_000_000, 5000, 73..75).await
+}
+
+async fn check_receipt_pressure(
+    max_page_count: u32,
+    permanent_blob_bytes: u32,
+    old_result_expiry: i64,
+    initial_pressure: std::ops::Range<u32>,
+) -> TestResult {
     let f = Fixture::create(StorageConfig {
-        max_page_count: 4350,
+        max_page_count,
         gc_interval: Duration::from_millis(1),
         token_gc_grace_ms: 1,
         ..StorageConfig::default()
@@ -1713,8 +1727,8 @@ async fn large_receipts_make_progress_at_the_soft_watermark_while_ttl_advances()
     f.open(OpenMode::OfflineExactVersion)?.run_offline_tx(|conn| {
         conn.execute(
             "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
-             VALUES ('account', 'account', ?1, 'private', 'secret_kv', zeroblob(12000000), 0, 0)",
-            [f.principal.to_string()],
+             VALUES ('account', 'account', ?1, 'private', 'secret_kv', zeroblob(?2), 0, 0)",
+            params![f.principal.to_string(), permanent_blob_bytes],
         )?;
         conn.execute("UPDATE auth_tokens SET revoked_at_ms = 100", [])?;
         let mut insert = conn.prepare(
@@ -1725,7 +1739,7 @@ async fn large_receipts_make_progress_at_the_soft_watermark_while_ttl_advances()
                 0, 0, ?7, 100000, CASE WHEN ?8 = 0 THEN NULL ELSE zeroblob(?8) END, ?8)",
         )?;
         for (id, state, expiry, bytes) in active.iter().copied().map(|id| (id, "accepted", 10000, 0))
-            .chain([(ExecutionId::new(), "succeeded", 1, 2_250_000)])
+            .chain([(ExecutionId::new(), "succeeded", old_result_expiry, 2_250_000)])
         {
             insert.execute(params![id.to_string(), f.principal.to_string(), f.token.to_string(),
                 f.tool.to_string(), f.node.to_string(), state, expiry, bytes])?;
@@ -1740,7 +1754,7 @@ async fn large_receipts_make_progress_at_the_soft_watermark_while_ttl_advances()
     let free: u32 = opened
         .conn
         .pragma_query_value(None, "freelist_count", |row| row.get(0))?;
-    assert!((75..85).contains(&((pages - free) * 100 / f.config.max_page_count)));
+    assert!(initial_pressure.contains(&((pages - free) * 100 / f.config.max_page_count)));
     let (handle, runtime) = opened.migrate_and_start_runtime()?;
     let (release, anchor) = pause_writer(&handle).await?;
     let mut queue = Vec::new();
@@ -1771,6 +1785,61 @@ async fn large_receipts_make_progress_at_the_soft_watermark_while_ttl_advances()
     }
     assert!(observed_ttl_during_work);
     assert_eq!(handle.status_snapshot().await?.active_waiters_count, 0);
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retention_pauses_do_not_reset_the_priority_burst() -> TestResult {
+    let f = Fixture::create(StorageConfig {
+        max_events_rows: 1,
+        ..StorageConfig::default()
+    })?;
+    let tokens: Vec<_> = (0..40).map(|_| TokenId::new_user_or_agent()).collect();
+    f.open(OpenMode::OfflineExactVersion)?
+        .run_offline_tx(|conn| {
+            for &token in &tokens {
+                seed_token(conn, token, f.principal, f.principal)?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })?;
+    let (handle, runtime) = f.start()?;
+    let actor_id = ActorId::Hub(f.hub_id);
+    let principal = f.principal;
+    handle
+        .execute_work(0, move |tx| {
+            tx.append_event(actor_id, Event::PrincipalRevoked(principal))?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+    let (release, anchor) = pause_writer(&handle).await?;
+
+    let mut queued = Vec::new();
+    for token in tokens {
+        let mut priority = Box::pin(handle.revoke_token(actor_id, token));
+        assert!(poll!(&mut priority).is_pending());
+        queued.push(priority);
+    }
+    let mut work = Box::pin(handle.execute_work(0, |tx| {
+        let revoked = tx.conn().query_row(
+            "SELECT COUNT(*) FROM auth_tokens WHERE revoked_at_ms IS NOT NULL",
+            [],
+            |row| row.get::<_, usize>(0),
+        )?;
+        Ok::<_, WriteTxError<Infallible>>(revoked)
+    }));
+    assert!(poll!(&mut work).is_pending());
+    release.send(()).map_err(|_| "writer stopped")?;
+    anchor.await?;
+
+    let revoked_before_work = tokio::time::timeout(TIMEOUT, work).await??;
+    assert!(
+        (16..=18).contains(&revoked_before_work),
+        "{revoked_before_work} revocations ran before work"
+    );
+    for priority in queued {
+        assert!(priority.await?);
+    }
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }
