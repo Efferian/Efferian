@@ -48,7 +48,7 @@ pub(super) struct MintReenrollment {
 #[derive(Serialize, ToSchema)]
 pub(super) struct EnrollmentIssued {
     enrollment_id: EnrollmentId,
-    #[schema(value_type = String)]
+    #[schema(value_type = String, format = Password)]
     enrollment_token: SecretString,
     expires_at_ms: i64,
 }
@@ -68,7 +68,7 @@ impl<'de> Deserialize<'de> for ExchangeEnrollment {
 pub(super) struct EnrollmentExchanged {
     hub_id: HubId,
     node_id: NodeId,
-    #[schema(value_type = String)]
+    #[schema(value_type = String, format = Password)]
     node_token: SecretString,
 }
 

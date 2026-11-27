@@ -805,6 +805,17 @@ async fn openapi_matches_input_and_boundary_response_contracts() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
+    for (schema, field) in [
+        ("MintedToken", "token"),
+        ("EnrollmentIssued", "enrollment_token"),
+        ("EnrollmentExchanged", "node_token"),
+    ] {
+        let credential = &doc["components"]["schemas"][schema]["properties"][field];
+        assert_eq!(credential["type"], "string");
+        assert_eq!(credential["format"], "password");
+        assert!(credential.get("writeOnly").is_none());
+    }
+
     let principal_put = &doc["paths"]["/v1/principals/{principal_ref}"]["put"];
     let principal_schema = &principal_put["requestBody"]["content"]["application/json"]["schema"];
     let schema = serde_json::json!({
