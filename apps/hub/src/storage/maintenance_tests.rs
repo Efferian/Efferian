@@ -723,3 +723,101 @@ fn all_gc_and_waiter_queries_use_indexes_without_temp_btree() -> TestResult {
     )?;
     Ok(())
 }
+
+#[test]
+fn soft_state_handles_stale_hard_crossing_external_drop_and_held_scheduled_vacuum() -> TestResult {
+    // 1. Stale used_percent = 84% when actual DB already crossed >= 85% must NOT
+    // latch Exhausted { at_hard: false }; it must stay Active so the next pass
+    // bypasses the 60s grace and evicts fresh blobs.
+    let f = Fixture::create(StorageConfig {
+        max_page_count: 300,
+        soft_pressure_grace_ms: 60_000,
+        ..StorageConfig::default()
+    })?;
+    f.set_wall_ms(100_000);
+    let db = f.open(OpenMode::OfflineExactVersion)?;
+    let conn = &db.conn;
+    conn.execute(
+        "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(740000), 0, 0)",
+        [f.principal.to_string()],
+    )?;
+    let fresh = seed_execution(
+        conn,
+        &f,
+        f.principal,
+        "succeeded",
+        500_000,
+        600_000,
+        100_000,
+    )?;
+    conn.execute(
+        "UPDATE executions SET finished_at_ms = 90000 WHERE execution_id = ?1",
+        [fresh.to_string()],
+    )?;
+    let mut m = Maintenance::new(&db, Arc::new(AtomicU64::new(0)))?;
+    assert!(m.used_percent >= 85, "{}", m.used_percent);
+    // Simulate a cached 84% reading before an unsampled write pushed into >= 85%.
+    m.used_percent = 84;
+    m.soft = SoftState::Active {
+        defer_next_work: false,
+    };
+    m.run_lane(&db, GcLane::Soft)?;
+    assert!(m.used_percent >= 85, "{}", m.used_percent);
+    assert_eq!(
+        m.soft,
+        SoftState::Active {
+            defer_next_work: true
+        },
+        "crossing >= 85% during graced soft pass must stay Active for immediate hard retry"
+    );
+    m.run_lane(&db, GcLane::Soft)?;
+    assert!(!conn.query_row(
+        "SELECT sealed_result_blob IS NOT NULL FROM executions WHERE execution_id = ?1",
+        [fresh.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?);
+
+    // 2. Non-Soft deletion dropping usage from Exhausted (>= 75%) into Normal (65..74%)
+    // must clear SoftState::Exhausted -> Idle both on sample() and on periodic_due.
+    let f2 = Fixture::create(StorageConfig {
+        max_page_count: 300,
+        soft_pressure_grace_ms: 60_000,
+        ..StorageConfig::default()
+    })?;
+    f2.set_wall_ms(100_000);
+    let db2 = f2.open(OpenMode::OfflineExactVersion)?;
+    let conn2 = &db2.conn;
+    conn2.execute(
+        "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+         VALUES ('base', 'base', ?1, 'private', 'secret_kv', zeroblob(600000), 0, 0)",
+        [f2.principal.to_string()],
+    )?;
+    conn2.execute(
+        "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+         VALUES ('temp', 'temp', ?1, 'private', 'secret_kv', zeroblob(140000), 0, 0)",
+        [f2.principal.to_string()],
+    )?;
+    let mut m2 = Maintenance::new(&db2, Arc::new(AtomicU64::new(0)))?;
+    assert!((75..85).contains(&m2.used_percent), "{}", m2.used_percent);
+    m2.run_lane(&db2, GcLane::Soft)?;
+    assert_eq!(m2.soft, SoftState::Exhausted { at_hard: false });
+    // External delete returns usage to Normal 65..74%; periodic_due must sample first
+    // and clear Exhausted -> Idle rather than waking Soft in Normal.
+    conn2.execute("DELETE FROM accounts WHERE account_id = 'temp'", [])?;
+    let due = m2.next_gc;
+    m2.tick(&db2, due, false)?;
+    assert!((65..75).contains(&m2.used_percent), "{}", m2.used_percent);
+    assert_eq!(m2.soft, SoftState::Idle);
+
+    // 3. A held Scheduled lane with remaining steps must NOT block Vacuum.
+    m2.held_lanes[GcLane::Scheduled as usize] = true;
+    m2.scheduled_steps.push_back(GcStep::Results);
+    m2.periodic_vacuum_pending = true;
+    assert!(Pages::read(conn2)?.free > 0);
+    let ready = m2.ready_lane(&db2);
+    assert!(matches!(ready, Some((_, GcLane::Vacuum))), "{ready:?}");
+    m2.run_lane(&db2, GcLane::Vacuum)?;
+    assert_eq!(Pages::read(conn2)?.free, 0);
+    Ok(())
+}

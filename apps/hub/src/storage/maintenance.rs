@@ -235,7 +235,9 @@ impl Maintenance {
 
     fn sample(&mut self, db: &OpenedDb) -> rusqlite::Result<()> {
         self.used_percent = Pages::read(&db.conn)?.percent(db.config.max_page_count);
-        if self.used_percent < 65 {
+        if self.used_percent < 65
+            || (self.used_percent < 75 && matches!(self.soft, SoftState::Exhausted { .. }))
+        {
             self.soft = SoftState::Idle;
         } else if self.used_percent >= 85 {
             match self.soft {
@@ -285,23 +287,27 @@ impl Maintenance {
                 }
             }
             self.periodic_vacuum_pending = true;
+            self.sample(db)?;
             if matches!(self.soft, SoftState::Exhausted { .. }) {
                 self.soft = SoftState::Active {
                     defer_next_work: false,
                 };
             }
-            self.sample(db)?;
         }
+        let mut wrote_wal = wrote_wal;
         if let Some((index, lane)) = self.ready_lane(db) {
             self.next_lane = (index + 1) % GcLane::COUNT;
-            if let Err(error) = self.run_lane(db, lane) {
-                // FULL and failed FK checks must leave priority admission and
-                // unrelated GC lanes intact.
-                if !db.conn.is_autocommit() {
-                    return Err(error.into());
+            match self.run_lane(db, lane) {
+                Ok(()) => wrote_wal = true,
+                Err(error) => {
+                    // FULL and failed FK checks must leave priority admission and
+                    // unrelated GC lanes intact.
+                    if !db.conn.is_autocommit() {
+                        return Err(error.into());
+                    }
+                    self.gc_errors.fetch_add(1, Ordering::Relaxed);
+                    self.held_lanes[index] = true;
                 }
-                self.gc_errors.fetch_add(1, Ordering::Relaxed);
-                self.held_lanes[index] = true;
             }
         }
         if wrote_wal || periodic_due || self.next_wal_truncate.is_some_and(|retry| now >= retry) {
@@ -325,7 +331,8 @@ impl Maintenance {
                 GcLane::Scheduled => !self.scheduled_steps.is_empty(),
                 GcLane::Vacuum => {
                     (self.reactive_vacuum_pending || self.periodic_vacuum_pending)
-                        && self.scheduled_steps.is_empty()
+                        && (self.scheduled_steps.is_empty()
+                            || self.held_lanes[GcLane::Scheduled as usize])
                 }
             };
             ready.then_some((index, lane))
@@ -372,8 +379,15 @@ impl Maintenance {
                     // If usage has already returned to Normal (< 75%) and no
                     // reclaimable results remain, clear the hysteresis latch so
                     // future normal-pressure results are never evicted on commit.
+                    // If an unsampled write crossed >= 85% while this pass used
+                    // the soft recency grace, stay active so the next turn runs
+                    // with grace bypassed.
                     self.soft = if self.used_percent < 75 {
                         SoftState::Idle
+                    } else if !at_hard && self.used_percent >= 85 {
+                        SoftState::Active {
+                            defer_next_work: true,
+                        }
                     } else {
                         SoftState::Exhausted { at_hard }
                     };
@@ -494,7 +508,7 @@ impl Maintenance {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(usize)]
 enum GcLane {
     Purge = 0,

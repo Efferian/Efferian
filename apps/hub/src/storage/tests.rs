@@ -2070,7 +2070,7 @@ async fn local_savepoint_errors_preserve_sibling_commands_in_work_batch() -> Tes
     // Out-of-range edition version returns Ok(false) rather than truncating.
     assert!(!handle.disable_edition(profile, u64::MAX).await?);
 
-    // Seed a profile edition with corrupt bindings JSON (duplicate public_name).
+    // Seed a profile edition with corrupt bindings JSON ('not-json').
     handle
         .execute_work(0, move |tx| {
             let principal = read_principal(tx.conn(), caller)?;
@@ -2221,6 +2221,53 @@ async fn read_events_rejects_mismatched_auth_projection_columns() -> TestResult 
         Err(EventsReadError::Storage(StorageError::Sqlite(
             rusqlite::Error::FromSqlConversionFailure(..)
         )))
+    ));
+
+    // Empty-payload events must also reject JSON arrays like "[]".
+    handle
+        .execute_work(0, move |tx| {
+            tx.conn().execute(
+                "UPDATE events SET node_id = ?1, payload_json = '[]' WHERE seq = 1",
+                [node.to_string()],
+            )?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+    assert!(matches!(
+        handle.read_events(0, None, 10).await,
+        Err(EventsReadError::Storage(StorageError::Sqlite(
+            rusqlite::Error::FromSqlConversionFailure(..)
+        )))
+    ));
+
+    // append_event must reject invalid execution error_code before persisting.
+    let exec = handle
+        .invoke(f.request(RequestId::new()))
+        .await?
+        .execution_id;
+    let tool = f.tool;
+    let bad_append = handle
+        .execute_work(0, move |tx| {
+            tx.append_event(
+                actor,
+                Event::ExecutionFinished(efferian_protocol::ExecutionEventPayload {
+                    execution_id: exec,
+                    state: ExecutionState::Failed,
+                    profile_id: None,
+                    tool_id: tool,
+                    public_name: "example".to_owned(),
+                    node_id: Some(node),
+                    exit_code: Some(1),
+                    error_code: Some("bad code".to_owned()),
+                    duration_ms: Some(1),
+                }),
+            )?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await;
+    assert!(matches!(
+        bad_append,
+        Err(WriteError::Storage(StorageError::InvalidDatabase(_)))
     ));
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())

@@ -516,6 +516,34 @@ impl PrivateFs {
         Ok(metadata.len())
     }
 
+    /// Verify that an owned, single-link private regular file (mode 0400 or 0600)
+    /// is also openable for writing by the current process.
+    pub fn verify_private_file_writable(path: &Path) -> Result<(), PlatformError> {
+        let path = checked_path(path, false)?;
+        let (_file, metadata) = open_linked_file(path, || {
+            if let Some(metadata) = entry_metadata(path)? {
+                check_type(path, &metadata, false)?;
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAGS)
+                .open(path)
+                .map_err(|error| open_file_error(path, "open_file_rw", error))?;
+            let metadata = fd_metadata(path, &file)?;
+            check_type(path, &metadata, false)?;
+            Ok((file, metadata))
+        })?;
+        check_owner(path, &metadata, current_euid())?;
+        check_mode(
+            path,
+            &metadata,
+            |mode| matches!(mode, 0o400 | PRIVATE_FILE_MODE),
+            "expected mode 0400 or 0600",
+        )?;
+        Ok(())
+    }
+
     /// Read a fixed prefix from an owned, single-link private regular file
     /// (mode 0400 or 0600), returning its full byte length.
     pub fn read_private_file_header(path: &Path, header: &mut [u8]) -> Result<u64, PlatformError> {

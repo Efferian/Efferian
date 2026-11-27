@@ -419,8 +419,61 @@ fn open_existing_enforces_private_permissions_links_and_early_readonly_checks() 
     ));
     assert_eq!(fs::read(&wal)?, before_wal);
 
+    // Mode 0400 WAL or SHM sidecar beside a 0600 main DB fails as ReadOnlyDatabase
+    // without creating -shm or mutating the WAL (non-root).
+    let shm = db.dir.join("hub.sqlite3-shm");
+    assert!(shm.exists());
+    fs::set_permissions(&wal, fs::Permissions::from_mode(0o400))?;
+    let wal_writable = fs::OpenOptions::new().write(true).open(&wal).is_ok();
+    if !wal_writable {
+        let ro_wal_with_shm = open_existing(
+            acquire_state_lock(&db.dir)?,
+            OpenMode::ServeAutoMigrate,
+            db.expected(),
+            &db.config,
+            Arc::clone(&db.clock),
+        );
+        assert!(matches!(
+            ro_wal_with_shm,
+            Err(StorageError::ReadOnlyDatabase)
+        ));
+        assert_eq!(fs::read(&wal)?, before_wal);
+
+        fs::remove_file(&shm)?;
+        let ro_wal_no_shm = open_existing(
+            acquire_state_lock(&db.dir)?,
+            OpenMode::ServeAutoMigrate,
+            db.expected(),
+            &db.config,
+            Arc::clone(&db.clock),
+        );
+        assert!(matches!(ro_wal_no_shm, Err(StorageError::ReadOnlyDatabase)));
+        assert!(!shm.exists(), "must not create -shm during failed open");
+        assert_eq!(fs::read(&wal)?, before_wal);
+
+        // Recreate -shm and make only -shm read-only (0400).
+        fs::set_permissions(&wal, fs::Permissions::from_mode(0o600))?;
+        let conn = Connection::open(db.path())?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        conn.execute("UPDATE hub_meta SET updated_at_ms = updated_at_ms + 1", [])?;
+        conn.close().map_err(|(_, e)| e)?;
+        assert!(shm.exists());
+        fs::set_permissions(&shm, fs::Permissions::from_mode(0o400))?;
+        let ro_shm = open_existing(
+            acquire_state_lock(&db.dir)?,
+            OpenMode::ServeAutoMigrate,
+            db.expected(),
+            &db.config,
+            Arc::clone(&db.clock),
+        );
+        assert!(matches!(ro_shm, Err(StorageError::ReadOnlyDatabase)));
+        fs::set_permissions(&shm, fs::Permissions::from_mode(0o600))?;
+    }
+
     // Mode 0400 database with an uncheckpointed WAL fails as ReadOnlyDatabase (non-root)
     // without mutating the WAL.
+    let before_wal = fs::read(&wal)?;
     fs::set_permissions(&wal, fs::Permissions::from_mode(0o400))?;
     fs::set_permissions(db.path(), fs::Permissions::from_mode(0o400))?;
     let writable = fs::OpenOptions::new().write(true).open(db.path()).is_ok();
@@ -437,6 +490,9 @@ fn open_existing_enforces_private_permissions_links_and_early_readonly_checks() 
     }
     fs::set_permissions(db.path(), fs::Permissions::from_mode(0o600))?;
     fs::set_permissions(&wal, fs::Permissions::from_mode(0o600))?;
+    if shm.exists() {
+        fs::set_permissions(&shm, fs::Permissions::from_mode(0o600))?;
+    }
     assert_eq!(db.open(OpenMode::ServeAutoMigrate)?.hub_id(), &db.id);
     Ok(())
 }

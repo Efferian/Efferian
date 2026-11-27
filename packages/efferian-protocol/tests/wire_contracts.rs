@@ -404,6 +404,32 @@ fn receipt_checks_canonical_base64_and_combined_limits_before_lossy_decoding() -
     assert!(receipt.decode_and_validate_output(4).is_ok());
     let summary = receipt.summary(Some(5))?;
     assert!(validate_terminal_summary(receipt.state, &summary, true, false).is_ok());
+    let make_event_json = |code: &str| {
+        json!({
+            "type": "event",
+            "event": {
+                "seq": 1,
+                "event_id": EventId::new(),
+                "source_kind": "hub",
+                "source_id": HubId::new(),
+                "kind": "execution.finished",
+                "aggregate_type": "execution",
+                "aggregate_id": receipt.execution_id,
+                "actor_id": ActorId::Node(NodeId::new()),
+                "created_at_ms": 1,
+                "payload": {
+                    "execution_id": receipt.execution_id,
+                    "state": "failed",
+                    "profile_id": null,
+                    "tool_id": ToolId::new(),
+                    "public_name": "run",
+                    "error_code": code
+                }
+            }
+        })
+    };
+    assert!(serde_json::from_value::<EventStreamFrame>(make_event_json(&max_code)).is_ok());
+    assert!(serde_json::from_value::<ExecutionSummary>(json!({"error_code": max_code})).is_ok());
     for bad_code in [
         String::new(),
         "has space".to_owned(),
@@ -435,28 +461,10 @@ fn receipt_checks_canonical_base64_and_combined_limits_before_lossy_decoding() -
             validate_terminal_summary(TerminalExecutionState::Failed, &bad_summary, false, false)
                 .is_err()
         );
-        let bad_event = json!({
-            "type": "event",
-            "event": {
-                "seq": 1,
-                "event_id": EventId::new(),
-                "source_kind": "hub",
-                "source_id": HubId::new(),
-                "kind": "execution.finished",
-                "aggregate_type": "execution",
-                "aggregate_id": receipt.execution_id,
-                "actor_id": ActorId::Node(NodeId::new()),
-                "created_at_ms": 1,
-                "payload": {
-                    "execution_id": receipt.execution_id,
-                    "state": "failed",
-                    "tool_id": ToolId::new(),
-                    "public_name": "run",
-                    "error_code": bad_code
-                }
-            }
-        });
-        assert!(serde_json::from_value::<EventStreamFrame>(bad_event).is_err());
+        assert!(
+            serde_json::from_value::<ExecutionSummary>(json!({"error_code": bad_code})).is_err()
+        );
+        assert!(serde_json::from_value::<EventStreamFrame>(make_event_json(&bad_code)).is_err());
     }
     assert!(
         validate_terminal_summary(

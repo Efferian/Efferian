@@ -264,6 +264,18 @@ pub fn open_existing(
         }));
     }
 
+    // `is_readonly("main")` checks only the main file; verify existing sidecars
+    // are writable before SQLite opens them or attempts WAL recovery.
+    for (present, name) in [
+        (wal_existed, WAL_FILE),
+        (shm_existed, SHM_FILE),
+        (journal_existed, SIDECARS[2]),
+    ] {
+        if present {
+            check_private_writable(&path.join(name))?;
+        }
+    }
+
     if journal_existed {
         preflight_rollback_journal(path, mode, &expected, config, wal_existed)?;
     }
@@ -461,6 +473,21 @@ fn entry_metadata(path: &Path) -> io::Result<Option<Metadata>> {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+fn check_private_writable(path: &Path) -> Result<(), StorageError> {
+    match PrivateFs::verify_private_file_writable(path) {
+        Ok(()) => Ok(()),
+        Err(PlatformError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            Err(StorageError::ReadOnlyDatabase)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 

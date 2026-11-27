@@ -37,9 +37,33 @@ pub enum RevocationReason {
     PrincipalPermissionsReduced(PrincipalId),
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyPayload {}
+struct EmptyPayload;
+
+impl<'de> Deserialize<'de> for EmptyPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EmptyMapVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EmptyMapVisitor {
+            type Value = EmptyPayload;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an empty JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom("unexpected event payload field"));
+                }
+                Ok(EmptyPayload)
+            }
+        }
+
+        deserializer.deserialize_map(EmptyMapVisitor)
+    }
+}
 
 impl WriteTx<'_> {
     /// Persist the event and capture its authorization target in the same savepoint.
@@ -78,6 +102,8 @@ impl WriteTx<'_> {
                 if auth.node_id != payload.node_id || auth.profile_id != payload.profile_id {
                     return Err(StorageError::InvalidDatabase("event projection mismatch"));
                 }
+                efferian_protocol::validate_error_code(payload.error_code.as_deref())
+                    .map_err(|_| StorageError::InvalidDatabase("invalid execution error code"))?;
                 serde_json::to_string(payload).map_err(json_write_error)?
             }
             Event::NodeConnected(node_id)
