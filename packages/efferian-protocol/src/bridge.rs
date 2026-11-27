@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 use crate::{
     ExecutionId, ExecutionSummary, HubId, MAX_OUTPUT_BYTES, NodeId, OutputDiscardedReason,
     PlatformOs, ResolvedAction, SecretString, TerminalExecutionState, ValidationError, error_codes,
-    result::{DecodedOutput, decode_output, validate_error_message},
+    result::{DecodedOutput, decode_output, validate_error_code, validate_error_message},
     wire::{deserialize_object, strict_struct},
 };
 
@@ -190,6 +190,7 @@ impl ExecuteResPayload {
         {
             return Err(ValidationError::InvalidReceipt);
         }
+        validate_error_code(self.error_code.as_deref())?;
         validate_error_message(self.error_message.as_deref())
     }
 

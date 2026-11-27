@@ -26,9 +26,14 @@ impl PrincipalView {
 
         if !self.principal_id.matches_kind(self.kind)
             || (self.owner_principal_id.is_some() && self.kind != Agent)
+            || (self.managed_by_principal_id.is_some() && self.kind != Agent)
             || (self.inherit_owner_bindings && self.owner_principal_id.is_none())
             || (self.is_orchestrator && self.kind != Service)
             || (!self.allowed_node_tags.is_empty() && !self.is_orchestrator)
+            || self
+                .allowed_node_tags
+                .iter()
+                .any(|tag| efferian_protocol::validate_node_tag(tag).is_err())
             || (self.observe_executions && self.kind != Service)
         {
             return Err(AuthzError::InvalidAuthContext);

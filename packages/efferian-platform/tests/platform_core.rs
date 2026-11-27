@@ -189,6 +189,20 @@ fn private_reads_enforce_permissions_links_type_and_size() -> TestResult {
     for allowed in [0o400, 0o600] {
         set_mode(&path, allowed)?;
         assert_eq!(PrivateFs::read_private_file(&path, 5)?, b"bytes");
+        assert_eq!(PrivateFs::verify_private_file(&path)?, 5);
+        let writable = fs::OpenOptions::new().write(true).open(&path).is_ok();
+        assert_eq!(
+            PrivateFs::verify_private_file_writable(&path).is_ok(),
+            writable
+        );
+        let mut header = [0u8; 3];
+        assert_eq!(PrivateFs::read_private_file_header(&path, &mut header)?, 5);
+        assert_eq!(&header, b"byt");
+        let mut too_long = [0u8; 6];
+        assert!(matches!(
+            PrivateFs::read_private_file_header(&path, &mut too_long),
+            Err(PlatformError::Io { source, .. }) if source.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
         assert!(matches!(
             PrivateFs::read_private_file(&path, 4),
             Err(PlatformError::FileTooLarge { max_bytes: 4, .. })
@@ -199,6 +213,16 @@ fn private_reads_enforce_permissions_links_type_and_size() -> TestResult {
         assert!(
             matches!(PrivateFs::read_private_file(&path, 5), Err(PlatformError::InsecurePermissions { mode, .. }) if mode == rejected)
         );
+        assert!(
+            matches!(PrivateFs::verify_private_file(&path), Err(PlatformError::InsecurePermissions { mode, .. }) if mode == rejected)
+        );
+        assert!(
+            matches!(PrivateFs::verify_private_file_writable(&path), Err(PlatformError::InsecurePermissions { mode, .. }) if mode == rejected)
+        );
+        let mut header = [0u8; 3];
+        assert!(
+            matches!(PrivateFs::read_private_file_header(&path, &mut header), Err(PlatformError::InsecurePermissions { mode, .. }) if mode == rejected)
+        );
     }
     set_mode(&path, 0o600)?;
 
@@ -208,16 +232,45 @@ fn private_reads_enforce_permissions_links_type_and_size() -> TestResult {
         PrivateFs::read_private_file(&special, 5),
         Err(PlatformError::SymlinkNotAllowed { .. })
     ));
+    assert!(matches!(
+        PrivateFs::verify_private_file(&special),
+        Err(PlatformError::SymlinkNotAllowed { .. })
+    ));
+    assert!(matches!(
+        PrivateFs::verify_private_file_writable(&special),
+        Err(PlatformError::SymlinkNotAllowed { .. })
+    ));
+    let mut header = [0u8; 3];
+    assert!(matches!(
+        PrivateFs::read_private_file_header(&special, &mut header),
+        Err(PlatformError::SymlinkNotAllowed { .. })
+    ));
     fs::remove_file(&special)?;
     fs::hard_link(&path, &special)?;
     assert!(matches!(
         PrivateFs::read_private_file(&path, 5),
         Err(PlatformError::InvalidHardLinkCount { nlink: 2, .. })
     ));
+    assert!(matches!(
+        PrivateFs::verify_private_file(&path),
+        Err(PlatformError::InvalidHardLinkCount { nlink: 2, .. })
+    ));
+    assert!(matches!(
+        PrivateFs::verify_private_file_writable(&path),
+        Err(PlatformError::InvalidHardLinkCount { nlink: 2, .. })
+    ));
+    assert!(matches!(
+        PrivateFs::read_private_file_header(&path, &mut header),
+        Err(PlatformError::InvalidHardLinkCount { nlink: 2, .. })
+    ));
     fs::remove_file(&special)?;
     fifo(&special)?;
     assert!(matches!(
         PrivateFs::read_private_file(&special, 5),
+        Err(PlatformError::UnexpectedFileType { .. })
+    ));
+    assert!(matches!(
+        PrivateFs::verify_private_file(&special),
         Err(PlatformError::UnexpectedFileType { .. })
     ));
     assert!(matches!(

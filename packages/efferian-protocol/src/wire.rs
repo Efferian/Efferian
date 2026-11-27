@@ -55,8 +55,38 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct WireString<'a>(#[serde(borrow)] pub(crate) Cow<'a, str>);
+pub(crate) struct WireString<'a>(pub(crate) Cow<'a, str>);
+
+impl<'de> Deserialize<'de> for WireString<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WireStringVisitor;
+
+        impl<'de> Visitor<'de> for WireStringVisitor {
+            type Value = WireString<'de>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                value: &'de str,
+            ) -> Result<Self::Value, E> {
+                Ok(WireString(Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(WireString(Cow::Owned(value.to_owned())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(WireString(Cow::Owned(value)))
+            }
+        }
+
+        deserializer.deserialize_str(WireStringVisitor)
+    }
+}
 
 // Internally tagged enums may be nested inside Serde's buffered content, where
 // numeric identifiers can mean variant indexes. Enforce text at the tag field

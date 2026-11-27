@@ -16,7 +16,11 @@ reqwest = { workspace = true }
 rmcp = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sse-stream = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
