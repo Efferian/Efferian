@@ -130,7 +130,8 @@ async fn list_tools(
                         &ctx,
                         edition.profile_id,
                         &binding,
-                        &revision.definition
+                        &revision.definition,
+                        true,
                     )?,
                     Visibility::Hidden,
                 ) {
@@ -186,6 +187,7 @@ async fn get_tool(
                 edition.profile_id,
                 binding,
                 &revision.definition,
+                false,
             )?;
             let available_targets = match visible {
                 Visibility::Hidden => return Err(ApiError::not_found()),
@@ -225,6 +227,7 @@ fn tool_visibility(
     profile_id: ProfileId,
     binding: &ProfileToolBinding,
     definition: &ToolDefinition,
+    first_only: bool,
 ) -> ApiResult<Visibility> {
     match &definition.spec {
         ToolSpec::UpstreamRef {
@@ -253,7 +256,14 @@ fn tool_visibility(
         }
         spec => {
             let selector = spec.target_selector().ok_or_else(ApiError::internal)?;
-            let nodes = discovery_targets(conn, ctx, profile_id, selector, binding.fixed_node_id)?;
+            let nodes = discovery_targets(
+                conn,
+                ctx,
+                profile_id,
+                selector,
+                binding.fixed_node_id,
+                first_only,
+            )?;
             if nodes.is_empty() {
                 Ok(Visibility::Hidden)
             } else {

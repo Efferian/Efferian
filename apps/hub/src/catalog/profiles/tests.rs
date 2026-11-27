@@ -94,6 +94,17 @@ async fn publish_pins_an_immutable_tool_and_republishes_a_disabled_edition() -> 
             .0,
         StatusCode::NOT_FOUND
     );
+    let (status, problem) = hub
+        .request_admin(Method::PUT, "/v1/profiles/one", Some(json!(["full", []])))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(problem["code"], "invalid_input");
+    assert_eq!(
+        hub.request_admin(Method::GET, "/v1/profiles/one", None)
+            .await?
+            .0,
+        StatusCode::NOT_FOUND
+    );
     let (status, profile) = hub
         .request_admin(Method::PUT, "/v1/profiles/one", Some(draft.clone()))
         .await?;

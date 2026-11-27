@@ -5,8 +5,8 @@ use serde::{
     de::{DeserializeSeed, IntoDeserializer, MapAccess, Visitor, value::MapAccessDeserializer},
 };
 
-/// Serde's default struct decoder also accepts positional sequences.
-pub(crate) fn deserialize_object<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+/// Decode named fields from a wire object, rejecting positional sequences.
+pub fn deserialize_object<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,

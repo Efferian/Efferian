@@ -227,6 +227,8 @@ pub(super) fn read_execution_page(
     let params = scope_parameters(ctx)?;
     // Push visibility before the SQL limit. Recheck the authoritative policy
     // on returned rows to keep this projection fail closed if the policy evolves.
+    // Keep the timestamp bound indexable even on the first page. The tuple
+    // predicate handles the exclusive cursor within a shared timestamp.
     let mut stmt = conn.prepare_cached(select_execution!(
         "WHERE (:admin OR (
              (e.caller_principal_id = :caller OR p.owner_principal_id = :caller)
@@ -238,7 +240,8 @@ pub(super) fn read_execution_page(
          AND (:profile IS NULL OR e.profile_id = :profile)
          AND (:node IS NULL OR e.node_id = :node)
          AND (:tool IS NULL OR e.tool_id = :tool)
-         AND (:created IS NULL OR (e.created_at_ms, e.execution_id) < (:created, :cursor))
+         AND e.created_at_ms <= :created
+         AND (:cursor IS NULL OR (e.created_at_ms, e.execution_id) < (:created, :cursor))
          ORDER BY e.created_at_ms DESC, e.execution_id COLLATE BINARY DESC
          LIMIT :limit"
     ))?;
@@ -254,7 +257,7 @@ pub(super) fn read_execution_page(
                 ":profile": query.profile_id.map(|id| id.to_string()),
                 ":node": query.node_id.map(|id| id.to_string()),
                 ":tool": query.tool_id.map(|id| id.to_string()),
-                ":created": cursor.map(|(created, _)| created),
+                ":created": cursor.map_or(i64::MAX, |(created, _)| created),
                 ":cursor": cursor.map(|(_, id)| id.to_string()),
                 ":limit": limit + 1,
             },

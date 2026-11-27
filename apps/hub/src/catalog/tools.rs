@@ -56,6 +56,7 @@ pub(crate) struct ToolSummary {
 pub(crate) struct ToolDetail {
     #[serde(flatten)]
     pub(crate) summary: ToolSummary,
+    /// Upstream tools expose the effective revision annotations and omit the discovery-supplied input schema.
     pub(crate) definition: ToolDefinition,
 }
 
@@ -63,7 +64,6 @@ impl ToolDetail {
     fn authoring_view(mut self) -> Self {
         if self.summary.kind == ToolKind::UpstreamRef {
             self.definition.input_schema = None;
-            self.definition.annotations = None;
         }
         self
     }

@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,16 +100,20 @@ fn exact_node(conn: &Connection, target: &str) -> rusqlite::Result<Option<NodeCa
         .optional()
 }
 
-fn nodes_for_selector(
+fn visit_selector_nodes(
     conn: &Connection,
+    ctx: &AuthContext,
     selector: &TargetSelector,
     fixed: Option<NodeId>,
-) -> ApiResult<Vec<NodeCandidate>> {
+    mut visit: impl FnMut(NodeCandidate) -> ApiResult<ControlFlow<()>>,
+) -> ApiResult<()> {
     if let Some(node_id) = fixed {
-        return Ok(exact_node(conn, &node_id.to_string())?
-            .filter(|node| node.matches(selector, fixed))
-            .into_iter()
-            .collect());
+        if let Some(node) = exact_node(conn, &node_id.to_string())?
+            && node.matches(selector, fixed)
+        {
+            let _ = visit(node)?;
+        }
+        return Ok(());
     }
     let (condition, value) = match selector {
         TargetSelector::Fixed { node_ids } => (
@@ -120,12 +125,21 @@ fn nodes_for_selector(
             tag.clone(),
         ),
     };
-    let sql = format!("{ACTIVE_NODE_COLUMNS} AND {condition} ORDER BY name COLLATE BINARY");
-    let mut rows = conn.prepare_cached(&sql)?;
-    let candidates = rows
-        .query_map([value], NodeCandidate::read)?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(candidates)
+    let mut sql = format!("{ACTIVE_NODE_COLUMNS} AND {condition}");
+    let mut parameters = vec![value];
+    if let Some(allowed) = &ctx.token.allowed_nodes {
+        sql.push_str(" AND node_id IN (SELECT value FROM json_each(?2))");
+        parameters.push(serde_json::to_string(allowed).map_err(|_| ApiError::internal())?);
+    }
+    sql.push_str(" ORDER BY name COLLATE BINARY");
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
+    while let Some(row) = rows.next()? {
+        if visit(NodeCandidate::read(row)?)?.is_break() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn visible_node(ctx: &AuthContext, profile_id: ProfileId, node: &NodeCandidate) -> ApiResult<bool> {
@@ -142,16 +156,21 @@ pub(super) fn discovery_targets(
     profile_id: ProfileId,
     selector: &TargetSelector,
     fixed: Option<NodeId>,
+    first_only: bool,
 ) -> ApiResult<Vec<AvailableTarget>> {
     let mut visible = Vec::new();
-    for node in nodes_for_selector(conn, selector, fixed)? {
+    visit_selector_nodes(conn, ctx, selector, fixed, |node| {
         if visible_node(ctx, profile_id, &node)? {
             visible.push(AvailableTarget {
                 node_id: node.auth.node_id,
                 name: node.name,
             });
+            if first_only {
+                return Ok(ControlFlow::Break(()));
+            }
         }
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(visible)
 }
 
@@ -573,7 +592,12 @@ pub(super) fn resolve_candidate(
                     _ => Vec::new(),
                 }
             } else {
-                nodes_for_selector(conn, selector, fixed)?
+                let mut nodes = Vec::new();
+                visit_selector_nodes(conn, ctx, selector, fixed, |node| {
+                    nodes.push(node);
+                    Ok(ControlFlow::Continue(()))
+                })?;
+                nodes
             };
             let candidates = match profile {
                 Some(id) => checked_candidates(ctx, id, candidates)?,

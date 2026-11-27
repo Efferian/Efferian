@@ -245,7 +245,10 @@ async fn put(
             let existing = binding_at(conn, principal_id, upstream_id)?;
             let outcome = match &existing {
                 Some(binding) if binding.account_id == account.account_id => Outcome::Unchanged,
-                Some(_) => Outcome::Updated,
+                Some(binding) => {
+                    authorize_removal(conn, &ctx, upstream, &subject, binding)?;
+                    Outcome::Updated
+                },
                 None => Outcome::Created,
             };
             if matches!(outcome, Outcome::Unchanged) && let Some(binding) = existing {
@@ -309,17 +312,7 @@ async fn delete(
             let subject = binding_subject(conn, &ctx, admin, principal_id)?;
             let existing =
                 binding_at(conn, principal_id, upstream_id)?.ok_or_else(ApiError::not_found)?;
-            let account =
-                account_by_id(conn, existing.account_id)?.ok_or_else(ApiError::not_found)?;
-            authorize_binding_mutation(
-                &ctx,
-                Some(upstream),
-                &subject,
-                &account.view(),
-                BindingMutation::Remove {
-                    existing: existing.view(),
-                },
-            )?;
+            authorize_removal(conn, &ctx, upstream, &subject, &existing)?;
             conn.execute(
                 "DELETE FROM account_bindings WHERE principal_id = ?1 AND upstream_id = ?2",
                 params![principal_id.to_string(), upstream_id.to_string()],
@@ -334,6 +327,26 @@ async fn delete(
         })
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn authorize_removal(
+    conn: &Connection,
+    ctx: &AuthContext,
+    upstream: BindingUpstream<'_>,
+    subject: &PrincipalView,
+    binding: &AccountBindingMetadata,
+) -> ApiResult<()> {
+    let account = account_by_id(conn, binding.account_id)?.ok_or_else(ApiError::not_found)?;
+    authorize_binding_mutation(
+        ctx,
+        Some(upstream),
+        subject,
+        &account.view(),
+        BindingMutation::Remove {
+            existing: binding.view(),
+        },
+    )?;
+    Ok(())
 }
 
 fn parse_subject(principal: &str, caller: PrincipalId) -> ApiResult<PrincipalId> {

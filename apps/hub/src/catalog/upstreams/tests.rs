@@ -458,3 +458,52 @@ async fn malformed_or_large_discovery_preserves_the_last_successful_cache() -> T
     hub.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn upstream_tool_detail_preserves_effective_annotations_across_read_and_put() -> TestResult {
+    let (hub, _, mut pending) = start().await?;
+    let (status, upstream) = put(&hub, "https://example.com/mcp", json!({})).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = serde_json::from_value(upstream["upstream"]["upstream_id"].clone())?;
+    let refresh = discover(&hub, json!({}));
+    let (_, send) = next_call(&mut pending).await?;
+    let mut discovered = tool(id, "echo");
+    let inherited = json!({"title": "Upstream hint", "read_only_hint": true});
+    discovered.annotations = Some(serde_json::from_value(inherited.clone())?);
+    respond(send, Ok(vec![discovered]));
+    assert_eq!(refresh.await??.0, StatusCode::OK);
+
+    for (slug, authored) in [
+        ("inherited", None),
+        (
+            "custom",
+            Some(json!({"title":"Operator hint", "destructive_hint":true})),
+        ),
+    ] {
+        let uri = format!("/v1/tools/{slug}");
+        let mut definition = json!({"spec": {"kind":"upstream_ref", "upstream_id":id, "upstream_tool_name":"echo", "account_mode":"none", "runtime_ms":1000}});
+        if let Some(annotations) = &authored {
+            definition["annotations"] = annotations.clone();
+        }
+        let (status, created) = hub
+            .request_admin(Method::PUT, &uri, Some(definition))
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let (status, detail) = hub.request_admin(Method::GET, &uri, None).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail, created["tool"]);
+        assert!(detail["definition"].get("input_schema").is_none());
+        assert_eq!(
+            &detail["definition"]["annotations"],
+            authored.as_ref().unwrap_or(&inherited)
+        );
+        let (status, replay) = hub
+            .request_admin(Method::PUT, &uri, Some(detail["definition"].clone()))
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["outcome"], "unchanged");
+        assert_eq!(replay["tool"]["current_version"], 1);
+    }
+    hub.shutdown().await;
+    Ok(())
+}

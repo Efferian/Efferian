@@ -11905,7 +11905,8 @@
             ],
             "properties": {
               "definition": {
-                "$ref": "#/components/schemas/ToolDefinition"
+                "$ref": "#/components/schemas/ToolDefinition",
+                "description": "Upstream tools expose the effective revision annotations and omit the discovery-supplied input schema."
               }
             }
           }

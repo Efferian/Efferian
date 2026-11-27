@@ -424,6 +424,15 @@ async fn bindings_use_pinned_visibility_and_hide_foreign_accounts() -> TestResul
     assert_eq!(overwritten["outcome"], "updated");
     let (status, problem) = hub.request(Method::DELETE, binding, &alice, None).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    let (status, problem) = hub
+        .request(
+            Method::PUT,
+            binding,
+            &alice,
+            Some(json!({"account_slug": "common"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     let (status, _) = hub
         .request(
             Method::PUT,
@@ -455,6 +464,22 @@ async fn bindings_use_pinned_visibility_and_hide_foreign_accounts() -> TestResul
     assert_eq!(metadata, account["account"]);
     let (status, problem) = hub.request(Method::DELETE, detached, &bobby, None).await?;
     assert_eq!(status, StatusCode::NO_CONTENT, "{problem}");
+
+    let (status, _) = hub.request(Method::DELETE, binding, &bobby, None).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, problem) = hub.request(Method::DELETE, path, &bobby, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+    assert_eq!(problem["code"], "resource_in_use");
+    let (status, _) = hub
+        .request_admin(
+            Method::DELETE,
+            &format!("/v1/account-bindings/{bobby_id}/visible"),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = hub.request(Method::DELETE, path, &bobby, None).await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     hub.shutdown().await;
     Ok(())

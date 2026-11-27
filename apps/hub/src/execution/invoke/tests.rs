@@ -5,6 +5,7 @@ mod writer;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use efferian_protocol::{
@@ -602,8 +603,7 @@ impl UpstreamDispatcher for RemoteMock {
     }
 }
 
-#[tokio::test]
-async fn caller_bound_uses_each_members_account_and_never_falls_back() -> TestResult {
+async fn caller_bound_fixture() -> TestResult<(TestHub, Arc<RemoteMock>, Value)> {
     let remote = Arc::new(RemoteMock::default());
     let hub = TestHub::start_with_dispatchers(
         "caller-bound",
@@ -642,6 +642,12 @@ async fn caller_bound_uses_each_members_account_and_never_falls_back() -> TestRe
     )
     .await?;
     publish(&hub, tool, "remote", 1, "auto", None).await?;
+    Ok((hub, remote, upstream_id))
+}
+
+#[tokio::test]
+async fn caller_bound_uses_each_members_account_and_never_falls_back() -> TestResult {
+    let (hub, remote, upstream_id) = caller_bound_fixture().await?;
     let (_, a) = member(&hub, "member-a", None).await?;
     let (member_b, b) = member(&hub, "member-b", None).await?;
     let invoke = "/v1/profiles/demo/invoke";
@@ -815,62 +821,7 @@ async fn archived_invocations_fail_closed_when_a_dependency_was_deleted() -> Tes
     Ok(())
 }
 
-#[tokio::test]
-async fn owner_disable_after_http_auth_hides_an_explicit_out_of_scope_target() -> TestResult {
-    use std::time::Duration;
-
-    use axum::Router;
-    use axum::body::{Body, to_bytes};
-    use http::Request;
-    use tokio::sync::oneshot;
-    use tower_service::Service;
-
-    type PendingRequest = (
-        oneshot::Sender<()>,
-        tokio::task::JoinHandle<TestResult<(StatusCode, Value)>>,
-    );
-
-    async fn hold_body(
-        mut router: Router,
-        token: &str,
-        payload: Value,
-    ) -> TestResult<PendingRequest> {
-        let (entered, ready) = oneshot::channel();
-        let (release, blocked) = oneshot::channel();
-        let bytes = Bytes::from(serde_json::to_vec(&payload)?);
-        let body = Body::from_stream(futures_util::stream::once(async move {
-            let _ = entered.send(());
-            blocked.await.map_err(std::io::Error::other)?;
-            Ok::<Bytes, std::io::Error>(bytes)
-        }));
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/profiles/demo/invoke")
-            .header("host", "localhost:8080")
-            .header("authorization", format!("Bearer {token}"))
-            .header("content-type", "application/json")
-            .body(body)?;
-        let pending = tokio::spawn(async move {
-            let response = router.call(request).await?;
-            let status = response.status();
-            let bytes = to_bytes(response.into_body(), 64 * 1024).await?;
-            Ok((status, serde_json::from_slice(&bytes)?))
-        });
-        tokio::time::timeout(Duration::from_secs(5), ready).await??;
-        Ok((release, pending))
-    }
-
-    let now = RequestId::new().timestamp_ms();
-    let (hub, bridge, visible, _) = managed_fixture(now).await?;
-    let hidden = seed_node(&hub, "node-hidden", "[\"test\"]").await?;
-    let tag = put_tool(
-        &hub,
-        command("/bin/echo", json!({"kind": "tag", "tag": "test"})),
-        StatusCode::OK,
-    )
-    .await?;
-    publish(&hub, tag, "tag", 2, "async", None).await?;
-    let (owner, _) = member(&hub, "owner", None).await?;
+async fn create_owned_agent(hub: &TestHub, owner: PrincipalId) -> TestResult<PrincipalId> {
     let (status, agent) = hub
         .request_admin(
             Method::PUT,
@@ -892,6 +843,62 @@ async fn owner_disable_after_http_auth_hides_an_explicit_out_of_scope_target() -
         )
         .await?;
     assert_eq!(status, StatusCode::CREATED, "{grant}");
+    Ok(agent)
+}
+
+type PendingRequest = (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<TestResult<(StatusCode, Value)>>,
+);
+
+async fn hold_body(
+    mut router: axum::Router,
+    token: &str,
+    payload: Value,
+) -> TestResult<PendingRequest> {
+    use axum::body::{Body, to_bytes};
+    use http::Request;
+    use tower_service::Service;
+
+    let (entered, ready) = oneshot::channel();
+    let (release, blocked) = oneshot::channel();
+    let bytes = Bytes::from(serde_json::to_vec(&payload)?);
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        let _ = entered.send(());
+        blocked.await.map_err(std::io::Error::other)?;
+        Ok::<Bytes, std::io::Error>(bytes)
+    }));
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/profiles/demo/invoke")
+        .header("host", "localhost:8080")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(body)?;
+    let pending = tokio::spawn(async move {
+        let response = router.call(request).await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await?;
+        Ok((status, serde_json::from_slice(&bytes)?))
+    });
+    tokio::time::timeout(Duration::from_secs(5), ready).await??;
+    Ok((release, pending))
+}
+
+#[tokio::test]
+async fn owner_disable_after_http_auth_hides_an_explicit_out_of_scope_target() -> TestResult {
+    let now = RequestId::new().timestamp_ms();
+    let (hub, bridge, visible, _) = managed_fixture(now).await?;
+    let hidden = seed_node(&hub, "node-hidden", "[\"test\"]").await?;
+    let tag = put_tool(
+        &hub,
+        command("/bin/echo", json!({"kind": "tag", "tag": "test"})),
+        StatusCode::OK,
+    )
+    .await?;
+    publish(&hub, tag, "tag", 2, "async", None).await?;
+    let (owner, _) = member(&hub, "owner", None).await?;
+    let agent = create_owned_agent(&hub, owner).await?;
     let token = mint(&hub, agent, Some(vec![visible])).await?;
     let payload = json!({"public_name": "tag", "arguments": {"text": "pending"}});
     let (allow, allowed) = hold_body(hub.router.clone(), &token, payload.clone()).await?;
@@ -923,6 +930,66 @@ async fn owner_disable_after_http_auth_hides_an_explicit_out_of_scope_target() -
     assert!(problem.get("extensions").is_none());
     assert!(bridge.sent.lock().unwrap().is_empty());
 
+    hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_disable_after_http_auth_preserves_caller_bound_error_scope() -> TestResult {
+    let (hub, remote, _) = caller_bound_fixture().await?;
+    let (owner, _) = member(&hub, "owner", None).await?;
+    let agent = create_owned_agent(&hub, owner).await?;
+    let invoke = mint(&hub, agent, None).await?;
+    let (status, response) = hub
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({
+                "principal_id": agent, "label": "discover", "max_capability": "discover"
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let discover = response["token"].as_str().ok_or("missing token")?;
+    let body = json!({"public_name": "remote"});
+    let (allow, pending_invoke) = hold_body(hub.router.clone(), &invoke, body.clone()).await?;
+    let (limit, pending_discover) = hold_body(hub.router.clone(), discover, body).await?;
+    let (status, _) = hub
+        .request_admin(
+            Method::POST,
+            &format!("/v1/principals/{owner}/disable"),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    allow.send(()).map_err(|_| "invoke request dropped")?;
+    limit.send(()).map_err(|_| "discover request dropped")?;
+    let (status, problem) =
+        tokio::time::timeout(Duration::from_secs(5), pending_invoke).await???;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(problem["code"], "account_not_bound");
+    assert_eq!(
+        problem["extensions"],
+        json!({"reason": "owner_disabled", "upstream_slug": "example"})
+    );
+    let (status, problem) =
+        tokio::time::timeout(Duration::from_secs(5), pending_discover).await???;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(problem["code"], "forbidden");
+    assert!(problem.get("extensions").is_none());
+    let executions = hub
+        .state
+        .storage
+        .read_snapshot(|conn| {
+            Ok::<_, crate::storage::StorageError>(conn.query_row(
+                "SELECT count(*) FROM executions",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(executions, 0);
+    assert!(remote.auths.lock().unwrap().is_empty());
     hub.shutdown().await;
     Ok(())
 }
