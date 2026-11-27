@@ -244,7 +244,12 @@ impl UpstreamReservation {
     pub(crate) async fn claim_start(&mut self) -> Option<UpstreamCancellation> {
         loop {
             match self.control.claim_start(self.execution_id) {
-                StartDecision::Claimed => return Some(UpstreamCancellation(self.receiver.clone())),
+                StartDecision::Claimed => {
+                    return Some(UpstreamCancellation {
+                        phase: self.receiver.clone(),
+                        shutdown: self.control.shutdown_receiver(),
+                    });
+                }
                 StartDecision::Finished => return None,
                 StartDecision::Wait => {
                     self.receiver
@@ -258,7 +263,10 @@ impl UpstreamReservation {
 }
 
 #[derive(Clone)]
-pub(crate) struct UpstreamCancellation(watch::Receiver<UpstreamPhase>);
+pub(crate) struct UpstreamCancellation {
+    phase: watch::Receiver<UpstreamPhase>,
+    shutdown: watch::Receiver<bool>,
+}
 
 impl UpstreamCancellation {
     /// Order a nonblocking transport handoff against the cancellation write.
@@ -266,11 +274,15 @@ impl UpstreamCancellation {
     /// The handoff must return promptly and must not reenter cancellation.
     pub(crate) async fn start_io<T>(&mut self, handoff: impl FnOnce() -> T) -> Option<T> {
         let phase = self
-            .0
+            .phase
             .wait_for(|phase| !phase.cancellation_staged())
             .await
             .ok()?;
-        let result = matches!(*phase, UpstreamPhase::Started).then(handoff);
+        // Stop publishes the global signal before visiting each reservation.
+        // Hold both reads so either the handoff or the stop wins that order.
+        let shutdown = self.shutdown.borrow();
+        let result = (!*shutdown && matches!(*phase, UpstreamPhase::Started)).then(handoff);
+        drop(shutdown);
         drop(phase);
         result
     }
@@ -278,10 +290,10 @@ impl UpstreamCancellation {
     /// Resolves for committed cancellation, Hub stop, or a retired reservation.
     #[allow(dead_code, reason = "the live upstream transport observes this signal")]
     pub(crate) async fn cancelled(&mut self) {
-        let _ = self
-            .0
-            .wait_for(|phase| matches!(phase, UpstreamPhase::Cancelled))
-            .await;
+        tokio::select! {
+            _ = self.shutdown.wait_for(|&stopping| stopping) => {}
+            _ = self.phase.wait_for(|phase| matches!(phase, UpstreamPhase::Cancelled)) => {}
+        }
     }
 }
 
@@ -398,5 +410,38 @@ async fn close_executions(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestResult;
+
+    #[tokio::test]
+    async fn global_stop_fences_a_slot_before_its_local_cancel_signal() -> TestResult {
+        let control = Arc::new(ExecutionControl::new(&Config::default()));
+        let mut reservation = control
+            .reserve_upstream(
+                ExecutionId::new(),
+                UpstreamId::new(),
+                PrincipalId::new_user(),
+            )
+            .ok_or("upstream reservation missing")?;
+        let mut cancellation = reservation
+            .claim_start()
+            .await
+            .ok_or("start claim missing")?;
+
+        // Simulate the interval after stop publishes its global signal and
+        // before it reaches this reservation while walking the slots.
+        control.shutdown.send_replace(true);
+        assert!(matches!(
+            *cancellation.phase.borrow(),
+            UpstreamPhase::Started
+        ));
+        assert!(cancellation.start_io(|| ()).await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled()).await?;
+        Ok(())
     }
 }

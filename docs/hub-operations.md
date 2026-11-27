@@ -61,6 +61,8 @@ In a node credential incident, revoke the node with `POST /v1/nodes/{id}/revoke`
 
 ## Publish and invoke tools
 
+The current `efferian-hub serve` uses offline Node and upstream dispatchers. The catalog and execution API are available with this setup. Live calls require the corresponding Node bridge or upstream HTTP adapter.
+
 An unrestricted Admin registers upstreams at `/v1/upstreams`, defines tools at `/v1/tools`, and sets profile bindings at `/v1/profiles`. An effective tool update creates an immutable revision. A profile binds public names to specific revisions and serves them after `POST /v1/profiles/{slug}/publish` creates an edition. Use `GET /v1/profiles/{slug}/tools` to list tools and `GET /v1/profiles/{slug}/tools/{public_name}` for the input schema and available targets. Profile, edition, tool and upstream disable routes take effect for new invocations. Resource deletion returns `409 resource_in_use` while active references exist.
 
 Members can store private accounts through `/v1/accounts` and bind them through `/v1/account-bindings/me/{upstream_slug}` where they can access a published caller-bound tool. An Admin can manage shared accounts and refresh an upstream's discovery cache explicitly. Account reads return metadata. Changing an upstream URL to a different origin requires removing its HTTP authentication accounts or creating a separate upstream.
