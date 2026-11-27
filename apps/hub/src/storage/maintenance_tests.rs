@@ -369,3 +369,41 @@ fn later_ttl_passes_vacuum_an_existing_freelist_without_new_deletions() -> TestR
     }
     Ok(())
 }
+
+#[test]
+fn periodic_token_gc_makes_progress_while_soft_pressure_remains_active() -> TestResult {
+    let f = Fixture::create(StorageConfig {
+        max_page_count: 256,
+        ..StorageConfig::default()
+    })?;
+    let db = f.open(OpenMode::OfflineExactVersion)?;
+    let conn = &db.conn;
+    conn.execute(
+        "INSERT INTO upstreams(upstream_id, slug, url, discovered_tools_json, created_at_ms, updated_at_ms)
+         VALUES ('large', 'large', 'https://example.test', zeroblob(740000), 0, 0)",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE auth_tokens SET revoked_at_ms = ?1",
+        [-db.config.token_gc_grace_ms],
+    )?;
+    let mut maintenance = Maintenance::new(&db)?;
+    assert!(maintenance.soft_active);
+    for _ in 0..20 {
+        seed_execution(conn, &f, f.principal, "succeeded", 100, 200, 1024)?;
+        maintenance.after_write(&db, true, 1024, 0, false)?;
+        maintenance.tick(&db, db.config.gc_interval)?;
+        assert!(
+            maintenance.soft_active,
+            "fixture must stay under soft pressure"
+        );
+    }
+    let revoked = conn.query_row("SELECT count(*) FROM auth_tokens", [], |row| {
+        row.get::<_, u32>(0)
+    })?;
+    assert_eq!(
+        revoked, 0,
+        "periodic revocation cleanup was starved by soft result GC"
+    );
+    Ok(())
+}

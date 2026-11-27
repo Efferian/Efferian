@@ -42,7 +42,7 @@ Only Node enables the Platform `process` feature. Its `ProcessHandle` owns the g
 
 The Hub storage module owns a single `hub.sqlite3` writer under the `hub.lock` sidecar. The database uses WAL, full synchronous commits by default and eight read-only connections for snapshots. State changes and their outbox events commit together. Live subscribers also receive a dedicated revocation feed and must invalidate cached permissions if it reports a gap or closes.
 
-The default database page budget is 4 GiB. At 75% used pages, background cleanup can discard retained execution output. At 85%, admission rejects new invocations while replays, revocations and finalization can use available pages. The page budget tracks logical SQLite capacity. These writes still require free filesystem space for the database and WAL.
+The default database page budget is 4 GiB. At 75% used pages, background cleanup can discard retained execution output. At 85%, admission rejects new invocations while replays, revocations and finalization can use available pages. The page budget tracks logical SQLite capacity. These writes still require free filesystem space for the database and WAL. If a restored snapshot needs rollback recovery, Hub verifies the recovered identity and page budget in private staging first. This requires temporary space for a copy.
 
 Run `make gate_sqlite_hygiene` to verify the schema, SQLite settings and read-only behavior in the pinned environment. `make test app=hub` also exercises process crashes, transaction rollback, bounded maintenance and recovery.
 

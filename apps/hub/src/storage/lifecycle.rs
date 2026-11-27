@@ -219,11 +219,8 @@ pub fn open_existing(
         }
     }
 
-    // A read-only preflight prevents rollback journal recovery from mutating an
-    // unvalidated database.
     if journal_existed {
-        let preflight = Connection::open_with_flags(&database, RO)?;
-        validate_identity(&preflight, mode, &expected, config, wal_existed)?;
+        preflight_rollback_journal(path, mode, &expected, config, wal_existed)?;
     }
 
     let conn = Connection::open_with_flags(database, RW)?;
@@ -240,6 +237,37 @@ pub fn open_existing(
         mode,
         lock,
     })
+}
+
+// SQLite can roll back a hot journal on the first read of an RW connection,
+// even with query_only enabled. Validate the recovered state before giving
+// SQLite write access to the original. An ordinary, cold journal needs no copy.
+fn preflight_rollback_journal(
+    path: &Path,
+    mode: OpenMode,
+    expected: &ExpectedHubIdentity,
+    config: &StorageConfig,
+    wal_existed: bool,
+) -> Result<(), StorageError> {
+    let reader = Connection::open_with_flags(path.join(DATABASE), RO)?;
+    match validate_identity(&reader, mode, expected, config, wal_existed) {
+        Ok(_) => return Ok(()),
+        Err(StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
+            if code.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK => {}
+        Err(error) => return Err(error),
+    }
+    drop(reader);
+
+    let scratch = PrivateFs::create_ephemeral_dir(path, STAGING_DIR)?;
+    for name in [DATABASE, SIDECARS[2]] {
+        fs::copy(path.join(name), scratch.path().join(name))?;
+    }
+    if wal_existed {
+        fs::copy(path.join(WAL_FILE), scratch.path().join(WAL_FILE))?;
+    }
+    let copy = Connection::open_with_flags(scratch.path().join(DATABASE), RW)?;
+    validate_identity(&copy, mode, expected, config, wal_existed)?;
+    Ok(())
 }
 
 fn validate_identity(

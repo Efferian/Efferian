@@ -303,12 +303,7 @@ impl DbActor {
     fn run(&mut self, db: &OpenedDb, mailbox: &Mailbox) -> Result<(), StorageError> {
         let mut timeout = Duration::ZERO;
         loop {
-            let max_work_commands = if self.maintenance.near_event_cap(db, MAX_COMMANDS) {
-                MAX_COMMANDS / 2
-            } else {
-                MAX_COMMANDS
-            };
-            let Some(turn) = mailbox.next(timeout, max_work_commands) else {
+            let Some(turn) = mailbox.next(timeout, self.maintenance.defer_work()) else {
                 return Ok(());
             };
             for (execution_id, reply) in turn.subscriptions {
@@ -757,12 +752,12 @@ impl Mailbox {
         state.subscriptions.clear();
     }
 
-    fn next(&self, timeout: Duration, max_work_commands: usize) -> Option<Turn> {
+    fn next(&self, timeout: Duration, defer_work: bool) -> Option<Turn> {
         let (mut state, _) = self
             .wake
             .wait_timeout_while(self.state(), timeout, |state| {
                 state.priority.is_empty()
-                    && state.work.is_empty()
+                    && (defer_work || state.work.is_empty())
                     && state.subscriptions.is_empty()
                     && !state.shutting_down
             })
@@ -772,19 +767,18 @@ impl Mailbox {
         let subscription_count = state.subscriptions.len().min(MAX_COMMANDS);
         turn.subscriptions
             .extend(state.subscriptions.drain(..subscription_count));
-        if !state.priority.is_empty()
-            && (state.work.is_empty() || state.priority_streak < PRIORITY_BURST)
-        {
-            state.priority_streak = if state.work.is_empty() {
-                0
-            } else {
+        let work_ready = (!defer_work || state.shutting_down) && !state.work.is_empty();
+        if !state.priority.is_empty() && (!work_ready || state.priority_streak < PRIORITY_BURST) {
+            state.priority_streak = if work_ready {
                 state.priority_streak + 1
+            } else {
+                0
             };
             turn.commands.extend(state.priority.pop_front());
-        } else {
+        } else if work_ready {
             state.priority_streak = 0;
             let mut remaining = MAX_WORK_BYTES;
-            while turn.commands.len() < max_work_commands
+            while turn.commands.len() < MAX_COMMANDS
                 && state
                     .work
                     .front()

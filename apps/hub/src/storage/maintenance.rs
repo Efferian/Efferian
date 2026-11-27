@@ -12,7 +12,6 @@ use super::lifecycle::{OpenedDb, WAL_FILE, truncate_checkpoint};
 use super::{StorageError, StorageHandle};
 
 const GC_ROWS: usize = 32;
-const EVENT_PRUNE_BURST: u8 = 2;
 const SAMPLE_COMMITS: usize = 100;
 const SHORT_CHECKPOINT: Duration = Duration::from_millis(50);
 
@@ -116,7 +115,8 @@ pub(super) struct Maintenance {
     soft_exhausted: bool,
     used_percent: u32,
     live_events_count: usize,
-    event_prune_streak: u8,
+    event_write_debt: usize,
+    next_lane: usize,
     unsampled_bytes: usize,
     unsampled_commits: usize,
 }
@@ -143,7 +143,8 @@ impl Maintenance {
             soft_exhausted: false,
             used_percent,
             live_events_count,
-            event_prune_streak: 0,
+            event_write_debt: 0,
+            next_lane: 0,
             unsampled_bytes: 0,
             unsampled_commits: 0,
         })
@@ -153,9 +154,10 @@ impl Maintenance {
         pressure(self.used_percent)
     }
 
-    /// Slow event-producing bursts before they overtake bounded prefix pruning.
-    pub(super) fn near_event_cap(&self, db: &OpenedDb, next_batch: usize) -> bool {
-        self.live_events_count.saturating_add(next_batch) >= db.config.max_events_rows
+    /// A committed burst that exceeds the cap must leave room for retention
+    /// before the next work batch. Priority and shutdown drain stay available.
+    pub(super) fn defer_work(&self) -> bool {
+        self.event_write_debt != 0 && !self.hold_gc_until_tick
     }
 
     pub(super) fn after_write(
@@ -168,6 +170,16 @@ impl Maintenance {
     ) -> Result<(), StorageError> {
         if committed {
             self.live_events_count += appended_events;
+            let excess = self
+                .live_events_count
+                .saturating_sub(db.config.max_events_rows);
+            if appended_events != 0 && excess != 0 {
+                // Charge actual committed outbox rows. An extra place when
+                // already over cap makes a continuing stream pay down old rows.
+                self.event_write_debt = self
+                    .event_write_debt
+                    .saturating_add(appended_events.min(excess).saturating_add(1));
+            }
             self.unsampled_bytes += bytes;
             self.unsampled_commits += 1;
             if bytes != 0 {
@@ -197,13 +209,7 @@ impl Maintenance {
     }
 
     pub(super) fn wait_for(&self, db: &OpenedDb, now: Duration) -> Duration {
-        if !self.scheduled_steps.is_empty()
-            || self.vacuum_pending
-            || (!self.hold_gc_until_tick
-                && (self.purge_pending
-                    || (self.soft_active && !self.soft_exhausted)
-                    || self.live_events_count > db.config.max_events_rows))
-        {
+        if !self.hold_gc_until_tick && self.ready_lane(db).is_some() {
             return Duration::ZERO;
         }
         self.next_gc
@@ -215,10 +221,11 @@ impl Maintenance {
     pub(super) fn tick(&mut self, db: &OpenedDb, now: Duration) -> Result<(), StorageError> {
         if now >= self.next_gc {
             self.next_gc = now.saturating_add(db.config.gc_interval);
-            if self.scheduled_steps.is_empty() {
-                self.scheduled_steps.extend(GcStep::SCHEDULED);
+            for step in GcStep::SCHEDULED {
+                if !self.scheduled_steps.contains(&step) {
+                    self.scheduled_steps.push_back(step);
+                }
             }
-            self.vacuum_pending = true;
             self.hold_gc_until_tick = false;
             self.soft_exhausted = false;
             self.purge_pending = purging_principal(&db.conn)?.is_some();
@@ -239,94 +246,126 @@ impl Maintenance {
         self.checkpoint_wal(db, now)
     }
 
+    fn ready_lane(&self, db: &OpenedDb) -> Option<(usize, GcLane)> {
+        let lanes = GcLane::ORDER;
+        (0..lanes.len()).find_map(|offset| {
+            let index = (self.next_lane + offset) % lanes.len();
+            let lane = lanes[index];
+            let ready = match lane {
+                GcLane::Purge => self.purge_pending,
+                GcLane::Retention => self.live_events_count > db.config.max_events_rows,
+                GcLane::Soft => self.soft_active && !self.soft_exhausted,
+                GcLane::Scheduled => !self.scheduled_steps.is_empty(),
+                GcLane::Vacuum => self.vacuum_pending && self.scheduled_steps.is_empty(),
+            };
+            ready.then_some((index, lane))
+        })
+    }
+
     fn gc_step(&mut self, db: &OpenedDb) -> rusqlite::Result<()> {
-        let now = db.clock.wall_now_ms();
-        let excess = self
-            .live_events_count
-            .saturating_sub(db.config.max_events_rows);
-        let grace_cutoff = now.saturating_sub(db.config.token_gc_grace_ms);
-        let conn = &db.conn;
-
-        let soft_pending = self.soft_active && !self.soft_exhausted;
-        let other_work_pending = self.purge_pending
-            || soft_pending
-            || !self.scheduled_steps.is_empty()
-            || self.vacuum_pending;
-        // At the cap, 16 normal single-event writes per turn leave room for
-        // two 31-event prunes and one slot for other GC every three turns.
-        if excess > 0 && (self.event_prune_streak < EVENT_PRUNE_BURST || !other_work_pending) {
-            self.event_prune_streak = self.event_prune_streak.saturating_add(1);
-            let deleted = gc_transaction(conn, |tx| prune_events(tx, now, excess))?;
-            if deleted == 0 {
-                self.live_events_count = 0;
-            } else {
-                self.record_prune(deleted);
-                self.sample(db)?;
-            }
+        let Some((index, lane)) = self.ready_lane(db) else {
             return Ok(());
-        }
-        self.event_prune_streak = 0;
-
-        if self.purge_pending {
-            self.purge_pending = gc_transaction(conn, purge_agent_children)?;
-            self.vacuum_pending = true;
-            return self.sample(db);
-        }
-        if soft_pending {
-            let changed = gc_transaction(conn, |tx| expire_results(tx, i64::MAX))?;
-            self.soft_exhausted = changed == 0;
-            self.vacuum_pending |= changed != 0;
-            return self.sample(db);
-        }
-
-        if let Some(step) = self.scheduled_steps.pop_front() {
-            let changed = gc_transaction(conn, |tx| {
-                match step {
-                GcStep::Results => expire_results(tx, now),
-                GcStep::Executions => expire_executions(tx, now),
-                GcStep::Events => prune_events(tx, now, 0),
-                GcStep::Tokens => tx.execute(
-                    "DELETE FROM auth_tokens WHERE token_id IN (
-                        SELECT token_id FROM auth_tokens WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT 32)",
-                    [grace_cutoff],
-                ),
-                GcStep::RevokedTokens => tx.execute(
-                    "DELETE FROM auth_tokens WHERE token_id IN (
-                        SELECT token_id FROM auth_tokens WHERE revoked_at_ms <= ?1 ORDER BY revoked_at_ms LIMIT 32)",
-                    [grace_cutoff],
-                ),
-                GcStep::Enrollments => tx.execute(
-                    "DELETE FROM node_enrollments WHERE enrollment_id IN (
-                        SELECT enrollment_id FROM node_enrollments WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT 32)",
-                    [grace_cutoff],
-                ),
-                GcStep::Agent => claim_agent(tx, now.saturating_sub(db.config.agent_gc_age_ms)).map(usize::from),
-            }
-            })?;
-            if step == GcStep::Events {
-                self.record_prune(changed);
-            }
-            if step == GcStep::Agent {
-                self.purge_pending = changed != 0;
-            }
-            if changed != 0 {
-                // A busy category yields to the rest of the current sweep.
-                self.scheduled_steps.push_back(step);
+        };
+        self.next_lane = (index + 1) % GcLane::ORDER.len();
+        let conn = &db.conn;
+        let now = db.clock.wall_now_ms();
+        match lane {
+            GcLane::Purge => {
+                self.purge_pending = gc_transaction(conn, purge_agent_children)?;
                 self.vacuum_pending = true;
                 self.sample(db)?;
             }
-        } else if self.vacuum_pending {
-            self.vacuum_pending = false;
-            if Pages::read(conn)?.free != 0 {
-                incremental_vacuum(conn)?;
+            GcLane::Retention => {
+                let excess = self
+                    .live_events_count
+                    .saturating_sub(db.config.max_events_rows);
+                let deleted = gc_transaction(conn, |tx| prune_events(tx, now, excess))?;
+                if deleted == 0 {
+                    self.live_events_count = 0;
+                    self.event_write_debt = 0;
+                } else {
+                    self.record_prune(db, deleted);
+                    self.sample(db)?;
+                }
+            }
+            GcLane::Soft => {
+                let changed = gc_transaction(conn, |tx| expire_results(tx, i64::MAX))?;
+                self.soft_exhausted = changed == 0;
+                self.vacuum_pending |= changed != 0;
                 self.sample(db)?;
             }
+            GcLane::Scheduled => self.periodic_step(db, now)?,
+            GcLane::Vacuum => self.vacuum(db)?,
         }
         Ok(())
     }
 
-    fn record_prune(&mut self, deleted: usize) {
+    fn periodic_step(&mut self, db: &OpenedDb, now: i64) -> rusqlite::Result<()> {
+        let Some(step) = self.scheduled_steps.pop_front() else {
+            return Ok(());
+        };
+        if step == GcStep::Vacuum {
+            return self.vacuum(db);
+        }
+        if step == GcStep::Agent && self.purge_pending {
+            self.scheduled_steps.push_back(step);
+            return Ok(());
+        }
+        let grace_cutoff = now.saturating_sub(db.config.token_gc_grace_ms);
+        let changed = gc_transaction(&db.conn, |tx| {
+            match step {
+            GcStep::Results => expire_results(tx, now),
+            GcStep::Executions => expire_executions(tx, now),
+            GcStep::Events => prune_events(tx, now, 0),
+            GcStep::Tokens => tx.execute(
+                "DELETE FROM auth_tokens WHERE token_id IN (
+                    SELECT token_id FROM auth_tokens WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT 32)",
+                [grace_cutoff],
+            ),
+            GcStep::RevokedTokens => tx.execute(
+                "DELETE FROM auth_tokens WHERE token_id IN (
+                    SELECT token_id FROM auth_tokens WHERE revoked_at_ms <= ?1 ORDER BY revoked_at_ms LIMIT 32)",
+                [grace_cutoff],
+            ),
+            GcStep::Enrollments => tx.execute(
+                "DELETE FROM node_enrollments WHERE enrollment_id IN (
+                    SELECT enrollment_id FROM node_enrollments WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms LIMIT 32)",
+                [grace_cutoff],
+            ),
+            GcStep::Agent => claim_agent(tx, now.saturating_sub(db.config.agent_gc_age_ms)).map(usize::from),
+            GcStep::Vacuum => Err(rusqlite::Error::InvalidQuery),
+        }
+        })?;
+        if step == GcStep::Events {
+            self.record_prune(db, changed);
+        }
+        if step == GcStep::Agent {
+            self.purge_pending = changed != 0;
+        }
+        if changed != 0 {
+            self.scheduled_steps.push_back(step);
+            self.vacuum_pending = true;
+            self.sample(db)?;
+        }
+        Ok(())
+    }
+
+    fn vacuum(&mut self, db: &OpenedDb) -> rusqlite::Result<()> {
+        self.vacuum_pending = false;
+        if Pages::read(&db.conn)?.free != 0 {
+            incremental_vacuum(&db.conn)?;
+            self.sample(db)?;
+        }
+        Ok(())
+    }
+
+    fn record_prune(&mut self, db: &OpenedDb, deleted: usize) {
         self.live_events_count = self.live_events_count.saturating_sub(deleted);
+        self.event_write_debt = if self.live_events_count <= db.config.max_events_rows {
+            0
+        } else {
+            self.event_write_debt.saturating_sub(deleted)
+        };
         self.vacuum_pending |= deleted != 0;
     }
 
@@ -353,6 +392,25 @@ impl Maintenance {
     }
 }
 
+#[derive(Clone, Copy)]
+enum GcLane {
+    Purge,
+    Retention,
+    Soft,
+    Scheduled,
+    Vacuum,
+}
+
+impl GcLane {
+    const ORDER: [Self; 5] = [
+        Self::Purge,
+        Self::Retention,
+        Self::Soft,
+        Self::Scheduled,
+        Self::Vacuum,
+    ];
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GcStep {
     Results,
@@ -362,10 +420,11 @@ enum GcStep {
     RevokedTokens,
     Enrollments,
     Agent,
+    Vacuum,
 }
 
 impl GcStep {
-    const SCHEDULED: [Self; 7] = [
+    const SCHEDULED: [Self; 8] = [
         Self::Results,
         Self::Executions,
         Self::Events,
@@ -373,6 +432,7 @@ impl GcStep {
         Self::RevokedTokens,
         Self::Enrollments,
         Self::Agent,
+        Self::Vacuum,
     ];
 }
 
@@ -495,10 +555,13 @@ fn claim_agent(conn: &Connection, cutoff: i64) -> rusqlite::Result<bool> {
         [cutoff],
         |row| row.get::<_, String>(0),
     ).optional()? else { return Ok(false) };
-    conn.execute(
+    let claimed = conn.execute(
         "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1 AND gc_purging_principal_id IS NULL",
         [&principal],
     )?;
+    if claimed == 0 {
+        return Ok(false);
+    }
     conn.execute(
         "UPDATE principals SET name = '~purging:' || principal_id WHERE principal_id = ?1",
         [&principal],

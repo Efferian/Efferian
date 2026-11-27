@@ -824,6 +824,21 @@ fn staging_subprocess() -> TestResult {
         return Ok(());
     }
     let lock = acquire_state_lock(&dir)?;
+    if std::env::var(STAGE_POINT_ENV).as_deref() == Ok("spill") {
+        let conn = Connection::open(dir.join("hub.sqlite3"))?;
+        conn.pragma_update(None, "cache_size", 2)?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        conn.execute("UPDATE hub_meta SET active_key_id = 99", [])?;
+        for n in 0..12 {
+            conn.execute(
+                "INSERT INTO upstreams(upstream_id, slug, url, discovered_tools_json, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?1, 'https://example.test', hex(zeroblob(10000)), 0, 0)",
+                [n],
+            )?;
+        }
+        stage_point("spill");
+        return Err("snapshot subprocess ran past its crash boundary".into());
+    }
     let hub_id = HubId::parse(&std::env::var(STAGE_ID_ENV)?)?;
     create_staged(
         &lock,
@@ -844,8 +859,7 @@ fn staging_subprocess() -> TestResult {
 
 #[test]
 fn staged_init_recovers_at_real_process_death_boundaries() -> TestResult {
-    use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     for point in ["pre-commit", "pre-link", "post-link"] {
         let f = Fixture::create(StorageConfig::default())?;
@@ -862,30 +876,7 @@ fn staged_init_recovers_at_real_process_death_boundaries() -> TestResult {
         let lock = acquire_state_lock(&f.dir)?;
         assert!(subprocess.env(STAGE_POINT_ENV, "lock").status()?.success());
         drop(lock);
-        let mut child = subprocess
-            .env(STAGE_POINT_ENV, point)
-            .stdout(Stdio::piped())
-            .spawn()?;
-        let stdout = child.stdout.take().ok_or("missing subprocess output")?;
-        let (ready, paused) = std::sync::mpsc::channel();
-        let watcher = std::thread::spawn(move || {
-            if BufReader::new(stdout)
-                .lines()
-                .map_while(Result::ok)
-                .any(|line| line == format!("PAUSED {point}"))
-            {
-                let _ = ready.send(());
-            }
-        });
-        let observed = paused.recv_timeout(TIMEOUT);
-        let kill = child.kill();
-        let status = child.wait()?;
-        watcher
-            .join()
-            .map_err(|_| "crash output watcher panicked")?;
-        observed?;
-        kill?;
-        assert!(!status.success());
+        stop_subprocess_at(&mut subprocess, point)?;
         assert_eq!(f.path().exists(), point == "post-link");
         if !f.path().exists() {
             let lock = acquire_state_lock(&f.dir)?;
@@ -1427,5 +1418,285 @@ async fn first_maintenance_turn_is_skipped_if_shutdown_has_begun() -> TestResult
             )
         })?;
     assert_eq!(retained.value, 1);
+    Ok(())
+}
+
+fn stop_subprocess_at(subprocess: &mut std::process::Command, point: &'static str) -> TestResult {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let mut child = subprocess
+        .env(STAGE_POINT_ENV, point)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or("missing subprocess output")?;
+    let (ready, paused) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        if BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line == format!("PAUSED {point}"))
+        {
+            let _ = ready.send(());
+        }
+    });
+    let observed = paused.recv_timeout(TIMEOUT);
+    let kill = child.kill();
+    let status = child.wait()?;
+    watcher
+        .join()
+        .map_err(|_| "crash output watcher panicked")?;
+    observed?;
+    kill?;
+    assert!(!status.success());
+    Ok(())
+}
+
+#[test]
+fn hot_snapshot_journal_is_recovered_only_after_identity_is_validated() -> TestResult {
+    use rusqlite::{OpenFlags, ffi::SQLITE_READONLY_ROLLBACK};
+
+    let f = Fixture::create(StorageConfig::default())?;
+    let dir = f.dir.join("restored");
+    let lock = acquire_state_lock(&dir)?;
+    let snapshot = dir.join("hub.sqlite3");
+    let source = Connection::open_with_flags(f.path(), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    source.execute(
+        "VACUUM INTO ?1",
+        [snapshot.to_str().ok_or("non-UTF-8 snapshot path")?],
+    )?;
+    drop(source);
+    drop(lock);
+    let mut subprocess = std::process::Command::new(std::env::current_exe()?);
+    subprocess
+        .args([
+            "--exact",
+            "storage::tests::staging_subprocess",
+            "--nocapture",
+        ])
+        .env(STAGE_DIR_ENV, &dir);
+    stop_subprocess_at(&mut subprocess, "spill")?;
+
+    let rollback = dir.join("hub.sqlite3-journal");
+    let original = (fs::read(&snapshot)?, fs::read(&rollback)?);
+    let reader = Connection::open_with_flags(&snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let needs_recovery =
+        reader.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0));
+    assert!(
+        matches!(needs_recovery, Err(rusqlite::Error::SqliteFailure(code, _))
+        if code.extended_code == SQLITE_READONLY_ROLLBACK)
+    );
+    drop(reader);
+
+    let reopen = |key| -> Result<OpenedDb, StorageError> {
+        open_existing(
+            acquire_state_lock(&dir)?,
+            OpenMode::OfflineExactVersion,
+            ExpectedHubIdentity {
+                active_key_id: key,
+                master_key_fingerprint: "test-fingerprint".into(),
+            },
+            &f.config,
+            f.clock.clone(),
+        )
+    };
+    assert!(matches!(reopen(99), Err(StorageError::IdentityMismatch)));
+    assert_eq!((fs::read(&snapshot)?, fs::read(&rollback)?), original);
+    assert!(!dir.join(".staging-hub-init").exists());
+    let opened = reopen(1)?;
+    assert_eq!(opened.hub_id(), &f.hub_id);
+    let outcome = opened.run_offline_tx(|conn| {
+        let row_count = conn.query_row("SELECT count(*) FROM upstreams", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let journal =
+            conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
+        Ok::<_, rusqlite::Error>((row_count, journal))
+    })?;
+    assert_eq!(outcome.value, (0, "wal".into()));
+    assert!(!rollback.exists());
+    assert!(!dir.join(".staging-hub-init").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiple_events_per_command_do_not_accumulate_across_work_batches() -> TestResult {
+    use futures_util::StreamExt;
+
+    let f = Fixture::create(StorageConfig {
+        max_events_rows: 32,
+        ..StorageConfig::default()
+    })?;
+    let (handle, runtime) = f.start()?;
+    let principal = f.principal;
+    let actor = ActorId::Hub(f.hub_id);
+    let work = |n: usize| {
+        handle.execute_work(0, move |tx| {
+            for _ in 0..n {
+                tx.append_event(actor, Event::PrincipalRevoked(principal))?;
+            }
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+    };
+    // Non-uniform batches also exercise a single command larger than a prune.
+    let mut burst =
+        futures_util::stream::iter((0..320).map(|index| if index == 128 { 100 } else { 4 }))
+            .map(work)
+            .buffer_unordered(128);
+    let mut committed = 0;
+    while let Some(result) = burst.next().await {
+        result?;
+        committed += 1;
+        if committed % 16 == 0 {
+            let report = handle.status_snapshot().await?;
+            assert!(
+                report.events_head_seq - report.events_pruned_through_seq <= 32 + 32 * 4 + 96,
+                "{report:?}"
+            );
+        }
+    }
+    assert_eq!(committed, 320);
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            handle.subscribe_waiter(ExecutionId::new()).await?;
+            let report = handle.status_snapshot().await?;
+            assert_eq!(report.events_head_seq, 319 * 4 + 100);
+            if report.events_head_seq - report.events_pruned_through_seq == 32 {
+                break Ok::<_, StorageError>(());
+            }
+        }
+    })
+    .await??;
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_projections_preserve_committed_recipients_in_live_and_catchup() -> TestResult {
+    use efferian_authz::{AuthContext, PrincipalView, TokenScope, can_observe_event};
+    use efferian_protocol::PrincipalKind;
+
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let manager = PrincipalId::new_service();
+    let other = PrincipalId::new_service();
+    let revoked_token = TokenId::new_service();
+    let node = f.node;
+    let actor = ActorId::Hub(f.hub_id);
+    let mut live = handle.subscribe_events()?;
+    handle.execute_work(0, move |tx| {
+        for service in [manager, other] {
+            let id = service.to_string();
+            tx.conn().execute("INSERT INTO principals(principal_id, kind, name, is_orchestrator, created_at_ms, updated_at_ms)
+                VALUES (?1, 'service', ?1, 1, 0, 0)", [id])?;
+        }
+        seed_token(tx.conn(), revoked_token, manager, manager)?;
+        tx.conn().execute("UPDATE nodes SET managed_by_principal_id = ?1", [manager.to_string()])?;
+        tx.append_event(actor, Event::NodeConnected(node))?;
+        tx.conn().execute("UPDATE nodes SET managed_by_principal_id = ?1", [other.to_string()])?;
+        tx.append_event(actor, Event::NodeDisconnected(node))?;
+        Ok::<_, WriteTxError<Infallible>>(())
+    }).await?;
+    assert!(handle.revoke_token(actor, revoked_token).await?);
+
+    let scope = |principal_id| AuthContext {
+        caller: PrincipalView {
+            principal_id,
+            kind: PrincipalKind::Service,
+            owner_principal_id: None,
+            managed_by_principal_id: None,
+            inherit_owner_bindings: false,
+            is_orchestrator: true,
+            allowed_node_tags: Default::default(),
+            observe_executions: false,
+            disabled_at_ms: None,
+        },
+        token: TokenScope {
+            token_id: TokenId::new_service(),
+            principal_id,
+            max_capability: None,
+            allowed_profiles: None,
+            allowed_nodes: Some([node].into()),
+            withhold_sensitive: false,
+            expires_at_ms: None,
+            revoked_at_ms: None,
+        },
+        caller_grants: Vec::new(),
+        owner: None,
+        owner_grants: Vec::new(),
+        managed_by: None,
+        managed_by_grants: Vec::new(),
+        now_ms: 0,
+    };
+    let contexts = [scope(manager), scope(other)];
+    let page = handle.read_events(0, None, 10).await?;
+    assert_eq!(page.items.len(), 3);
+    for (stored, visible) in page
+        .items
+        .iter()
+        .zip([[true, false], [false, true], [true, false]])
+    {
+        let published = live.recv().await?;
+        assert_eq!(published.auth, stored.auth);
+        assert_eq!(published.envelope, stored.envelope);
+        for (ctx, allowed) in contexts.iter().zip(visible) {
+            assert_eq!(can_observe_event(ctx, &stored.auth), allowed);
+        }
+    }
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn revocation_is_observable_at_the_instant_the_outbox_wakes_a_subscriber() -> TestResult {
+    use std::future::Future;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Wake, Waker};
+
+    struct ObserveRevocation {
+        receiver: Mutex<RevocationWatch>,
+        received: AtomicBool,
+        token: TokenId,
+    }
+    impl Wake for ObserveRevocation {
+        fn wake(self: Arc<Self>) {
+            let received = self
+                .receiver
+                .lock()
+                .ok()
+                .and_then(|mut watch| watch.try_recv().ok());
+            self.received.store(
+                received.is_some_and(|signal| {
+                    signal.reason == RevocationReason::TokenRevoked(self.token)
+                }),
+                Ordering::Release,
+            );
+        }
+    }
+
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let observe = Arc::new(ObserveRevocation {
+        receiver: Mutex::new(handle.subscribe_revocations()?),
+        received: AtomicBool::new(false),
+        token: f.token,
+    });
+    let mut live = handle.subscribe_events()?;
+    let mut event = Box::pin(live.recv());
+    let waker = Waker::from(observe.clone());
+    assert!(
+        event
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(handle.revoke_token(ActorId::Hub(f.hub_id), f.token).await?);
+    assert!(
+        observe.received.load(Ordering::Acquire),
+        "outbox woke before revocation was visible"
+    );
+    let event = tokio::time::timeout(TIMEOUT, event).await??;
+    assert!(matches!(event.envelope.event, Event::TokenRevoked(id) if id == f.token));
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }
