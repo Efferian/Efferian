@@ -793,6 +793,83 @@ async fn extractor_failures_and_routing_errors_are_stable_wire_problems() {
 }
 
 #[tokio::test]
+async fn openapi_matches_input_and_boundary_response_contracts() {
+    let fixture = Fixture::new();
+    let hub = router(fixture.state.clone(), 8101).unwrap();
+    let response = send(
+        hub,
+        request(Method::GET, "/v1/openapi.json", None, Body::empty()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let principal_put = &doc["paths"]["/v1/principals/{principal_ref}"]["put"];
+    let principal_schema = &principal_put["requestBody"]["content"]["application/json"]["schema"];
+    let schema = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": principal_schema["$ref"].as_str().unwrap(),
+        "components": doc["components"],
+    });
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&serde_json::json!({})));
+    assert!(validator.is_valid(&serde_json::json!({"kind": "agent"})));
+    assert!(!validator.is_valid(&serde_json::json!({"kind": null})));
+    let kind = &doc["components"]["schemas"]["PrincipalPut"]["properties"]["kind"];
+    assert!(
+        kind["description"]
+            .as_str()
+            .unwrap()
+            .contains("Administrators must supply")
+    );
+
+    let ttl = &doc["components"]["schemas"]["MintEnrollment"]["properties"]["ttl_ms"];
+    assert!(ttl.get("default").is_none());
+    assert_eq!(ttl["minimum"].as_f64(), Some(1.0));
+    assert!(
+        ttl["description"]
+            .as_str()
+            .unwrap()
+            .contains("orchestrator_enrollment_ttl_ms")
+    );
+
+    let paths = &doc["paths"];
+    let problem_content = |operation: &serde_json::Value, statuses: &[&str]| {
+        for status in statuses {
+            assert_eq!(
+                operation["responses"][status]["content"]["application/problem+json"]["schema"]["$ref"],
+                "#/components/schemas/ProblemDetails",
+                "missing problem schema for {} {status}",
+                operation["operationId"],
+            );
+        }
+    };
+    for path in ["/v1/enrollment/tokens", "/v1/enrollment/exchange"] {
+        problem_content(
+            &paths[path]["post"],
+            &[
+                "400", "401", "403", "408", "409", "413", "415", "500", "503",
+            ],
+        );
+    }
+    assert!(paths["/v1/enrollment/tokens"]["post"]["responses"]["201"].is_object());
+    let bodyless = &paths["/v1/nodes/{id}"]["delete"];
+    problem_content(bodyless, &["401", "404", "408", "413", "503"]);
+    assert!(bodyless["responses"].get("415").is_none());
+    let protected_get = &paths["/v1/nodes/{id}"]["get"];
+    problem_content(protected_get, &["400", "401", "404", "503"]);
+    for status in ["408", "413", "415"] {
+        assert!(protected_get["responses"].get(status).is_none());
+    }
+    let health = &paths["/v1/health"]["get"];
+    problem_content(health, &["400", "403", "409"]);
+    assert!(health["responses"].get("401").is_none());
+    assert!(health["responses"].get("503").is_none());
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn openapi_bytes_are_a_per_router_artifact_with_weak_etag_matching() {
     let fixture = Fixture::new();
     let router = router(fixture.state.clone(), 8101).unwrap();

@@ -130,14 +130,14 @@ pub(super) fn list_principals(
     // Keep this visibility predicate aligned with authorize_principal_manage(Read)
     // so filtering never excludes an eligible row from a page window.
     let mut stmt = conn.prepare_cached(&format!(
-        "{SELECT_PRINCIPAL} AND (?1 IS NULL OR p.principal_id COLLATE BINARY > ?1)
+        "{SELECT_PRINCIPAL} AND p.principal_id COLLATE BINARY > ?1
          AND (?3 OR p.principal_id = ?2 OR (p.kind = 'agent' AND
               ((?4 AND p.owner_principal_id = ?2)
                OR (?5 AND p.owner_principal_id IS NULL AND p.managed_by_principal_id = ?2))))
          ORDER BY p.principal_id COLLATE BINARY ASC LIMIT ?6"
     ))?;
     let mut rows = stmt.query(params![
-        cursor,
+        cursor.unwrap_or_default(),
         ctx.caller.principal_id.to_string(),
         authorize_admin(ctx).is_ok(),
         ctx.caller.kind == PrincipalKind::Member,
@@ -187,7 +187,9 @@ fn specified_kind<'de, D: Deserializer<'de>>(
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PrincipalPut {
+    /// Administrators must supply a kind. When a Member or orchestrator omits it, it defaults to `agent`.
     #[serde(default, deserialize_with = "specified_kind")]
+    #[schema(value_type = PrincipalKind, required = false)]
     kind: Option<PrincipalKind>,
     #[serde(default)]
     #[schema(value_type = Option<PrincipalId>)]

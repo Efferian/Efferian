@@ -163,11 +163,17 @@ async fn list_nodes(
                 "SELECT {SUMMARY_COLUMNS} FROM nodes n
                  WHERE (?1 OR n.managed_by_principal_id = ?2)
                    AND (?3 IS NULL OR n.node_id IN (SELECT value FROM json_each(?3)))
-                   AND (?4 IS NULL OR n.node_id COLLATE BINARY > ?4)
+                   AND n.node_id COLLATE BINARY > ?4
                  ORDER BY n.node_id COLLATE BINARY ASC LIMIT ?5",
             ))?;
             let selected = statement.query_map(
-                params![admin, manager, scope, cursor, limit + 1],
+                params![
+                    admin,
+                    manager,
+                    scope,
+                    cursor.as_deref().unwrap_or_default(),
+                    limit + 1
+                ],
                 NodeSummary::from_row,
             )?;
             let rows = selected.collect::<rusqlite::Result<Vec<_>>>()?;

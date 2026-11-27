@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use efferian_protocol::{HubId, ProblemDetails};
+use efferian_protocol::{HubId, PROBLEM_JSON_MEDIA_TYPE, ProblemDetails};
 use http::{
     HeaderMap, StatusCode,
     header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH},
@@ -15,7 +15,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use utoipa::{
     Modify, OpenApi, ToSchema,
-    openapi::security::{Http, HttpAuthScheme, SecurityScheme},
+    openapi::{
+        Content, Ref,
+        path::Operation,
+        response::ResponseBuilder,
+        security::{Http, HttpAuthScheme, SecurityScheme},
+    },
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -48,6 +53,94 @@ pub(super) fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(health))
         .routes(routes!(info))
         .routes(routes!(openapi))
+}
+
+pub(super) fn document_boundary_errors(doc: &mut utoipa::openapi::OpenApi) {
+    for path in doc.paths.paths.values_mut() {
+        for (operation, checks_body) in [
+            (&mut path.get, false),
+            (&mut path.head, false),
+            (&mut path.options, false),
+            (&mut path.trace, false),
+            (&mut path.post, true),
+            (&mut path.put, true),
+            (&mut path.patch, true),
+            (&mut path.delete, true),
+        ] {
+            if let Some(operation) = operation {
+                document_operation_errors(operation, checks_body);
+            }
+        }
+    }
+}
+
+fn document_operation_errors(operation: &mut Operation, checks_body: bool) {
+    use StatusCode as Status;
+
+    let mut problems = vec![
+        (Status::BAD_REQUEST, "A request header or input is invalid."),
+        (Status::FORBIDDEN, "The request is forbidden."),
+        (Status::CONFLICT, "The request targets a different Hub."),
+    ];
+    if operation
+        .security
+        .as_ref()
+        .is_some_and(|rules| !rules.is_empty())
+    {
+        problems.extend([
+            (
+                Status::UNAUTHORIZED,
+                "The credential is absent or inactive.",
+            ),
+            (
+                Status::INTERNAL_SERVER_ERROR,
+                "The Hub could not complete the request.",
+            ),
+            (
+                Status::SERVICE_UNAVAILABLE,
+                "The Hub is temporarily unable to admit the request.",
+            ),
+        ]);
+    }
+    if checks_body || operation.request_body.is_some() {
+        problems.extend([
+            (
+                Status::REQUEST_TIMEOUT,
+                "The request body stalled while being read.",
+            ),
+            (
+                Status::PAYLOAD_TOO_LARGE,
+                "The request body exceeds the route limit.",
+            ),
+        ]);
+    }
+    if operation
+        .request_body
+        .as_ref()
+        .is_some_and(|body| body.content.contains_key("application/json"))
+    {
+        problems.push((
+            Status::UNSUPPORTED_MEDIA_TYPE,
+            "A JSON content type is required.",
+        ));
+    }
+
+    for (status, description) in problems {
+        operation
+            .responses
+            .responses
+            .entry(status.as_str().to_owned())
+            .or_insert_with(|| {
+                ResponseBuilder::new()
+                    .description(description)
+                    .content(
+                        PROBLEM_JSON_MEDIA_TYPE,
+                        Content::new(Some(Ref::from_schema_name("ProblemDetails"))),
+                    )
+                    .build()
+                    .into()
+            });
+    }
 }
 
 #[derive(Serialize, ToSchema)]

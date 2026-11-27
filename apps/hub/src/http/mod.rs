@@ -108,7 +108,7 @@ fn assemble(
         admission::api,
     ));
 
-    let (router, doc) = system::routes()
+    let (router, mut doc) = system::routes()
         .merge(application)
         .merge(control)
         .merge(enrollment_api)
@@ -117,6 +117,7 @@ fn assemble(
         .merge(mcp)
         .split_for_parts();
 
+    system::document_boundary_errors(&mut doc);
     let artifact = Arc::new(OnceLock::from(system::OpenApiArtifact::build(&doc)?));
     Ok(router
         .fallback(|| async { ApiError::not_found() })

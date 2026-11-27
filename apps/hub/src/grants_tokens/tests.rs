@@ -598,3 +598,64 @@ async fn orchestrator_can_only_attenuate_into_active_managed_nodes() -> TestResu
     fixture.finish().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_token_revoked_while_the_request_body_is_pending_cannot_mint() -> TestResult {
+    use std::convert::Infallible;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use futures_util::stream;
+    use tokio::sync::Notify;
+
+    let fixture = Fixture::start(8).await?;
+    let (status, issued) = fixture
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({"principal_id": fixture.admin, "label": "pending-caller"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let token_id = field(&issued, "token_id")?;
+    let bearer = field(&issued, "token")?;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let payload = Bytes::from(serde_json::to_vec(&json!({
+        "principal_id": fixture.admin,
+        "label": "after-revoke",
+    }))?);
+    let body = Body::from_stream(stream::once({
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        async move {
+            started.notify_one();
+            release.notified().await;
+            Ok::<_, Infallible>(payload)
+        }
+    }));
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/tokens")
+        .header("host", "localhost:8080")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(body)?;
+    let mut router = fixture.http.clone();
+    let pending = tokio::spawn(async move { router.call(request).await });
+
+    tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
+    let (status, _) = fixture
+        .request_admin(Method::POST, &format!("/v1/tokens/{token_id}/revoke"), None)
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(5), pending).await???;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let (_, tokens) = fixture
+        .request_admin(Method::GET, "/v1/tokens", None)
+        .await?;
+    assert_eq!(tokens["items"].as_array().map(Vec::len), Some(2));
+    fixture.finish().await;
+    Ok(())
+}

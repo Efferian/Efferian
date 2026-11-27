@@ -15,6 +15,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use efferian_protocol::HubId;
+use futures_util::{StreamExt, stream};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 
@@ -79,16 +80,18 @@ struct Server {
 }
 
 impl Server {
-    fn start(state: &Path, quota: &str) -> Self {
-        let mut child = hub()
-            .args(["serve", "--state-dir"])
-            .arg(state)
-            .args([
-                "--listen",
-                "127.0.0.1:0",
-                "--max-active-tokens-per-principal",
-                quota,
-            ])
+    fn start(state: &Path, quota: &str, config: Option<&Path>) -> Self {
+        let mut command = hub();
+        command.args(["serve", "--state-dir"]).arg(state).args([
+            "--listen",
+            "127.0.0.1:0",
+            "--max-active-tokens-per-principal",
+            quota,
+        ]);
+        if let Some(config) = config {
+            command.arg("--config").arg(config);
+        }
+        let mut child = command
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -212,7 +215,7 @@ async fn bootstrap_snapshot_restore_and_offline_recovery() {
     assert_eq!(mode(&key), 0o600);
     fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
 
-    let server = Server::start(&state, "1");
+    let server = Server::start(&state, "1", None);
     let health = json(
         client
             .get(server.url("health"))
@@ -277,7 +280,7 @@ async fn bootstrap_snapshot_restore_and_offline_recovery() {
     fs::DirBuilder::new().mode(0o700).create(&restore).unwrap();
     fs::copy(&snapshot, restore.join("hub.sqlite3")).unwrap();
     fs::copy(&key, restore.join("hub.master.key")).unwrap();
-    let server = Server::start(&restore, "1");
+    let server = Server::start(&restore, "1", None);
     let restored_info = json(client.get(server.url("info")), StatusCode::OK).await;
     assert_eq!(restored_info["hub_id"], info["hub_id"]);
     json(
@@ -306,13 +309,38 @@ async fn bootstrap_snapshot_restore_and_offline_recovery() {
     assert!(!denied.status.success());
     assert!(denied.stdout.is_empty());
     let recovery = token(success(mint("2")));
-    let server = Server::start(&restore, "1");
+    let server = Server::start(&restore, "1", None);
     let tokens = json(
         client.get(server.url("tokens")).bearer_auth(&recovery),
         StatusCode::OK,
     )
     .await;
     assert_eq!(tokens["items"].as_array().unwrap().len(), 2);
+    let status = || {
+        client
+            .get(server.url("admin/status"))
+            .bearer_auth(&recovery)
+    };
+    let before = json(status(), StatusCode::OK).await;
+    let unexpected_byte = stream::iter([Ok::<_, std::io::Error>("x")]);
+    let unfinished = unexpected_byte.chain(stream::pending());
+    let invalid = json(
+        client
+            .post(server.url(&format!("tokens/{token_id}/revoke")))
+            .bearer_auth(&recovery)
+            .body(reqwest::Body::wrap_stream(unfinished)),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(invalid["code"], "invalid_input");
+    let after = json(status(), StatusCode::OK).await;
+    assert_eq!(after["events_head_seq"], before["events_head_seq"]);
+    json(
+        client.get(server.url("me")).bearer_auth(&original),
+        StatusCode::OK,
+    )
+    .await;
+
     let response = client
         .post(server.url(&format!("tokens/{token_id}/revoke")))
         .bearer_auth(&recovery)
@@ -341,7 +369,7 @@ async fn enrollment_and_revocation_preserve_node_identity() {
             .output()
             .unwrap(),
     ));
-    let server = Server::start(&state, "64");
+    let server = Server::start(&state, "64", None);
     let ticket = json(
         client
             .post(server.url("enrollment/tokens"))
@@ -451,8 +479,95 @@ fn invalid_launch_configuration_leaves_state_untouched() {
 }
 
 #[test]
+fn init_rejects_a_fifo_output_parent_without_waiting() {
+    let dir = RunDir::new();
+    let state = dir.path("state");
+    let fifo = dir.path("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut child = hub()
+        .args(["init", "--state-dir"])
+        .arg(&state)
+        .arg("--admin-token-out")
+        .arg(fifo.join("token"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Hub init waited on a non-directory output parent");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("output parent is not a directory"));
+    assert!(!state.join("hub.master.key").exists());
+    assert!(!state.join("hub.sqlite3").exists());
+}
+
+#[test]
+fn failed_stdout_delivery_reports_committed_init_and_mint() {
+    fn closed_stdout() -> Stdio {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        Stdio::from(writer)
+    }
+
+    let dir = RunDir::new();
+    let state = dir.path("state");
+    let init = hub()
+        .args(["init", "--state-dir"])
+        .arg(&state)
+        .stdout(closed_stdout())
+        .output()
+        .unwrap();
+    assert!(!init.status.success());
+    let stderr = String::from_utf8_lossy(&init.stderr);
+    assert!(stderr.contains("Hub was initialized, but token output failed"));
+    assert!(stderr.contains("admin create-token"));
+    assert!(!stderr.contains("eff_tok_"));
+
+    let mint = || {
+        let mut command = hub();
+        command
+            .args(["admin", "create-token", "--state-dir"])
+            .arg(&state)
+            .args(["--principal", "admin"]);
+        command
+    };
+    let failed = mint().stdout(closed_stdout()).output().unwrap();
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("new token was committed, but token output failed"));
+    assert!(!stderr.contains("eff_tok_"));
+    token(success(mint().output().unwrap()));
+
+    let db = rusqlite::Connection::open_with_flags(
+        state.join("hub.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let tokens: i64 = db
+        .query_row("SELECT count(*) FROM auth_tokens", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tokens, 3);
+}
+
+#[tokio::test]
 #[ignore = "writes a SQLite fixture over 4 GiB for the offline recovery acceptance check"]
-fn offline_recovery_respects_page_budget_over_four_gib() {
+async fn offline_recovery_respects_page_budget_over_four_gib() {
     use efferian_protocol::{ExecutionId, ToolId, UpstreamId};
     use rusqlite::{Connection, params};
 
@@ -470,6 +585,7 @@ fn offline_recovery_respects_page_budget_over_four_gib() {
             .output()
             .unwrap(),
     );
+    let original = token(fs::read(bootstrap).unwrap());
 
     let mut db = Connection::open(state.join("hub.sqlite3")).unwrap();
     db.pragma_update(None, "journal_mode", "DELETE").unwrap();
@@ -515,7 +631,39 @@ fn offline_recovery_respects_page_budget_over_four_gib() {
     assert!(!denied.status.success());
     assert!(denied.stdout.is_empty());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("is below the SQLite page count"));
-    token(success(
-        mint().arg("--config").arg(config).output().unwrap(),
+    let recovery = token(success(
+        mint()
+            .arg("--config")
+            .arg(&config)
+            .args(["--max-active-tokens-per-principal", "2"])
+            .output()
+            .unwrap(),
     ));
+    let server = Server::start(&state, "1", Some(&config));
+    let client = client();
+    let tokens = json(
+        client.get(server.url("tokens")).bearer_auth(&recovery),
+        StatusCode::OK,
+    )
+    .await;
+    let items = tokens["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let bootstrap = items
+        .iter()
+        .find(|item| item["label"] == "bootstrap")
+        .unwrap();
+    let token_id = bootstrap["token_id"].as_str().unwrap();
+    let revoked = client
+        .post(server.url(&format!("tokens/{token_id}/revoke")))
+        .bearer_auth(&recovery)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    json(
+        client.get(server.url("me")).bearer_auth(&original),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    server.stop("TERM");
 }

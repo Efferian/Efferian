@@ -32,7 +32,9 @@ pub(super) struct MintEnrollment {
     target_node_name: String,
     #[serde(default)]
     tags: Vec<String>,
-    #[schema(minimum = 1, default = 900000)]
+    /// Time to live in milliseconds. Defaults to 900,000 for administrators. For orchestrators the
+    /// default is the smaller of 900,000 and the configured `orchestrator_enrollment_ttl_ms` limit.
+    #[schema(minimum = 1)]
     ttl_ms: Option<i64>,
 }
 
