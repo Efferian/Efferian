@@ -21,7 +21,7 @@ const PRIORITY_CAPACITY: usize = 128;
 const WORK_CAPACITY: usize = 256;
 const MAX_COMMANDS: usize = 32;
 const PRIORITY_BURST: usize = 16;
-pub(super) const MAX_WORK_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_WORK_BYTES: usize = 4 * 1024 * 1024;
 const EVENTS_CAPACITY: usize = 1024;
 const REVOCATIONS_CAPACITY: usize = 128;
 
@@ -639,6 +639,7 @@ impl WriteTx<'_> {
 pub(crate) enum WriteTxError<E> {
     Domain(E),
     StoragePressure,
+    LastAdmin,
     InvalidDatabase(&'static str),
     Sqlite(rusqlite::Error),
 }
@@ -653,6 +654,7 @@ impl<E> From<StorageError> for WriteTxError<E> {
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::StoragePressure => Self::StoragePressure,
+            StorageError::LastAdmin => Self::LastAdmin,
             StorageError::InvalidDatabase(msg) => Self::InvalidDatabase(msg),
             StorageError::Sqlite(error) => Self::Sqlite(error),
             other => Self::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(other))),
@@ -676,6 +678,7 @@ impl<E> WriteTxError<E> {
         match self {
             Self::Domain(error) => Some(WriteError::Domain(error)),
             Self::StoragePressure => Some(StorageError::StoragePressure.into()),
+            Self::LastAdmin => Some(StorageError::LastAdmin.into()),
             Self::InvalidDatabase(msg) => Some(StorageError::InvalidDatabase(msg).into()),
             Self::Sqlite(error) if is_local_sqlite_error(&error) => {
                 Some(StorageError::from(error).into())

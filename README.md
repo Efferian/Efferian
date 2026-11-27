@@ -38,6 +38,15 @@ Use separate sidecar files such as `hub.lock` and `node.lock` for exclusive inst
 
 Only Node enables the Platform `process` feature. Its `ProcessHandle` owns the group through cleanup and keeps the leader unreaped until the final group signal. Explicit termination gives signalable group members the full TERM grace period, then escalates and collects the leader. Callers retain the handle through cleanup. Take each piped stdout and stderr and read both concurrently with waiting, or select inherited or null output when a stream is unused. Spawn on a thread with SIGCHLD unblocked and keep signal delivery and child collection available to the handle. Pipe registration errors after OS spawn trigger group cleanup and leader collection. The command may already have performed work when such an error is returned. The guarantee covers the original process group while Node is running.
 
+## Run the Hub
+
+```sh
+efferian-hub init --state-dir ./hub-state --admin-token-out ./hub-admin.token
+efferian-hub serve --state-dir ./hub-state
+```
+
+The default listener is `127.0.0.1:8080`. See the operator guide for configuration, live backups and offline administrator recovery. [Hub operations](docs/hub-operations.md)
+
 ## Hub storage
 
 The Hub storage module owns a single `hub.sqlite3` writer under the `hub.lock` sidecar. The database uses WAL, full synchronous commits by default and eight read-only connections for snapshots. State changes and their outbox events commit together. Live subscribers also receive a dedicated revocation feed and must invalidate cached permissions if it reports a gap or closes.

@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "version": "0.6.0",
   "releaseIdentity": "1e3a61daf9a5a1527dd049d9f04f84a42ec22aaba783b66d16cbc95af285914c",
-  "generation": "901fad1b-583f-4688-b396-d1dce08e319f",
+  "generation": "6f16b0dc-5d06-404c-9051-73cab4e92f67",
   "packageMode": "registry",
   "managed": {
     ".devkit/compose.apps.yaml": {
@@ -170,13 +170,13 @@
   },
   "cargoResolution": {
     "version": 1,
-    "lock": "27a801846f016f047d545464a51061d2b9af32f6fd9371ed83f64df9d1188a1a",
+    "lock": "ffe2a724e24d24b0d31932018d26b798c07c83ad1ed46bfebd0cd1dc616175a8",
     "inputs": {
-      "digest": "e07a2c592b09e1678c65cb821d3690b9c7c03d5b904841d1539d0672f52677aa",
-      "policy": "058040da9ad8fa2d8a8a95b19ae4104dc0834604a64226de1d33abbd71d6fa2c",
+      "digest": "52a5e6ce26e8b2bbe0b1af3ff40073bab6708a162e0b38f0336c001c021a10ef",
+      "policy": "530d3f56d77020b43cc5c870bd69c5410716019ec8d615831fe6abc48deaa0e5",
       "members": {
         "apps/cli": "224291444635a28a827e50ec8c5435b47140eaa629c08b41af4ce6b431ac7b14",
-        "apps/hub": "55226bcad224b1df6c5f23532e2e7e411f12d2285336990f53415189b0ee1086",
+        "apps/hub": "7f6670f3d3f23b484bf7cc5bf5f2e0d34e5f8cff6946596dccd4666ae35bdb48",
         "apps/node": "64abdaee4da48420e272d67999d0b347d9c67a98cc8f7fe8f23e68a7c066db62",
         "packages/efferian-authz": "f5b96ac551f479ade753f97321f3d4e75c1f197f6cdd4fe91b480a55144a5b5b",
         "packages/efferian-client": "c2a1b2e7dec4ce7877e6f09891cae4b543f69d6c9e3c2be43d80abcda697de38",

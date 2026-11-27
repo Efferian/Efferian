@@ -20,6 +20,9 @@ pub use lifecycle::{
 };
 pub use maintenance::{StoragePressure, StorageStatus};
 
+pub(crate) use actor::MAX_WORK_BYTES;
+pub(crate) use events::{id, json, opt_id, scalar, scalar_text};
+
 #[allow(unused_imports, reason = "storage write seams for hub modules")]
 pub(crate) use actor::{PriorityKind, WriteTx, WriteTxError};
 #[allow(unused_imports, reason = "storage execution seams for hub modules")]
@@ -86,7 +89,7 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
-    fn validate(&self) -> Result<(), StorageError> {
+    pub(crate) fn validate(&self) -> Result<(), StorageError> {
         if !(MIN_PAGES..=0xffff_fffe).contains(&self.max_page_count) {
             return Err(StorageError::InvalidConfig(
                 "max_page_count is out of range",
@@ -152,6 +155,8 @@ pub enum StorageError {
     PayloadTooLarge,
     #[error("storage has reached its admission watermark")]
     StoragePressure,
+    #[error("at least one active global administrator is required")]
+    LastAdmin,
     #[error("page limit {requested} is below the SQLite page count {actual_page_count}")]
     QuotaBelowCurrentPages {
         requested: u32,
