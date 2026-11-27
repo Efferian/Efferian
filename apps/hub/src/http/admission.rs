@@ -7,10 +7,12 @@ use axum::{
     response::Response,
 };
 use efferian_protocol::PrincipalId;
-use http::{HeaderMap, Method, header::AUTHORIZATION};
+use http::Method;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::vault::auth::{authenticate_api, authenticate_enrollment, authenticate_node};
+use crate::vault::auth::{
+    ParsedBearer, authenticate_api, authenticate_enrollment, authenticate_node,
+};
 
 use super::extract::buffer_mcp;
 use super::{ApiCaller, ApiError, ApiResult, AppState, EnrollmentCaller, NodeCaller};
@@ -58,7 +60,7 @@ pub(super) async fn api(
     next: Next,
 ) -> ApiResult<Response> {
     let pre_auth = admission.pre_auth_permit()?;
-    let headers = authorization_headers(&request);
+    let bearer = ParsedBearer::from_headers(request.headers())?;
     let clock = Arc::clone(&admission.state.clock);
     let vault = Arc::clone(&admission.state.vault);
     let authenticated = admission
@@ -67,10 +69,10 @@ pub(super) async fn api(
         .read_snapshot(move |conn| {
             // Keep the slot even if the HTTP request disappears while SQLite is running.
             let _permit = pre_auth;
-            authenticate_api(&vault, conn, &headers, clock.wall_now_ms())
+            authenticate_api(&vault, conn, bearer, clock.wall_now_ms())
         })
         .await?;
-    let principal_id = authenticated.context.caller.principal_id;
+    let principal_id = authenticated.principal_id;
     request.extensions_mut().insert(ApiCaller(authenticated));
 
     if matches!(lane, ApiLane::Control) {
@@ -97,7 +99,7 @@ pub(super) async fn enrollment(
     next: Next,
 ) -> ApiResult<Response> {
     let pre_auth = admission.pre_auth_permit()?;
-    let headers = authorization_headers(&request);
+    let bearer = ParsedBearer::from_headers(request.headers())?;
     let clock = Arc::clone(&admission.state.clock);
     let vault = Arc::clone(&admission.state.vault);
     let authenticated = admission
@@ -105,7 +107,7 @@ pub(super) async fn enrollment(
         .storage
         .read_snapshot(move |conn| {
             let _permit = pre_auth;
-            authenticate_enrollment(&vault, conn, &headers, clock.wall_now_ms())
+            authenticate_enrollment(&vault, conn, bearer, clock.wall_now_ms())
         })
         .await?;
     let _application = admission
@@ -124,26 +126,18 @@ pub(super) async fn node(
     next: Next,
 ) -> ApiResult<Response> {
     let pre_auth = admission.pre_auth_permit()?;
-    let headers = authorization_headers(&request);
+    let bearer = ParsedBearer::from_headers(request.headers())?;
     let vault = Arc::clone(&admission.state.vault);
     let authenticated = admission
         .state
         .storage
         .read_snapshot(move |conn| {
             let _permit = pre_auth;
-            authenticate_node(&vault, conn, &headers)
+            authenticate_node(&vault, conn, bearer)
         })
         .await?;
     request.extensions_mut().insert(NodeCaller(authenticated));
     Ok(next.run(request).await)
-}
-
-fn authorization_headers(request: &Request) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for value in request.headers().get_all(AUTHORIZATION) {
-        headers.append(AUTHORIZATION, value.clone());
-    }
-    headers
 }
 
 struct PrincipalSlots {

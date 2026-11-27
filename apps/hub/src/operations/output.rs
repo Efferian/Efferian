@@ -9,7 +9,7 @@ use super::{OperationError, RESERVED, path_io};
 
 pub(super) enum TokenOutput {
     Stdout,
-    File(FileOutput),
+    File(FileOutput, TemporaryFile),
 }
 
 impl TokenOutput {
@@ -17,7 +17,9 @@ impl TokenOutput {
         if path.as_os_str() == "-" {
             Ok(Self::Stdout)
         } else {
-            Ok(Self::File(FileOutput::preflight(state_dir, path)?))
+            let target = FileOutput::preflight(state_dir, path)?;
+            let temporary = target.reserve()?;
+            Ok(Self::File(target, temporary))
         }
     }
 
@@ -32,8 +34,7 @@ impl TokenOutput {
             Self::Stdout => {
                 write_token(&mut io::stdout().lock(), secret).map_err(OperationError::Stdout)
             }
-            Self::File(target) => {
-                let mut temporary = target.reserve()?;
+            Self::File(target, mut temporary) => {
                 write_token(&mut temporary.file, secret)
                     .map_err(|error| path_io("write token output", &temporary.path, error))?;
                 temporary.publish(target)
@@ -82,6 +83,14 @@ impl FileOutput {
             .map_err(|error| path_io("inspect state directory", state_dir, error))?;
         if same_inode(&parent_meta, &state_meta) && RESERVED.contains(&name) {
             return Err(invalid_output(path, "reserved Hub state filename"));
+        }
+        let state_dir = fs::canonicalize(state_dir)
+            .map_err(|error| path_io("resolve state directory", state_dir, error))?;
+        if parent.starts_with(state_dir.join(super::STAGING)) {
+            return Err(invalid_output(
+                path,
+                "output is inside the Hub staging directory",
+            ));
         }
         let target = parent.join(name);
         if target.to_str().is_none() {

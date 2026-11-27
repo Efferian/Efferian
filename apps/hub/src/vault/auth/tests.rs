@@ -33,6 +33,42 @@ fn database(vault: &Vault) -> Connection {
     conn
 }
 
+fn api_from_headers(
+    vault: &Vault,
+    conn: &Connection,
+    headers: &HeaderMap,
+    now: i64,
+) -> Result<AuthenticatedApi, CredentialError> {
+    authenticate_api(
+        vault,
+        conn,
+        ParsedBearer::<TokenId>::from_headers(headers)?,
+        now,
+    )
+}
+
+fn enrollment_from_headers(
+    vault: &Vault,
+    conn: &Connection,
+    headers: &HeaderMap,
+    now: i64,
+) -> Result<AuthenticatedEnrollment, CredentialError> {
+    authenticate_enrollment(
+        vault,
+        conn,
+        ParsedBearer::<EnrollmentId>::from_headers(headers)?,
+        now,
+    )
+}
+
+fn node_from_headers(
+    vault: &Vault,
+    conn: &Connection,
+    headers: &HeaderMap,
+) -> Result<VerifiedCredential<NodeId>, CredentialError> {
+    authenticate_node(vault, conn, ParsedBearer::<NodeId>::from_headers(headers)?)
+}
+
 fn headers(token: &SecretString) -> HeaderMap {
     let mut header = HeaderValue::from_str(&format!("Bearer {}", token.expose_secret())).unwrap();
     header.set_sensitive(true);
@@ -105,7 +141,7 @@ fn strict_bearer_parser_and_family_selection() {
     };
 
     assert_eq!(
-        authenticate_api(
+        api_from_headers(
             &vault,
             &conn,
             &request_headers(&format!("bEaReR {raw}")),
@@ -118,7 +154,7 @@ fn strict_bearer_parser_and_family_selection() {
     );
     let mut duplicate = headers(&issued.secret);
     duplicate.append(AUTHORIZATION, duplicate[AUTHORIZATION].clone());
-    assert_unauthenticated(authenticate_api(&vault, &conn, &duplicate, NOW));
+    assert_unauthenticated(api_from_headers(&vault, &conn, &duplicate, NOW));
     let mut uppercase_hex = format!("Bearer {raw}");
     uppercase_hex.pop();
     uppercase_hex.push('A');
@@ -133,7 +169,7 @@ fn strict_bearer_parser_and_family_selection() {
         format!("Bearer{}", " ".repeat(507)),
         uppercase_hex,
     ] {
-        assert_unauthenticated(authenticate_api(
+        assert_unauthenticated(api_from_headers(
             &vault,
             &conn,
             &request_headers(&invalid),
@@ -143,15 +179,15 @@ fn strict_bearer_parser_and_family_selection() {
     let enrollment = vault.issue_enrollment(EnrollmentId::new()).unwrap();
     let node = vault.issue_node(NodeId::new()).unwrap();
     for secret in [&enrollment.secret, &node.secret] {
-        assert_unauthenticated(authenticate_api(&vault, &conn, &headers(secret), NOW));
+        assert_unauthenticated(api_from_headers(&vault, &conn, &headers(secret), NOW));
     }
-    assert_unauthenticated(authenticate_enrollment(
+    assert_unauthenticated(enrollment_from_headers(
         &vault,
         &conn,
         &headers(&issued.secret),
         NOW,
     ));
-    assert_unauthenticated(authenticate_node(&vault, &conn, &headers(&issued.secret)));
+    assert_unauthenticated(node_from_headers(&vault, &conn, &headers(&issued.secret)));
 }
 
 #[test]
@@ -163,7 +199,7 @@ fn dummy_verifier_runs_for_missing_purging_and_unknown_key_rows() {
     let missing = vault.issue_token(TokenId::new_user_or_agent()).unwrap();
     let check_dummy = |secret| {
         MAC_CHECKS.with(|checks| checks.set(0));
-        assert_unauthenticated(authenticate_api(&vault, &conn, &headers(secret), NOW));
+        assert_unauthenticated(api_from_headers(&vault, &conn, &headers(secret), NOW));
         MAC_CHECKS.with(|checks| assert_eq!(checks.get(), 1));
     };
     check_dummy(&missing.secret);
@@ -181,7 +217,7 @@ fn dummy_verifier_runs_for_missing_purging_and_unknown_key_rows() {
         [id.to_string()],
     )
     .unwrap();
-    assert!(authenticate_api(&vault, &conn, &headers(&issued.secret), NOW).is_ok());
+    assert!(api_from_headers(&vault, &conn, &headers(&issued.secret), NOW).is_ok());
     conn.execute(
         "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1",
         [user.to_string()],
@@ -198,11 +234,13 @@ fn api_auth_reads_only_and_checks_mac_before_disabled_or_expired_status() {
     let (id, issued) = token(&vault, &conn, admin, PrincipalKind::Admin);
     conn.execute_batch("PRAGMA query_only = ON;").unwrap();
     let changes = conn.total_changes();
-    let accepted = authenticate_api(&vault, &conn, &headers(&issued.secret), NOW).unwrap();
-    assert_eq!(accepted.context.token.token_id, id);
-    assert_eq!(accepted.context.caller.principal_id, admin);
+    let accepted = api_from_headers(&vault, &conn, &headers(&issued.secret), NOW).unwrap();
+    assert_eq!(accepted.credential.id(), id);
+    assert_eq!(accepted.principal_id, admin);
     assert_eq!(
-        accepted.context.caller_grants,
+        refresh_api(&conn, &accepted.credential, NOW)
+            .unwrap()
+            .caller_grants,
         [GrantView {
             scope: GrantScope::Global,
             capability: Capability::Admin
@@ -218,14 +256,14 @@ fn api_auth_reads_only_and_checks_mac_before_disabled_or_expired_status() {
     )
     .unwrap();
     let wrong_secret = vault.issue_token(id).unwrap();
-    assert_unauthenticated(authenticate_api(
+    assert_unauthenticated(api_from_headers(
         &vault,
         &conn,
         &headers(&wrong_secret.secret),
         NOW,
     ));
     assert!(matches!(
-        authenticate_api(&vault, &conn, &headers(&issued.secret), NOW),
+        api_from_headers(&vault, &conn, &headers(&issued.secret), NOW),
         Err(CredentialError::Authz(AuthzError::PrincipalDisabled)),
     ));
     conn.execute(
@@ -233,7 +271,7 @@ fn api_auth_reads_only_and_checks_mac_before_disabled_or_expired_status() {
         params![NOW, id.to_string()],
     )
     .unwrap();
-    assert_unauthenticated(authenticate_api(
+    assert_unauthenticated(api_from_headers(
         &vault,
         &conn,
         &headers(&issued.secret),
@@ -249,7 +287,7 @@ fn api_auth_reads_only_and_checks_mac_before_disabled_or_expired_status() {
     )
     .unwrap();
     assert_unauthenticated(refresh_api(&conn, &accepted.credential, NOW));
-    assert!(authenticate_api(&vault, &conn, &headers(&wrong_secret.secret), NOW).is_ok());
+    assert!(api_from_headers(&vault, &conn, &headers(&wrong_secret.secret), NOW).is_ok());
 }
 
 #[test]
@@ -273,13 +311,13 @@ fn service_tokens_and_managed_agents_use_current_principal_projection() {
     let manager_headers = headers(&manager_token.secret);
     let agent_headers = headers(&agent_token.secret);
 
-    let manager_context = authenticate_api(&vault, &conn, &manager_headers, NOW)
-        .unwrap()
-        .context;
+    let manager_auth = api_from_headers(&vault, &conn, &manager_headers, NOW).unwrap();
+    let manager_context = refresh_api(&conn, &manager_auth.credential, NOW).unwrap();
     assert_eq!(manager_context.caller.kind, PrincipalKind::Service);
     assert!(manager_context.caller.is_orchestrator);
-    let agent_auth = authenticate_api(&vault, &conn, &agent_headers, NOW).unwrap();
-    assert_eq!(agent_auth.context.managed_by.unwrap().principal_id, manager);
+    let agent_auth = api_from_headers(&vault, &conn, &agent_headers, NOW).unwrap();
+    let agent_context = refresh_api(&conn, &agent_auth.credential, NOW).unwrap();
+    assert_eq!(agent_context.managed_by.unwrap().principal_id, manager);
     conn.execute(
         "UPDATE principals SET is_orchestrator = 0 WHERE principal_id = ?1",
         [manager.to_string()],
@@ -290,7 +328,7 @@ fn service_tokens_and_managed_agents_use_current_principal_projection() {
         Err(CredentialError::Authz(AuthzError::InvalidAuthContext)),
     ));
     assert!(matches!(
-        authenticate_api(&vault, &conn, &agent_headers, NOW),
+        api_from_headers(&vault, &conn, &agent_headers, NOW),
         Err(CredentialError::Authz(AuthzError::InvalidAuthContext)),
     ));
 }
@@ -323,7 +361,7 @@ fn new_managed_enrollment_requires_the_issuers_current_tag_allowlist() {
     )
     .unwrap();
     let request = headers(&issued.secret);
-    let authenticated = authenticate_enrollment(&vault, &conn, &request, NOW).unwrap();
+    let authenticated = enrollment_from_headers(&vault, &conn, &request, NOW).unwrap();
     assert!(matches!(
         authenticated.record,
         EnrollmentRecord::New { managed_by: Some(id), ref tags, .. }
@@ -334,7 +372,7 @@ fn new_managed_enrollment_requires_the_issuers_current_tag_allowlist() {
         [manager.to_string()],
     )
     .unwrap();
-    assert_unauthenticated(authenticate_enrollment(&vault, &conn, &request, NOW));
+    assert_unauthenticated(enrollment_from_headers(&vault, &conn, &request, NOW));
     assert_unauthenticated(recheck_enrollment(&conn, &authenticated.credential, NOW));
 }
 
@@ -370,8 +408,8 @@ fn enrollment_and_node_auth_recheck_current_rows_and_active_managers() {
     )
     .unwrap();
 
-    assert_unauthenticated(authenticate_node(&vault, &conn, &headers(&node.secret)));
-    assert_unauthenticated(authenticate_enrollment(
+    assert_unauthenticated(node_from_headers(&vault, &conn, &headers(&node.secret)));
+    assert_unauthenticated(enrollment_from_headers(
         &vault,
         &conn,
         &headers(&issued.secret),
@@ -380,13 +418,13 @@ fn enrollment_and_node_auth_recheck_current_rows_and_active_managers() {
     conn.execute("UPDATE node_enrollments SET created_at_ms = ?1", [NOW + 1])
         .unwrap();
     // A demoted, active service can still manage a previously enrolled node.
-    let enrollment = authenticate_enrollment(&vault, &conn, &headers(&issued.secret), NOW).unwrap();
+    let enrollment = enrollment_from_headers(&vault, &conn, &headers(&issued.secret), NOW).unwrap();
     assert_eq!(enrollment.credential.id(), enrollment_id);
     assert!(
         matches!(enrollment.record, EnrollmentRecord::Reenroll { node_id: id } if id == node_id)
     );
-    assert_unauthenticated(authenticate_node(&vault, &conn, &headers(&issued.secret)));
-    assert_unauthenticated(authenticate_enrollment(
+    assert_unauthenticated(node_from_headers(&vault, &conn, &headers(&issued.secret)));
+    assert_unauthenticated(enrollment_from_headers(
         &vault,
         &conn,
         &headers(&node.secret),
@@ -396,7 +434,7 @@ fn enrollment_and_node_auth_recheck_current_rows_and_active_managers() {
 
     conn.execute("UPDATE nodes SET revoked_at_ms = NULL", [])
         .unwrap();
-    let authenticated_node = authenticate_node(&vault, &conn, &headers(&node.secret)).unwrap();
+    let authenticated_node = node_from_headers(&vault, &conn, &headers(&node.secret)).unwrap();
     recheck_node(&conn, &authenticated_node).unwrap();
     conn.execute(
         "UPDATE principals SET disabled_at_ms = ?1 WHERE principal_id = ?2",
@@ -418,5 +456,5 @@ fn enrollment_and_node_auth_recheck_current_rows_and_active_managers() {
     conn.execute("UPDATE nodes SET credential_hmac = ?1", [&rotated.verifier])
         .unwrap();
     assert_unauthenticated(recheck_node(&conn, &authenticated_node));
-    authenticate_node(&vault, &conn, &headers(&rotated.secret)).unwrap();
+    node_from_headers(&vault, &conn, &headers(&rotated.secret)).unwrap();
 }

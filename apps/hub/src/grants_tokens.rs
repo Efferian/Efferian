@@ -12,7 +12,7 @@ use efferian_protocol::{
     ActorId, Capability, GrantId, GrantScope, NodeId, PrincipalId, PrincipalKind, PrincipalPrefix,
     ProblemDetails, ProfileId, SecretString, TokenId, error_codes,
 };
-use rusqlite::{Connection, OptionalExtension, Row, named_params, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -493,43 +493,15 @@ async fn delete_grant(
     Ok(StatusCode::NO_CONTENT)
 }
 
-macro_rules! subject_page_sql {
-    ($select:literal, $table:literal, $id:literal) => {
-        concat!(
-            "SELECT ",
-            $select,
-            " FROM ",
-            $table,
-            " r
-             JOIN principals p ON p.principal_id = r.principal_id
-             JOIN hub_meta h ON h.id = 1
-             WHERE p.principal_id IS NOT h.gc_purging_principal_id
-               AND (:subject IS NULL OR p.principal_id = :subject)
-               AND (:admin
-                    OR (:member AND (p.principal_id = :caller
-                        OR (p.kind = 'agent' AND p.owner_principal_id = :caller)))
-                    OR (:orchestrator AND p.kind = 'agent' AND p.owner_principal_id IS NULL
-                        AND p.managed_by_principal_id = :caller))
-               AND ",
-            $id,
-            " COLLATE BINARY > :cursor
-             ORDER BY ",
-            $id,
-            " COLLATE BINARY ASC LIMIT :limit"
-        )
-    };
-}
-
-const TOKEN_LIST: &str = subject_page_sql!(
-    "r.token_id, r.principal_id, r.label, r.max_capability, r.allowed_profiles_json, r.allowed_nodes_json,
-     r.withhold_sensitive, r.created_at_ms, r.expires_at_ms, r.revoked_at_ms",
-    "auth_tokens",
-    "r.token_id"
+const TOKEN_LIST: (&str, &str) = (
+    "SELECT r.token_id, r.principal_id, r.label, r.max_capability, r.allowed_profiles_json,
+            r.allowed_nodes_json, r.withhold_sensitive, r.created_at_ms, r.expires_at_ms, r.revoked_at_ms
+     FROM auth_tokens r",
+    "r.token_id",
 );
-const GRANT_LIST: &str = subject_page_sql!(
-    "r.grant_id, r.principal_id, r.scope_kind, r.scope_id, r.capability",
-    "grants",
-    "r.grant_id"
+const GRANT_LIST: (&str, &str) = (
+    "SELECT r.grant_id, r.principal_id, r.scope_kind, r.scope_id, r.capability FROM grants r",
+    "r.grant_id",
 );
 
 fn read_subject_page<Id: ToString, Item>(
@@ -538,32 +510,56 @@ fn read_subject_page<Id: ToString, Item>(
     query: SubjectPageQuery<Id>,
     limit: usize,
     metadata: SubjectMetadata,
-    sql: &str,
-    decode: impl FnMut(&Row<'_>) -> rusqlite::Result<(PrincipalId, Item)>,
+    (select, id): (&str, &str),
+    mut decode: impl FnMut(&Row<'_>) -> rusqlite::Result<(PrincipalId, Item)>,
 ) -> ApiResult<Vec<Item>> {
-    if let Some(principal_id) = query.principal_id {
-        let target =
-            read_principal(conn, principal_id)?.ok_or_else(|| point_missing(ctx, false))?;
+    let mut checked = BTreeSet::new();
+    let caller = ctx.caller.principal_id;
+    // A subject filter can use the principal index directly. An unfiltered
+    // delegate page starts with the subjects that delegate can see.
+    let (visibility, subject) = if let Some(subject) = query.principal_id {
+        let target = read_principal(conn, subject)?.ok_or_else(|| point_missing(ctx, false))?;
         authorize_subject_metadata_read(ctx, &target, metadata)?;
-    }
-    let mut statement = conn.prepare_cached(sql)?;
-    let rows = statement.query_map(
-        named_params! {
-            ":subject": query.principal_id.map(|id| id.to_string()),
-            ":admin": authorize_admin(ctx).is_ok(),
-            ":member": ctx.caller.kind == PrincipalKind::Member,
-            ":orchestrator": ctx.caller.is_orchestrator,
-            ":caller": ctx.caller.principal_id.to_string(),
-            ":cursor": query.cursor.map(|id| id.to_string()).unwrap_or_default(),
-            ":limit": limit + 1,
-        },
-        decode,
-    )?;
+        checked.insert(subject);
+        ("r.principal_id = ?3", Some(subject))
+    } else if authorize_admin(ctx).is_ok() {
+        (
+            "r.principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1)",
+            None,
+        )
+    } else if ctx.caller.kind == PrincipalKind::Member {
+        (
+            "r.principal_id IN (SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1
+          WHERE p.principal_id IS NOT h.gc_purging_principal_id
+            AND (p.principal_id = ?3 OR (p.kind = 'agent' AND p.owner_principal_id = ?3)))",
+            Some(caller),
+        )
+    } else if ctx.caller.is_orchestrator {
+        (
+            "r.principal_id IN (SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1
+          WHERE p.principal_id IS NOT h.gc_purging_principal_id AND p.kind = 'agent'
+            AND p.owner_principal_id IS NULL AND p.managed_by_principal_id = ?3)",
+            Some(caller),
+        )
+    } else {
+        return Ok(Vec::new());
+    };
+
+    let mut stmt = conn.prepare_cached(&format!(
+        "{select} WHERE {visibility} AND {id} COLLATE BINARY > ?1 ORDER BY {id} COLLATE BINARY ASC LIMIT ?2"
+    ))?;
+    let cursor = query.cursor.map(|id| id.to_string()).unwrap_or_default();
+    let mut rows = match subject {
+        Some(subject) => stmt.query(params![cursor, limit + 1, subject.to_string()])?,
+        None => stmt.query(params![cursor, limit + 1])?,
+    };
     let mut items = Vec::new();
-    for row in rows {
-        let (subject, item) = row?;
-        let target = read_principal(conn, subject)?.ok_or_else(ApiError::internal)?;
-        authorize_subject_metadata_read(ctx, &target, metadata)?;
+    while let Some(row) = rows.next()? {
+        let (subject, item) = decode(row)?;
+        if checked.insert(subject) {
+            let target = read_principal(conn, subject)?.ok_or_else(ApiError::internal)?;
+            authorize_subject_metadata_read(ctx, &target, metadata)?;
+        }
         items.push(item);
     }
     Ok(items)

@@ -341,6 +341,18 @@ async fn token_pages_filter_before_binary_cursor_and_treat_purging_as_missing() 
     expected.sort();
     assert_eq!(page["items"][0]["token_id"], expected[0]);
     assert_eq!(page["next_cursor"], expected[0]);
+    let (status, page) = fixture
+        .request(
+            Method::GET,
+            &format!("/v1/tokens?principal_id={}", agent.principal_id),
+            member.secret.expose_secret(),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["items"].as_array().ok_or("expected items")?.len(), 1);
+    assert_eq!(page["items"][0]["token_id"], agent.token_id.to_string());
+    assert!(page["next_cursor"].is_null());
     for hidden in [purging_id, service.principal_id, PrincipalId::new_service()] {
         let (status, problem) = fixture
             .request(

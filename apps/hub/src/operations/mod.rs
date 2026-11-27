@@ -283,6 +283,10 @@ pub fn snapshot(state_dir: &Path, out: &Path) -> Result<(), OperationError> {
     let conn = Connection::open_with_flags(state_dir.join(DATABASE), flags)?;
     conn.busy_timeout(Duration::from_secs(5))?;
 
+    let _: HubId = conn.query_row("SELECT hub_id FROM hub_meta WHERE id = 1", [], |row| {
+        storage::id(row, 0)
+    })?;
+
     let temporary = output.reserve()?;
     conn.execute("VACUUM INTO ?1", [temporary.utf8_path()?])?;
     conn.close().map_err(|(_, error)| error)?;

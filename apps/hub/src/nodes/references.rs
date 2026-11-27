@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use efferian_protocol::{
     NodeId, ProfileToolBinding, TargetSelector, ToolDefinition, validate_profile_bindings,
 };
@@ -44,6 +46,7 @@ fn profile_bindings_use_node(conn: &Connection, node_id: NodeId) -> NodeWriteRes
            ON e.profile_id = p.profile_id AND e.version = p.published_version
          WHERE p.published_version > 0 AND e.disabled_at_ms IS NULL",
     )?;
+    let mut checked_revisions = HashSet::new();
     let mut revisions = conn.prepare_cached(
         "SELECT definition_json FROM tool_revisions WHERE tool_id = ?1 AND version = ?2",
     )?;
@@ -55,6 +58,9 @@ fn profile_bindings_use_node(conn: &Connection, node_id: NodeId) -> NodeWriteRes
         for binding in bindings {
             if binding.fixed_node_id == Some(node_id) {
                 return Ok(true);
+            }
+            if !checked_revisions.insert((binding.tool_id, binding.tool_version)) {
+                continue;
             }
             let definition = revisions.query_row(
                 params![binding.tool_id.to_string(), binding.tool_version],

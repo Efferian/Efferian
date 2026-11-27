@@ -32,7 +32,7 @@ type BodyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Stop accepting when `shutdown` resolves, then drain active HTTP connections.
 pub async fn serve(
-    listener: TcpListener,
+    mut listener: TcpListener,
     router: Router,
     max_tcp_connections: usize,
     shutdown: impl Future<Output = ()> + Send,
@@ -51,21 +51,16 @@ pub async fn serve(
         .header_read_timeout(HEADER_READ_TIMEOUT);
     tokio::pin!(shutdown);
 
-    let result = loop {
+    loop {
         tokio::select! {
             biased;
-            () = &mut shutdown => break Ok(()),
+            () = &mut shutdown => break,
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if result.is_err() {
                     tracing::warn!("HTTP connection task stopped unexpectedly");
                 }
             }
-            accepted = listener.accept() => {
-                let (stream, _) = match accepted {
-                    Ok(connected) => connected,
-                    Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => continue,
-                    Err(error) => break Err(error),
-                };
+            (stream, _) = axum::serve::Listener::accept(&mut listener) => {
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                     continue;
                 };
@@ -89,7 +84,7 @@ pub async fn serve(
                 });
             }
         }
-    };
+    }
     drop(listener);
     let _ = drain.send(());
 
@@ -103,7 +98,7 @@ pub async fn serve(
         tracing::warn!("HTTP drain deadline elapsed, closing remaining HTTP connections");
         tasks.shutdown().await;
     }
-    result
+    Ok(())
 }
 
 fn idle_expired(timer: &mut IdleTimer, duration: Duration, cx: &mut Context<'_>) -> bool {

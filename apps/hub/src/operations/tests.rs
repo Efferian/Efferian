@@ -81,6 +81,17 @@ fn init_preflight_preserves_existing_entries_and_creates_no_key_on_refusal() -> 
     assert!(!state.join(MASTER_KEY).exists());
     fs::remove_file(staged)?;
 
+    let staging_output = alias.join(STAGING).join("nested");
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&staging_output)?;
+    assert!(matches!(
+        init(&state, "admin", &staging_output.join("key"), &config),
+        Err(OperationError::InvalidOutput { .. })
+    ));
+    assert!(!state.join(MASTER_KEY).exists());
+
     init(&state, "admin", &token, &config)?;
     assert_eq!(fs::metadata(&state)?.mode() & 0o777, 0o700);
     for file in [state.join(MASTER_KEY), state.join(DATABASE), token.clone()] {
@@ -122,6 +133,38 @@ fn init_preflight_preserves_existing_entries_and_creates_no_key_on_refusal() -> 
     );
     assert_eq!(seed.5.len(), 64);
     assert!(!bootstrap.contains(&seed.5));
+    Ok(())
+}
+
+#[test]
+fn preflight_reserves_private_output_and_cleans_up_on_abort() -> TestResult {
+    let root = TestDir::new()?;
+    let target = root.join("token");
+    let pending = TokenOutput::preflight(&root.0, &target)?;
+    let files = fs::read_dir(&root.0)?.collect::<io::Result<Vec<_>>>()?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].metadata()?.len(), 0);
+    assert_eq!(files[0].metadata()?.mode() & 0o777, 0o600);
+    assert!(!target.exists());
+    drop(pending);
+    assert!(fs::read_dir(&root.0)?.next().is_none());
+    Ok(())
+}
+
+#[test]
+fn snapshot_requires_an_existing_hub_identity() -> TestResult {
+    let root = TestDir::new()?;
+    let source = root.join(DATABASE);
+    let backup = root.join("backup");
+    fs::File::create(&source)?;
+    assert!(snapshot(&root.0, &backup).is_err());
+    assert!(!backup.exists());
+    let db = Connection::open(source)?;
+    db.execute_batch(
+        "CREATE TABLE hub_meta(id, hub_id); INSERT INTO hub_meta VALUES (1, 'invalid');",
+    )?;
+    assert!(snapshot(&root.0, &backup).is_err());
+    assert!(!backup.exists());
     Ok(())
 }
 

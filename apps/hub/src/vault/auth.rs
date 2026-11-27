@@ -79,7 +79,7 @@ impl<Id: fmt::Debug> fmt::Debug for VerifiedCredential<Id> {
 
 #[derive(Clone)]
 pub struct AuthenticatedApi {
-    pub context: AuthContext,
+    pub principal_id: PrincipalId,
     pub credential: VerifiedCredential<TokenId>,
 }
 
@@ -106,19 +106,19 @@ pub enum EnrollmentRecord {
 pub fn authenticate_api(
     vault: &Vault,
     conn: &Connection,
-    headers: &HeaderMap,
+    bearer: ParsedBearer<TokenId>,
     now_ms: i64,
 ) -> Result<AuthenticatedApi, CredentialError> {
     let credential = verify(
         vault,
         conn,
-        headers,
+        bearer,
         CredentialFamily::Token,
         API_VERIFIER_QUERY,
     )?;
     let context = active_api_context(conn, credential.id(), now_ms)?;
     Ok(AuthenticatedApi {
-        context,
+        principal_id: context.caller.principal_id,
         credential,
     })
 }
@@ -131,19 +131,27 @@ pub fn refresh_api(
     now_ms: i64,
 ) -> Result<AuthContext, CredentialError> {
     recheck_verifier(conn, credential, API_VERIFIER_QUERY)?;
-    active_api_context(conn, credential.id(), now_ms)
+    let mut context = active_api_context(conn, credential.id(), now_ms)?;
+    context.caller_grants = grant_views(conn, context.caller.principal_id)?;
+    if let Some(owner) = &context.owner {
+        context.owner_grants = grant_views(conn, owner.principal_id)?;
+    }
+    if let Some(manager) = &context.managed_by {
+        context.managed_by_grants = grant_views(conn, manager.principal_id)?;
+    }
+    Ok(context)
 }
 
 pub fn authenticate_enrollment(
     vault: &Vault,
     conn: &Connection,
-    headers: &HeaderMap,
+    bearer: ParsedBearer<EnrollmentId>,
     now_ms: i64,
 ) -> Result<AuthenticatedEnrollment, CredentialError> {
     let credential = verify(
         vault,
         conn,
-        headers,
+        bearer,
         CredentialFamily::Enrollment,
         ENROLLMENT_VERIFIER_QUERY,
     )?;
@@ -163,12 +171,12 @@ pub fn recheck_enrollment(
 pub fn authenticate_node(
     vault: &Vault,
     conn: &Connection,
-    headers: &HeaderMap,
+    bearer: ParsedBearer<NodeId>,
 ) -> Result<VerifiedCredential<NodeId>, CredentialError> {
     let credential = verify(
         vault,
         conn,
-        headers,
+        bearer,
         CredentialFamily::Node,
         NODE_VERIFIER_QUERY,
     )?;
@@ -214,7 +222,7 @@ fn active_api_context(
 
     let caller =
         read_principal(conn, token.principal_id)?.ok_or(CredentialError::Unauthenticated)?;
-    let mut context = AuthContext {
+    let context = AuthContext {
         owner: load_parent(conn, caller.owner_principal_id)?,
         managed_by: load_parent(conn, caller.managed_by_principal_id)?,
         caller,
@@ -225,13 +233,6 @@ fn active_api_context(
         now_ms,
     };
     check_active(&context)?;
-    context.caller_grants = grant_views(conn, context.caller.principal_id)?;
-    if let Some(owner) = &context.owner {
-        context.owner_grants = grant_views(conn, owner.principal_id)?;
-    }
-    if let Some(manager) = &context.managed_by {
-        context.managed_by_grants = grant_views(conn, manager.principal_id)?;
-    }
     Ok(context)
 }
 
@@ -424,14 +425,14 @@ fn read_verifier(
         .optional()?)
 }
 
-fn verify<Id: FromStr + fmt::Display>(
+fn verify<Id: fmt::Display>(
     vault: &Vault,
     conn: &Connection,
-    headers: &HeaderMap,
+    bearer: ParsedBearer<Id>,
     family: CredentialFamily,
     query: &str,
 ) -> Result<VerifiedCredential<Id>, CredentialError> {
-    let (id, secret) = parse_bearer::<Id>(headers).ok_or(CredentialError::Unauthenticated)?;
+    let ParsedBearer { id, secret } = bearer;
     let canonical_id = id.to_string();
     let row = read_verifier(conn, query, &canonical_id)?;
 
@@ -471,6 +472,18 @@ fn recheck_verifier<Id: fmt::Display>(
         return Err(CredentialError::Unauthenticated);
     }
     Ok(())
+}
+
+pub struct ParsedBearer<Id> {
+    id: Id,
+    secret: SecretBytes,
+}
+
+impl<Id: FromStr> ParsedBearer<Id> {
+    pub fn from_headers(headers: &HeaderMap) -> Result<Self, CredentialError> {
+        let (id, secret) = parse_bearer(headers).ok_or(CredentialError::Unauthenticated)?;
+        Ok(Self { id, secret })
+    }
 }
 
 fn parse_bearer<Id: FromStr>(headers: &HeaderMap) -> Option<(Id, SecretBytes)> {

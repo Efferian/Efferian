@@ -262,15 +262,14 @@ impl Fixture {
             "authorization",
             HeaderValue::from_str(&format!("Bearer {token}"))?,
         );
+        let bearer = crate::vault::auth::ParsedBearer::from_headers(&headers)?;
         self.state
             .storage
-            .read_snapshot(
-                move |conn| match authenticate_node(&vault, conn, &headers) {
-                    Ok(_) => Ok(true),
-                    Err(CredentialError::Unauthenticated) => Ok(false),
-                    Err(error) => Err(error),
-                },
-            )
+            .read_snapshot(move |conn| match authenticate_node(&vault, conn, bearer) {
+                Ok(_) => Ok(true),
+                Err(CredentialError::Unauthenticated) => Ok(false),
+                Err(error) => Err(error),
+            })
             .await
             .map_err(Into::into)
     }
@@ -595,7 +594,15 @@ async fn deleting_a_revoked_node_respects_reversible_catalog_references() -> Tes
     let pinned_definition =
         command_definition(json!({"kind": "fixed", "node_ids": [node]})).to_string();
     let other_definition = command_definition(json!({"kind": "tag", "tag": "alpha"})).to_string();
-    let direct_draft = binding(tool, 2, Some(node)).to_string();
+    // Both aliases pin the same revision. The second has a binding-level node reference.
+    let mut draft = binding(tool, 2, None);
+    let mut alias = binding(tool, 2, Some(node))[0].clone();
+    alias["public_name"] = json!("fixed-alias");
+    draft
+        .as_array_mut()
+        .ok_or("expected binding array")?
+        .push(alias);
+    let direct_draft = draft.to_string();
     let pinned = binding(tool, 1, None).to_string();
     let direct_published = direct_draft.clone();
 

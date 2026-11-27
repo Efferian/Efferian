@@ -11,7 +11,7 @@ efferian-hub serve --state-dir ./hub-state
 
 The default administrator name is `admin`. Serve listens on `127.0.0.1:8080` by default. Serve and offline administration take an exclusive `hub.lock` and require an existing database and matching master key. The state directory is private (`0700`). Init creates the key and token file with mode `0600`. The Hub also accepts an existing owner-only key with mode `0400`. Keep the token and master key in protected storage.
 
-Omit `--admin-token-out` or pass `-` to receive the initial token on stdout exactly once. Output files use a new path in an existing operator-controlled directory. If initialization reports that the database was published but token delivery failed, stop any running Hub and use offline token recovery. A failed initialization can leave the master key on disk. Inspect the database and key together before retrying.
+Omit `--admin-token-out` or pass `-` to receive the initial token on stdout exactly once. Output files use a new path in an existing writable, operator-controlled directory. The Hub reserves a private temporary file there before issuing a token. It rejects output paths inside its initialization staging directory. If initialization reports that the database was published but token delivery failed, stop any running Hub and use offline token recovery. A failed initialization can leave the master key on disk. Inspect the database and key together before retrying.
 
 `GET /v1/health` returns a minimal liveness response. `GET /v1/info` reports the Hub ID and version. `GET /v1/openapi.json` describes the routes and credentials. The current identity and token scope are available at `GET /v1/me` with an API bearer in the `Authorization` header. An unrestricted human Admin with a global admin grant can use `GET /v1/admin/status`.
 
@@ -54,7 +54,7 @@ In a node credential incident, revoke the node with `POST /v1/nodes/{id}/revoke`
 efferian-hub sqlite-snapshot --state-dir ./hub-state --out ./hub-backup.sqlite3
 ```
 
-The snapshot command can run while the Hub is serving. It writes a consistent SQLite copy with mode `0600` and atomically publishes it at an unused path. Back up `hub.master.key` separately. Restore the snapshot to `hub.sqlite3` in a private state directory with mode `0600` on the database and its original master key with mode `0400` or `0600`. Use a fresh destination or clear stale SQLite sidecars while the Hub is stopped. A restore also restores the access and revocation state from the time of the snapshot.
+The snapshot command can run while the Hub is serving. It checks the stored Hub ID and writes a consistent SQLite copy with mode `0600` and atomically publishes it at an unused path. Back up `hub.master.key` separately. Restore the snapshot to `hub.sqlite3` in a private state directory with mode `0600` on the database and its original master key with mode `0400` or `0600`. Use a fresh destination or clear stale SQLite sidecars while the Hub is stopped. A restore also restores the access and revocation state from the time of the snapshot.
 
 ## Recover administrator access offline
 

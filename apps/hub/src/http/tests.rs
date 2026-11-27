@@ -545,6 +545,28 @@ async fn credentials_and_admission_are_separate_from_body_and_control_routes() {
 }
 
 #[tokio::test]
+async fn malformed_credentials_do_not_need_a_database_reader() {
+    let fixture = Fixture::new();
+    let router = fixture.router(Arc::new(Gate::default()));
+    let api = fixture.api.clone();
+    fixture.finish().await;
+    for (method, path, bearer) in [
+        (Method::POST, "/v1/test/json", None),
+        (Method::POST, "/v1/enrollment/exchange", Some(&api)),
+        (Method::GET, "/v1/bridge/connect", Some(&api)),
+    ] {
+        let response = send(router.clone(), request(method, path, bearer, Body::empty())).await;
+        problem(response, StatusCode::UNAUTHORIZED, code::UNAUTHENTICATED).await;
+    }
+    let response = send(
+        router,
+        request(Method::POST, "/v1/test/json", Some(&api), Body::empty()),
+    )
+    .await;
+    problem(response, StatusCode::SERVICE_UNAVAILABLE, code::OVERLOADED).await;
+}
+
+#[tokio::test]
 async fn canceled_http_request_keeps_pre_auth_slot_until_sqlite_finishes() {
     let fixture = Fixture::new();
     let mut state = fixture.state.clone();
