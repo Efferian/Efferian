@@ -214,14 +214,10 @@ impl Maintenance {
                     .saturating_add(appended_events.min(excess).saturating_add(1));
             }
             self.unsampled_commits += 1;
-            if wrote_result_blob && !matches!(self.soft, SoftState::Idle) {
-                self.soft = SoftState::Active {
-                    defer_next_work: true,
-                };
-            }
         }
         // Sample after result blobs or multi-page writes so even small databases
-        // detect a soft/hard transition before the next large batch arrives.
+        // detect a soft/hard transition (or a drop back below 75% from Exhausted)
+        // before deciding whether to wake soft reclamation.
         if !committed
             || resample
             || wrote_result_blob
@@ -229,6 +225,11 @@ impl Maintenance {
             || self.unsampled_commits >= SAMPLE_COMMITS
         {
             self.sample(db)?;
+        }
+        if committed && wrote_result_blob && !matches!(self.soft, SoftState::Idle) {
+            self.soft = SoftState::Active {
+                defer_next_work: true,
+            };
         }
         Ok(())
     }

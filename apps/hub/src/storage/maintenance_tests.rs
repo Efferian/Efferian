@@ -802,9 +802,31 @@ fn soft_state_handles_stale_hard_crossing_external_drop_and_held_scheduled_vacuu
     assert!((75..85).contains(&m2.used_percent), "{}", m2.used_percent);
     m2.run_lane(&db2, GcLane::Soft)?;
     assert_eq!(m2.soft, SoftState::Exhausted { at_hard: false });
-    // External delete returns usage to Normal 65..74%; periodic_due must sample first
-    // and clear Exhausted -> Idle rather than waking Soft in Normal.
+    // External delete returns usage to Normal 65..74%: an intervening
+    // wrote_result_blob commit before periodic_due must sample first, clear
+    // Exhausted -> Idle, and leave the new result untouched.
     conn2.execute("DELETE FROM accounts WHERE account_id = 'temp'", [])?;
+    let normal_result = seed_execution(
+        conn2,
+        &f2,
+        f2.principal,
+        "succeeded",
+        500_000,
+        600_000,
+        1024,
+    )?;
+    m2.after_write(&db2, true, 1024, true, 0, false)?;
+    assert!((65..75).contains(&m2.used_percent), "{}", m2.used_percent);
+    assert_eq!(m2.soft, SoftState::Idle);
+    assert!(conn2.query_row(
+        "SELECT sealed_result_blob IS NOT NULL FROM executions WHERE execution_id = ?1",
+        [normal_result.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?);
+
+    // Same drop into Normal 65..74% before periodic_due must also sample first
+    // and clear Exhausted -> Idle rather than waking Soft in Normal.
+    m2.soft = SoftState::Exhausted { at_hard: false };
     let due = m2.next_gc;
     m2.tick(&db2, due, false)?;
     assert!((65..75).contains(&m2.used_percent), "{}", m2.used_percent);
