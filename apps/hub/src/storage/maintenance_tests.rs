@@ -55,9 +55,7 @@ fn ttl_work_is_row_and_byte_bounded_and_vacuum_drains_multiple_pages() -> TestRe
             assert_eq!(remaining, first.max(second).to_string());
         }
     }
-    let mut stmt = conn.prepare(&format!(
-        "EXPLAIN QUERY PLAN SELECT result_bytes {RESULT_CANDIDATES}"
-    ))?;
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {SELECT_RESULT_BYTES}"))?;
     let plan = stmt
         .query_map(params![i64::MAX, 32], |row| row.get::<_, String>(3))?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -138,22 +136,32 @@ fn event_pruning_is_contiguous_bounded_and_atomic() -> TestResult {
 #[test]
 fn soft_pressure_uses_result_order_hysteresis_and_preserves_events() -> TestResult {
     let f = Fixture::create(StorageConfig {
-        max_page_count: 256,
+        max_page_count: 5_600,
         ..StorageConfig::default()
     })?;
     let db = f.open(OpenMode::OfflineExactVersion)?;
     let conn = &db.conn;
-    let old = seed_execution(conn, &f, f.principal, "succeeded", 100, 200, 350_000)?;
-    let recent = seed_execution(conn, &f, f.principal, "succeeded", 200, 300, 350_000)?;
+    conn.execute(
+        "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+         VALUES ('base', 'base', ?1, 'private', 'secret_kv', zeroblob(13400000), 0, 0)",
+        [f.principal.to_string()],
+    )?;
+    // Each blob exceeds MAX_WORK_BYTES / 2 so one soft pass evicts only the
+    // oldest result, proving both ordering and 75%->65% hysteresis.
+    let old = seed_execution(conn, &f, f.principal, "succeeded", 100, 200, 2_500_000)?;
+    let recent = seed_execution(conn, &f, f.principal, "succeeded", 200, 300, 2_500_000)?;
     conn.execute(
         "INSERT INTO events(event_id, kind, aggregate_type, aggregate_id, actor_id, created_at_ms, expires_at_ms)
          VALUES ('one', 'auth.revoked', 'principal', 'a', 'a', 0, 0)",
         [],
     )?;
-    let mut maintenance = Maintenance::new(&db)?;
-    assert!(maintenance.soft_active);
-    assert!(maintenance.used_percent >= 75);
-    maintenance.gc_step(&db)?;
+    let mut maintenance = Maintenance::new(&db, Arc::new(AtomicU64::new(0)))?;
+    assert!(matches!(maintenance.soft, SoftState::Active { .. }));
+    assert!(
+        (75..85).contains(&maintenance.used_percent),
+        "{}",
+        maintenance.used_percent
+    );
     let has_blob = |id: ExecutionId| {
         conn.query_row(
             "SELECT sealed_result_blob IS NOT NULL FROM executions WHERE execution_id = ?1",
@@ -161,10 +169,24 @@ fn soft_pressure_uses_result_order_hysteresis_and_preserves_events() -> TestResu
             |row| row.get::<_, bool>(0),
         )
     };
+    maintenance.run_lane(&db, GcLane::Soft)?;
     assert!(!has_blob(old)?);
+    assert!(has_blob(recent)?);
+    assert!(
+        (65..75).contains(&maintenance.used_percent),
+        "{}",
+        maintenance.used_percent
+    );
+    assert!(matches!(maintenance.soft, SoftState::Active { .. }));
+
+    maintenance.run_lane(&db, GcLane::Soft)?;
     assert!(!has_blob(recent)?);
-    assert!(!maintenance.soft_active);
-    assert!(maintenance.used_percent < 65);
+    assert!(
+        maintenance.used_percent < 65,
+        "{}",
+        maintenance.used_percent
+    );
+    assert_eq!(maintenance.soft, SoftState::Idle);
     assert_eq!(
         conn.query_row("SELECT count(*) FROM events", [], |row| row
             .get::<_, i64>(0))?,
@@ -362,15 +384,15 @@ fn later_ttl_passes_vacuum_an_existing_freelist_without_new_deletions() -> TestR
     drop(db);
 
     let db = f.open(OpenMode::OfflineExactVersion)?;
-    let mut maintenance = Maintenance::new(&db)?;
+    let mut maintenance = Maintenance::new(&db, Arc::new(AtomicU64::new(0)))?;
     for turn in 1..=2 {
         let now = turn * db.config.gc_interval;
-        maintenance.tick(&db, now)?;
+        maintenance.tick(&db, now, false)?;
         for _ in 0..16 {
             if !maintenance.wait_for(&db, now).is_zero() {
                 break;
             }
-            maintenance.tick(&db, now)?;
+            maintenance.tick(&db, now, false)?;
         }
         assert!(
             !maintenance.wait_for(&db, now).is_zero(),
@@ -398,14 +420,14 @@ fn periodic_token_gc_makes_progress_while_soft_pressure_remains_active() -> Test
         "UPDATE auth_tokens SET revoked_at_ms = ?1",
         [-db.config.token_gc_grace_ms],
     )?;
-    let mut maintenance = Maintenance::new(&db)?;
-    assert!(maintenance.soft_active);
+    let mut maintenance = Maintenance::new(&db, Arc::new(AtomicU64::new(0)))?;
+    assert!(matches!(maintenance.soft, SoftState::Active { .. }));
     for _ in 0..20 {
         seed_execution(conn, &f, f.principal, "succeeded", 100, 200, 1024)?;
-        maintenance.after_write(&db, true, 1024, 0, false)?;
-        maintenance.tick(&db, db.config.gc_interval)?;
+        maintenance.after_write(&db, true, 1024, true, 0, false)?;
+        maintenance.tick(&db, db.config.gc_interval, false)?;
         assert!(
-            maintenance.soft_active,
+            !matches!(maintenance.soft, SoftState::Idle),
             "fixture must stay under soft pressure"
         );
     }
@@ -416,5 +438,288 @@ fn periodic_token_gc_makes_progress_while_soft_pressure_remains_active() -> Test
         revoked, 0,
         "periodic revocation cleanup was starved by soft result GC"
     );
+    Ok(())
+}
+
+#[test]
+fn failing_purge_lane_does_not_starve_other_gc_lanes() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let db = f.open(OpenMode::OfflineExactVersion)?;
+    let conn = &db.conn;
+    let stuck = PrincipalId::new_agent();
+    conn.execute(
+        "INSERT INTO principals(principal_id, kind, name, managed_by_principal_id, disabled_at_ms, created_at_ms, updated_at_ms)
+         VALUES (?1, 'agent', '~purging:stuck', ?2, -1, 0, 0)",
+        params![stuck.to_string(), f.principal.to_string()],
+    )?;
+    // An unexpected RESTRICT reference causes purge_agent_children's final DELETE to fail.
+    conn.execute(
+        "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+         VALUES ('blocker', 'blocker', ?1, 'shared', 'secret_kv', X'01', 0, 0)",
+        [stuck.to_string()],
+    )?;
+    conn.execute(
+        "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1",
+        [stuck.to_string()],
+    )?;
+    let expired_token = TokenId::new_user_or_agent();
+    seed_token(conn, expired_token, f.principal, f.principal)?;
+    conn.execute(
+        "UPDATE auth_tokens SET expires_at_ms = ?1 WHERE token_id = ?2",
+        params![-db.config.token_gc_grace_ms, expired_token.to_string()],
+    )?;
+
+    let gc_errors = Arc::new(AtomicU64::new(0));
+    let mut maintenance = Maintenance::new(&db, Arc::clone(&gc_errors))?;
+    let now = db.config.gc_interval;
+    for _ in 0..16 {
+        maintenance.tick(&db, now, false)?;
+    }
+    assert_eq!(gc_errors.load(Ordering::Relaxed), 1);
+    assert!(maintenance.held_lanes[GcLane::Purge as usize]);
+    assert!(!maintenance.held_lanes[GcLane::Scheduled as usize]);
+    let remaining: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM auth_tokens WHERE token_id = ?1",
+        [expired_token.to_string()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        remaining, 0,
+        "expired token GC was blocked by failing Purge lane"
+    );
+    Ok(())
+}
+
+#[test]
+fn soft_pressure_clears_latch_in_normal_band_and_respects_recency_grace_until_hard() -> TestResult {
+    // Part 1: Normal-band latch clearing (65..74% permanent data must not wipe later results).
+    let f = Fixture::create(StorageConfig {
+        max_page_count: 300,
+        ..StorageConfig::default()
+    })?;
+    let db = f.open(OpenMode::OfflineExactVersion)?;
+    let conn = &db.conn;
+    conn.execute(
+        "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(600000), 0, 0)",
+        [f.principal.to_string()],
+    )?;
+    let old = seed_execution(conn, &f, f.principal, "succeeded", 100, 200, 140_000)?;
+    let mut maintenance = Maintenance::new(&db, Arc::new(AtomicU64::new(0)))?;
+    assert!(
+        maintenance.used_percent >= 75,
+        "{}",
+        maintenance.used_percent
+    );
+    assert!(matches!(maintenance.soft, SoftState::Active { .. }));
+    // First soft pass reclaims `old`, dropping usage into 65..74%.
+    maintenance.run_lane(&db, GcLane::Soft)?;
+    assert!(
+        (65..75).contains(&maintenance.used_percent),
+        "{}",
+        maintenance.used_percent
+    );
+    assert!(!conn.query_row(
+        "SELECT sealed_result_blob IS NOT NULL FROM executions WHERE execution_id = ?1",
+        [old.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?);
+    // Second soft pass finds nothing else reclaimable while < 75% and clears to Idle.
+    maintenance.run_lane(&db, GcLane::Soft)?;
+    assert_eq!(maintenance.soft, SoftState::Idle);
+    // A subsequent normal-pressure result write must NOT reactivate soft eviction.
+    let newer = seed_execution(conn, &f, f.principal, "succeeded", 500, 600, 8_192)?;
+    maintenance.after_write(&db, true, 8_192, true, 0, false)?;
+    assert!(
+        maintenance.used_percent < 75,
+        "{}",
+        maintenance.used_percent
+    );
+    assert_eq!(maintenance.soft, SoftState::Idle);
+    assert!(conn.query_row(
+        "SELECT sealed_result_blob IS NOT NULL FROM executions WHERE execution_id = ?1",
+        [newer.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?);
+
+    // Part 2: 60s recency grace protects fresh receipts at 75..84% and is bypassed at >= 85%.
+    let f2 = Fixture::create(StorageConfig {
+        max_page_count: 300,
+        soft_pressure_grace_ms: 60_000,
+        ..StorageConfig::default()
+    })?;
+    f2.set_wall_ms(100_000);
+    let db2 = f2.open(OpenMode::OfflineExactVersion)?;
+    let conn2 = &db2.conn;
+    conn2.execute(
+        "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(610000), 0, 0)",
+        [f2.principal.to_string()],
+    )?;
+    let aged = seed_execution(
+        conn2,
+        &f2,
+        f2.principal,
+        "succeeded",
+        500_000,
+        600_000,
+        60_000,
+    )?;
+    conn2.execute(
+        "UPDATE executions SET finished_at_ms = 10000 WHERE execution_id = ?1",
+        [aged.to_string()],
+    )?;
+    let fresh = seed_execution(
+        conn2,
+        &f2,
+        f2.principal,
+        "succeeded",
+        500_000,
+        600_000,
+        100_000,
+    )?;
+    conn2.execute(
+        "UPDATE executions SET finished_at_ms = 90000 WHERE execution_id = ?1",
+        [fresh.to_string()],
+    )?;
+    let has_blob2 = |id: ExecutionId| {
+        conn2.query_row(
+            "SELECT sealed_result_blob IS NOT NULL FROM executions WHERE execution_id = ?1",
+            [id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )
+    };
+    let mut m2 = Maintenance::new(&db2, Arc::new(AtomicU64::new(0)))?;
+    assert!((75..85).contains(&m2.used_percent), "{}", m2.used_percent);
+    m2.run_lane(&db2, GcLane::Soft)?;
+    assert!(
+        !has_blob2(aged)?,
+        "aged result should be evicted under soft pressure"
+    );
+    assert!(
+        has_blob2(fresh)?,
+        "fresh result within 60s grace must be preserved at 75..84%"
+    );
+    assert!((75..85).contains(&m2.used_percent), "{}", m2.used_percent);
+    m2.run_lane(&db2, GcLane::Soft)?;
+    assert!(
+        has_blob2(fresh)?,
+        "second soft pass must still respect 60s grace"
+    );
+    assert_eq!(m2.soft, SoftState::Exhausted { at_hard: false });
+
+    // Crossing >= 85% Hard pressure wakes Soft and bypasses recency grace immediately.
+    conn2.execute(
+        "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+         VALUES ('push', 'push', ?1, 'private', 'secret_kv', zeroblob(140000), 0, 0)",
+        [f2.principal.to_string()],
+    )?;
+    m2.after_write(&db2, true, 140_000, false, 0, false)?;
+    assert!(m2.used_percent >= 85, "{}", m2.used_percent);
+    assert!(matches!(
+        m2.soft,
+        SoftState::Active {
+            defer_next_work: true
+        }
+    ));
+    m2.run_lane(&db2, GcLane::Soft)?;
+    assert!(
+        !has_blob2(fresh)?,
+        "hard pressure (>= 85%) must bypass 60s recency grace"
+    );
+    Ok(())
+}
+
+#[test]
+fn reactive_vacuum_batches_small_freelists_and_wal_truncate_clears_cooldown() -> TestResult {
+    let f = Fixture::create(StorageConfig {
+        journal_size_limit_bytes: 4096,
+        ..StorageConfig::default()
+    })?;
+    let db = f.open(OpenMode::OfflineExactVersion)?;
+    let conn = &db.conn;
+    // Free ~10 pages (< 64): reactive vacuum skips, periodic vacuum drains.
+    seed_execution(conn, &f, f.principal, "succeeded", 0, 9, 40_960)?;
+    assert_eq!(gc_transaction(conn, |tx| expire_results(tx, 0))?, 1);
+    let free_small = Pages::read(conn)?.free;
+    assert!(
+        (1..REACTIVE_VACUUM_MIN_FREE_PAGES).contains(&free_small),
+        "{free_small}"
+    );
+
+    let mut maintenance = Maintenance::new(&db, Arc::new(AtomicU64::new(0)))?;
+    maintenance.reactive_vacuum_pending = true;
+    maintenance.run_lane(&db, GcLane::Vacuum)?;
+    assert_eq!(
+        Pages::read(conn)?.free,
+        free_small,
+        "reactive vacuum should skip < 64 free pages"
+    );
+
+    maintenance.periodic_vacuum_pending = true;
+    maintenance.run_lane(&db, GcLane::Vacuum)?;
+    assert_eq!(
+        Pages::read(conn)?.free,
+        0,
+        "periodic vacuum should drain small freelist"
+    );
+
+    // WAL cooldown is cleared immediately when a TRUNCATE succeeds.
+    maintenance.next_wal_truncate = Some(Duration::from_secs(10));
+    for i in 1..=6 {
+        conn.execute("UPDATE hub_meta SET updated_at_ms = ?1", [i])?;
+    }
+    assert!(wal_bytes(&maintenance.wal_path)? > 8192);
+    maintenance.checkpoint_wal(&db, Duration::from_secs(10))?;
+    assert_eq!(maintenance.next_wal_truncate, None);
+    assert_eq!(wal_bytes(&maintenance.wal_path)?, 0);
+    Ok(())
+}
+
+#[test]
+fn all_gc_and_waiter_queries_use_indexes_without_temp_btree() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let db = f.open(OpenMode::OfflineExactVersion)?;
+    let conn = &db.conn;
+
+    let explain = |sql: &str, expected_index: &str| -> TestResult {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .join(" | ");
+        assert!(rows.contains(expected_index), "{sql} -> {rows}");
+        assert!(!rows.contains("TEMP B-TREE"), "{sql} -> {rows}");
+        Ok(())
+    };
+
+    explain(
+        "SELECT execution_id, state, finished_at_ms FROM executions WHERE state IN ('accepted', 'running')",
+        "idx_executions_active_deadline",
+    )?;
+    explain(
+        "SELECT result_bytes FROM executions WHERE sealed_result_blob IS NOT NULL AND result_expires_at_ms <= 0 ORDER BY result_expires_at_ms, execution_id LIMIT 32",
+        "idx_executions_result_expires",
+    )?;
+    explain(
+        "SELECT result_bytes FROM executions WHERE sealed_result_blob IS NOT NULL AND (result_expires_at_ms <= 0 OR finished_at_ms IS NULL OR finished_at_ms <= 0) ORDER BY result_expires_at_ms, execution_id LIMIT 32",
+        "idx_executions_result_expires",
+    )?;
+    explain(
+        "SELECT result_bytes FROM executions WHERE expires_at_ms <= 0 AND state NOT IN ('accepted', 'running') ORDER BY expires_at_ms, rowid LIMIT 32",
+        "idx_executions_expires",
+    )?;
+    explain(
+        "SELECT token_id FROM auth_tokens WHERE expires_at_ms <= 0 ORDER BY expires_at_ms LIMIT 32",
+        "idx_auth_tokens_expires",
+    )?;
+    explain(
+        "SELECT token_id FROM auth_tokens WHERE revoked_at_ms <= 0 ORDER BY revoked_at_ms LIMIT 32",
+        "idx_auth_tokens_revoked",
+    )?;
+    explain(
+        "SELECT enrollment_id FROM node_enrollments WHERE expires_at_ms <= 0 ORDER BY expires_at_ms LIMIT 32",
+        "idx_node_enrollments_expires",
+    )?;
     Ok(())
 }

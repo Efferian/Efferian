@@ -51,7 +51,7 @@ strict_struct! {
         pub node_id: Option<NodeId>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub exit_code: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "crate::result::deserialize_error_code", skip_serializing_if = "Option::is_none")]
         pub error_code: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub duration_ms: Option<u64>,

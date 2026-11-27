@@ -395,6 +395,95 @@ fn receipt_checks_canonical_base64_and_combined_limits_before_lossy_decoding() -
         .ok_or("error detail")?
         .push('x');
     assert!(receipt.decode_and_validate_output(4).is_err());
+    receipt.error_message = None;
+
+    let max_code = "a".repeat(MAX_EXECUTION_ERROR_CODE_BYTES);
+    assert!(validate_error_code(Some(&max_code)).is_ok());
+    assert!(validate_error_code(None).is_ok());
+    receipt.error_code = Some(max_code.clone());
+    assert!(receipt.decode_and_validate_output(4).is_ok());
+    let summary = receipt.summary(Some(5))?;
+    assert!(validate_terminal_summary(receipt.state, &summary, true, false).is_ok());
+    for bad_code in [
+        String::new(),
+        "has space".to_owned(),
+        "has\nnewline".to_owned(),
+        "has\x00nul".to_owned(),
+        "é".to_owned(),
+        "a".repeat(MAX_EXECUTION_ERROR_CODE_BYTES + 1),
+    ] {
+        assert!(
+            validate_error_code(Some(&bad_code)).is_err(),
+            "{bad_code:?}"
+        );
+        let mut bad_receipt = receipt.clone();
+        bad_receipt.error_code = Some(bad_code.clone());
+        assert_eq!(
+            bad_receipt.decode_and_validate_output(4).unwrap_err(),
+            ValidationError::InvalidField("execution error code")
+        );
+        let wire = json!({
+            "v": 1, "epoch": 7, "kind": "execute_res", "payload": bad_receipt
+        });
+        assert!(decode_bridge_frame(&serde_json::to_vec(&wire)?, BridgeReceiver::Hub).is_err());
+        let bad_summary = ExecutionSummary {
+            error_code: Some(bad_code.clone()),
+            effect_may_have_occurred: Some(true),
+            ..ExecutionSummary::default()
+        };
+        assert!(
+            validate_terminal_summary(TerminalExecutionState::Failed, &bad_summary, false, false)
+                .is_err()
+        );
+        let bad_event = json!({
+            "type": "event",
+            "event": {
+                "seq": 1,
+                "event_id": EventId::new(),
+                "source_kind": "hub",
+                "source_id": HubId::new(),
+                "kind": "execution.finished",
+                "aggregate_type": "execution",
+                "aggregate_id": receipt.execution_id,
+                "actor_id": ActorId::Node(NodeId::new()),
+                "created_at_ms": 1,
+                "payload": {
+                    "execution_id": receipt.execution_id,
+                    "state": "failed",
+                    "tool_id": ToolId::new(),
+                    "public_name": "run",
+                    "error_code": bad_code
+                }
+            }
+        });
+        assert!(serde_json::from_value::<EventStreamFrame>(bad_event).is_err());
+    }
+    assert!(
+        validate_terminal_summary(
+            TerminalExecutionState::Unknown,
+            &ExecutionSummary {
+                effect_may_have_occurred: Some(false),
+                ..ExecutionSummary::default()
+            },
+            false,
+            false,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_terminal_summary(
+            TerminalExecutionState::Succeeded,
+            &ExecutionSummary {
+                effect_may_have_occurred: Some(true),
+                output_discarded_reason: Some(OutputDiscardedReason::RamCap),
+                ..ExecutionSummary::default()
+            },
+            true,
+            true,
+        )
+        .is_err()
+    );
+    receipt.error_code = None;
 
     let mut raw = vec![0; MAX_OUTPUT_BYTES as usize];
     let stored = StoredResult::managed_from_bytes(&raw, &[], None, None, MAX_OUTPUT_BYTES)?;

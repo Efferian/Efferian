@@ -15,6 +15,7 @@ use rusqlite::{Connection, params};
 use tokio::sync::oneshot;
 
 use super::actor::{MAX_WORK_BYTES, WriteTxError};
+use super::executions::InvokeWrite;
 use super::*;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -144,6 +145,10 @@ impl Fixture {
 
     pub(super) fn path(&self) -> PathBuf {
         self.dir.join("hub.sqlite3")
+    }
+
+    pub(super) fn set_wall_ms(&self, ms: i64) {
+        self.clock.0.store(ms, Ordering::SeqCst);
     }
 }
 
@@ -1485,6 +1490,8 @@ fn hot_snapshot_journal_is_recovered_only_after_identity_is_validated() -> TestR
         "VACUUM INTO ?1",
         [snapshot.to_str().ok_or("non-UTF-8 snapshot path")?],
     )?;
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600))?;
     drop(source);
     drop(lock);
     let mut subprocess = std::process::Command::new(std::env::current_exe()?);
@@ -1523,6 +1530,17 @@ fn hot_snapshot_journal_is_recovered_only_after_identity_is_validated() -> TestR
     assert!(matches!(reopen(99), Err(StorageError::IdentityMismatch)));
     assert_eq!((fs::read(&snapshot)?, fs::read(&rollback)?), original);
     assert!(!dir.join(".staging-hub-init").exists());
+
+    // A 0400 hot-journal DB must report ReadOnlyDatabase before copying to staging.
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o400))?;
+    let writable = fs::OpenOptions::new().write(true).open(&snapshot).is_ok();
+    if !writable {
+        assert!(matches!(reopen(1), Err(StorageError::ReadOnlyDatabase)));
+        assert_eq!((fs::read(&snapshot)?, fs::read(&rollback)?), original);
+        assert!(!dir.join(".staging-hub-init").exists());
+    }
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600))?;
+
     let opened = reopen(1)?;
     assert_eq!(opened.hub_id(), &f.hub_id);
     let outcome = opened.run_offline_tx(|conn| {
@@ -1861,6 +1879,466 @@ async fn retention_pauses_do_not_reset_the_priority_burst() -> TestResult {
     for priority in queued {
         assert!(priority.await?);
     }
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_waiter_update_notifies_without_removing_waiter() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let accepted = handle.invoke(f.request(RequestId::new())).await?;
+    let mut waiter = accepted.waiter.ok_or("missing waiter")?;
+    assert_eq!(waiter.borrow().state, ExecutionState::Accepted);
+
+    handle
+        .execute_work(0, move |tx| {
+            tx.conn().execute(
+                "UPDATE executions SET state = 'running', started_at_ms = 55 WHERE execution_id = ?1",
+                [accepted.execution_id.to_string()],
+            )?;
+            tx.stage_waiter_update(
+                accepted.execution_id,
+                ExecutionSnapshot {
+                    state: ExecutionState::Running,
+                    finished_at_ms: None,
+                },
+            );
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+    waiter.changed().await?;
+    assert_eq!(
+        *waiter.borrow(),
+        ExecutionSnapshot {
+            state: ExecutionState::Running,
+            finished_at_ms: None,
+        }
+    );
+    assert_eq!(handle.status_snapshot().await?.active_waiters_count, 1);
+    let subscribed = handle
+        .subscribe_waiter(accepted.execution_id)
+        .await?
+        .ok_or("active waiter must stay registered after update")?;
+    assert!(waiter.same_channel(&subscribed));
+
+    assert_eq!(
+        handle
+            .apply_receipt(f.receipt(accepted.execution_id, TerminalExecutionState::Succeeded))
+            .await?,
+        ReceiptOutcome::AppliedTerminal
+    );
+    waiter.changed().await?;
+    assert_eq!(waiter.borrow().state, ExecutionState::Succeeded);
+    assert_eq!(handle.status_snapshot().await?.active_waiters_count, 0);
+    assert!(
+        handle
+            .subscribe_waiter(accepted.execution_id)
+            .await?
+            .is_none()
+    );
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn composable_execution_primitives_enforce_active_editions_replay_and_upstream_running()
+-> TestResult {
+    use efferian_protocol::{PreparedArgumentsDigest, UpstreamId};
+
+    let f = Fixture::create(StorageConfig::default())?;
+    f.set_wall_ms(1_234);
+    let (handle, runtime) = f.start()?;
+    let profile = ProfileId::new();
+    let upstream = UpstreamId::new();
+    let caller = f.principal;
+    let tool = f.tool;
+    let node = f.node;
+    handle
+        .execute_work(0, move |tx| {
+            tx.conn().execute(
+                "INSERT INTO profiles(profile_id, slug, discovery_mode, published_version, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'prof', 'full', 1, 0, 0)",
+                [profile.to_string()],
+            )?;
+            let bindings = serde_json::json!([{
+                "public_name": "run",
+                "tool_id": tool,
+                "tool_version": 1,
+                "fixed_node_id": node,
+            }])
+            .to_string();
+            tx.conn().execute(
+                "INSERT INTO profile_editions(profile_id, version, discovery_mode, bindings_json, published_by, published_at_ms)
+                 VALUES (?1, 1, 'full', ?2, ?3, 0)",
+                params![profile.to_string(), bindings, caller.to_string()],
+            )?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+
+    // Insert a Profile execution, disable the edition, verify new invokes fail
+    // with BindingUnavailable while replay of the existing request still works.
+    let req1 = RequestId::new();
+    let mut invoke1 = f.request(req1);
+    invoke1.resource = InvokeResource::Profile {
+        profile_id: profile,
+        version: NonZeroU64::MIN,
+    };
+    invoke1.public_name = "run".to_owned();
+    let first = handle.invoke(invoke1).await?;
+    assert!(handle.disable_edition(profile, 1).await?);
+
+    let mut invoke_after_disable = f.request(RequestId::new());
+    invoke_after_disable.resource = InvokeResource::Profile {
+        profile_id: profile,
+        version: NonZeroU64::MIN,
+    };
+    invoke_after_disable.public_name = "run".to_owned();
+    assert!(matches!(
+        handle.invoke(invoke_after_disable).await,
+        Err(WriteError::Domain(InvokeWriteError::BindingUnavailable))
+    ));
+
+    let args = PreparedArgumentsDigest::new(&serde_json::Map::new())?;
+    let replay_check = handle
+        .execute_work(0, move |tx| {
+            let recorded = tx
+                .lookup_invocation_replay(caller, req1)?
+                .ok_or(WriteTxError::InvalidDatabase("missing recorded invocation"))?;
+            assert_eq!(recorded.execution_id, first.execution_id);
+            assert_eq!(recorded.profile_id, Some(profile));
+            assert_eq!(recorded.profile_version, Some(1));
+            assert_eq!(recorded.tool_id, tool);
+            assert_eq!(recorded.node_id, Some(node));
+            assert_eq!(recorded.upstream_id, None);
+            tx.verify_invocation_replay(
+                &recorded,
+                &InvokeReplayInput {
+                    resource: InvokeResource::Profile {
+                        profile_id: profile,
+                        version: NonZeroU64::MIN,
+                    },
+                    public_name: "run",
+                    requested_target: None,
+                    arguments: &args,
+                },
+            )
+        })
+        .await?;
+    assert!(replay_check.replayed);
+    assert_eq!(replay_check.execution_id, first.execution_id);
+
+    // Upstream target starts directly in Running with started_at_ms and ExecutionStarted event.
+    let mut live_events = handle.subscribe_events()?;
+    let mut upstream_req = f.request(RequestId::new());
+    upstream_req.executor = ExecutionTarget::Upstream(upstream);
+    let upstream_out = handle.invoke(upstream_req).await?;
+    assert_eq!(upstream_out.snapshot.state, ExecutionState::Running);
+    let waiter = upstream_out.waiter.ok_or("missing upstream waiter")?;
+    assert_eq!(waiter.borrow().state, ExecutionState::Running);
+    let started_at: Option<i64> = handle
+        .read_snapshot(move |conn| {
+            conn.query_row(
+                "SELECT started_at_ms FROM executions WHERE execution_id = ?1",
+                [upstream_out.execution_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
+        })
+        .await?;
+    assert_eq!(started_at, Some(1_234));
+    let started_event = live_events.recv().await?;
+    assert!(matches!(
+        started_event.envelope.event,
+        Event::ExecutionStarted(ref payload)
+            if payload.execution_id == upstream_out.execution_id
+                && payload.state == ExecutionState::Running
+                && payload.node_id.is_none()
+    ));
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_savepoint_errors_preserve_sibling_commands_in_work_batch() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let profile = ProfileId::new();
+    let caller = f.principal;
+
+    // Out-of-range edition version returns Ok(false) rather than truncating.
+    assert!(!handle.disable_edition(profile, u64::MAX).await?);
+
+    // Seed a profile edition with corrupt bindings JSON (duplicate public_name).
+    handle
+        .execute_work(0, move |tx| {
+            let principal = read_principal(tx.conn(), caller)?;
+            assert!(principal.is_some());
+            tx.conn().execute(
+                "INSERT INTO profiles(profile_id, slug, discovery_mode, published_version, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'corrupt', 'full', 1, 0, 0)",
+                [profile.to_string()],
+            )?;
+            tx.conn().execute(
+                "INSERT INTO profile_editions(profile_id, version, discovery_mode, bindings_json, published_by, published_at_ms)
+                 VALUES (?1, 1, 'full', 'not-json', ?2, 0)",
+                params![profile.to_string(), caller.to_string()],
+            )?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+
+    let (release, anchor) = pause_writer(&handle).await?;
+    let mut bad_epoch = f.request(RequestId::new());
+    bad_epoch.executor = ExecutionTarget::Node {
+        node_id: f.node,
+        session_epoch: u64::MAX,
+    };
+    let mut bad_epoch_fut = Box::pin(handle.invoke(bad_epoch));
+
+    let mut corrupt_edition = f.request(RequestId::new());
+    corrupt_edition.resource = InvokeResource::Profile {
+        profile_id: profile,
+        version: NonZeroU64::MIN,
+    };
+    let mut corrupt_fut = Box::pin(handle.invoke(corrupt_edition));
+
+    let mut sibling = Box::pin(handle.execute_work(0, |tx| {
+        tx.conn()
+            .execute("UPDATE hub_meta SET updated_at_ms = 999", [])?;
+        Ok::<_, WriteTxError<Infallible>>(())
+    }));
+
+    assert!(poll!(&mut bad_epoch_fut).is_pending());
+    assert!(poll!(&mut corrupt_fut).is_pending());
+    assert!(poll!(&mut sibling).is_pending());
+    release.send(()).map_err(|_| "writer stopped")?;
+    anchor.await?;
+
+    assert!(matches!(
+        bad_epoch_fut.await,
+        Err(WriteError::Domain(InvokeWriteError::IntegerOutOfRange))
+    ));
+    assert!(matches!(
+        corrupt_fut.await,
+        Err(WriteError::Storage(StorageError::Sqlite(_)))
+    ));
+    sibling.await?;
+    let updated: i64 = handle
+        .read_snapshot(|conn| {
+            conn.query_row("SELECT updated_at_ms FROM hub_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .map_err(StorageError::from)
+        })
+        .await?;
+    assert_eq!(updated, 999);
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[test]
+fn receipt_prepare_enforces_error_code_and_summary_invariants() {
+    let base = || ReceiptWrite {
+        execution_id: ExecutionId::new(),
+        node_id: NodeId::new(),
+        state: TerminalExecutionState::Failed,
+        finished_at_ms: 10,
+        summary: ExecutionSummary {
+            effect_may_have_occurred: Some(true),
+            error_code: Some("ok_code".to_owned()),
+            ..ExecutionSummary::default()
+        },
+        sealed_result_blob: None,
+        result_truncated: false,
+    };
+    assert!(base().prepare().is_ok());
+
+    let mut empty_blob = base();
+    empty_blob.sealed_result_blob = Some(Vec::new());
+    assert!(matches!(
+        empty_blob.prepare(),
+        Err(WriteError::Domain(InvalidReceipt))
+    ));
+
+    let mut huge_code = base();
+    huge_code.summary.error_code = Some("x".repeat(65));
+    assert!(matches!(
+        huge_code.prepare(),
+        Err(WriteError::Domain(InvalidReceipt))
+    ));
+
+    let mut spaced_code = base();
+    spaced_code.summary.error_code = Some("bad code".to_owned());
+    assert!(matches!(
+        spaced_code.prepare(),
+        Err(WriteError::Domain(InvalidReceipt))
+    ));
+
+    let mut bad_unknown = base();
+    bad_unknown.state = TerminalExecutionState::Unknown;
+    bad_unknown.summary.effect_may_have_occurred = Some(false);
+    assert!(matches!(
+        bad_unknown.prepare(),
+        Err(WriteError::Domain(InvalidReceipt))
+    ));
+
+    let mut discarded_not_truncated = base();
+    discarded_not_truncated.summary.output_discarded_reason =
+        Some(efferian_protocol::OutputDiscardedReason::RamCap);
+    discarded_not_truncated.result_truncated = false;
+    assert!(matches!(
+        discarded_not_truncated.prepare(),
+        Err(WriteError::Domain(InvalidReceipt))
+    ));
+}
+
+#[tokio::test]
+async fn read_events_rejects_mismatched_auth_projection_columns() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let actor = ActorId::Hub(f.hub_id);
+    let node = f.node;
+    handle
+        .execute_work(0, move |tx| {
+            tx.append_event(actor, Event::NodeConnected(node))?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+    assert_eq!(handle.read_events(0, None, 10).await?.items.len(), 1);
+    handle
+        .execute_work(0, move |tx| {
+            tx.conn().execute(
+                "UPDATE events SET node_id = ?1 WHERE seq = 1",
+                [NodeId::new().to_string()],
+            )?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+    assert!(matches!(
+        handle.read_events(0, None, 10).await,
+        Err(EventsReadError::Storage(StorageError::Sqlite(
+            rusqlite::Error::FromSqlConversionFailure(..)
+        )))
+    ));
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_stopped()
+-> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let exec = handle
+        .invoke(f.request(RequestId::new()))
+        .await?
+        .execution_id;
+
+    // Trigger an unexpected writer exit via a panicking post-commit hook.
+    handle
+        .execute_work(0, |tx| {
+            tx.on_commit(|| assert_eq!(1, 0, "simulated writer hook panic"));
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+
+    tokio::time::timeout(TIMEOUT, runtime.wait_stopped()).await?;
+
+    // hub.lock must remain held until the runtime is explicitly shut down.
+    assert!(matches!(
+        acquire_state_lock(&f.dir),
+        Err(StorageError::Platform(
+            efferian_platform::PlatformError::LockContended { .. }
+        ))
+    ));
+
+    // All handle entrypoints must report ActorStopped (NOT ShuttingDown).
+    assert!(matches!(
+        handle
+            .execute_work(0, |_| Ok::<_, WriteTxError<Infallible>>(()))
+            .await,
+        Err(WriteError::Storage(StorageError::ActorStopped))
+    ));
+    assert!(matches!(
+        handle.read_snapshot(|_| Ok::<_, StorageError>(())).await,
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
+        handle.subscribe_events(),
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
+        handle.subscribe_revocations(),
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
+        handle.subscribe_waiter(exec).await,
+        Err(StorageError::ActorStopped)
+    ));
+
+    let report = tokio::time::timeout(TIMEOUT, runtime.shutdown()).await?;
+    assert!(matches!(
+        report,
+        ShutdownReport::Failed(StorageError::ActorStopped)
+    ));
+
+    // After shutdown joins the writer thread, hub.lock is released cleanly.
+    drop(acquire_state_lock(&f.dir)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoke_token_and_grant_ignore_principal_being_purged() -> TestResult {
+    use efferian_protocol::GrantId;
+
+    let f = Fixture::create(StorageConfig::default())?;
+    let agent = PrincipalId::new_agent();
+    let token = TokenId::new_user_or_agent();
+    let grant = GrantId::new();
+    let (handle, runtime) = f.start()?;
+    let admin = f.principal;
+    handle
+        .execute_work(0, move |tx| {
+            tx.conn().execute(
+                "INSERT INTO principals(principal_id, kind, name, managed_by_principal_id, disabled_at_ms, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'agent', '~purging:agent', ?2, -1, 0, 0)",
+                params![agent.to_string(), admin.to_string()],
+            )?;
+            seed_token(tx.conn(), token, agent, agent)?;
+            tx.conn().execute(
+                "INSERT INTO grants(grant_id, principal_id, scope_kind, scope_id, capability, created_by, created_at_ms)
+                 VALUES (?1, ?2, 'profile', 'prof_1', 'invoke', ?2, 0)",
+                params![grant.to_string(), agent.to_string()],
+            )?;
+            tx.conn().execute(
+                "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1",
+                [agent.to_string()],
+            )?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+
+    let mut events = handle.subscribe_events()?;
+    let mut revocations = handle.subscribe_revocations()?;
+    let actor = ActorId::Hub(f.hub_id);
+    assert!(!handle.revoke_token(actor, token).await?);
+    assert!(!handle.revoke_grant(grant).await?);
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        revocations.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(handle.revoke_node(actor, f.node).await?);
+    assert!(!handle.revoke_node(actor, f.node).await?);
+    assert!(matches!(
+        events.try_recv()?.envelope.event,
+        Event::NodeRevoked(id) if id == f.node
+    ));
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }

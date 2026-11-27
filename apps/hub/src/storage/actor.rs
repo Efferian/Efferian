@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -10,12 +10,12 @@ use tokio::sync::{broadcast, oneshot, watch};
 
 use super::events::{RevocationSignal, RevocationWatch, StoredEvent};
 use super::lifecycle::{
-    OpenedDb, WalCheckpointOutcome, apply_migration, close_writer, database_path,
-    truncate_checkpoint,
+    LockedStateDir, OpenedDb, WalCheckpointOutcome, close_writer, database_path,
+    migrate_to_current, truncate_checkpoint,
 };
 use super::maintenance::{Maintenance, StoragePressure};
 use super::readers::ReadPool;
-use super::{CURRENT_SCHEMA_VERSION, OpenMode, StorageConfig, StorageError, WriteError};
+use super::{OpenMode, StorageConfig, StorageError, WriteError};
 
 const PRIORITY_CAPACITY: usize = 128;
 const WORK_CAPACITY: usize = 256;
@@ -39,6 +39,7 @@ pub struct StorageHandle {
     hub_id: HubId,
     max_page_count: u32,
     pub(super) active_waiters: Arc<AtomicUsize>,
+    gc_errors: Arc<AtomicU64>,
     mailbox: Arc<Mailbox>,
     readers: Arc<ReadPool>,
     events: broadcast::WeakSender<Arc<StoredEvent>>,
@@ -48,7 +49,8 @@ pub struct StorageHandle {
 pub struct StorageRuntime {
     mailbox: Arc<Mailbox>,
     readers: Arc<ReadPool>,
-    thread: Option<JoinHandle<ShutdownReport>>,
+    stopped: watch::Receiver<bool>,
+    thread: Option<JoinHandle<(ShutdownReport, LockedStateDir)>>,
 }
 
 #[derive(Debug)]
@@ -63,13 +65,23 @@ pub enum ShutdownReport {
 }
 
 impl StorageRuntime {
+    /// Resolves when the background writer thread exits (either gracefully or
+    /// after an unrecoverable error). Safe to use in a supervisor `select!`.
+    pub async fn wait_stopped(&self) {
+        let mut rx = self.stopped.clone();
+        let _ = rx.wait_for(|&stopped| stopped).await;
+    }
+
     pub async fn shutdown(mut self) -> ShutdownReport {
         self.begin_shutdown();
         let Some(thread) = self.thread.take() else {
             return ShutdownReport::Failed(StorageError::ActorStopped);
         };
         match tokio::task::spawn_blocking(move || thread.join()).await {
-            Ok(Ok(report)) => report,
+            Ok(Ok((report, lock))) => {
+                drop(lock);
+                report
+            }
             Ok(Err(_)) => ShutdownReport::Failed(StorageError::ActorStopped),
             Err(error) => ShutdownReport::Failed(error.into()),
         }
@@ -83,8 +95,8 @@ impl StorageRuntime {
 
 impl Drop for StorageRuntime {
     fn drop(&mut self) {
-        // The writer finishes the drain even when an owner drops the runtime
-        // or cancels a shutdown future. Joining never blocks an async worker.
+        // The writer finishes draining and releases `hub.lock` after closing
+        // SQLite even when an owner drops the runtime or cancels shutdown.
         self.begin_shutdown();
     }
 }
@@ -98,11 +110,15 @@ impl StorageHandle {
         self.max_page_count
     }
 
+    pub fn gc_error_count(&self) -> u64 {
+        self.gc_errors.load(Ordering::Relaxed)
+    }
+
     pub fn subscribe_events(&self) -> Result<broadcast::Receiver<Arc<StoredEvent>>, StorageError> {
         self.events
             .upgrade()
             .map(|events| events.subscribe())
-            .ok_or(StorageError::ShuttingDown)
+            .ok_or_else(|| self.mailbox.closed_error())
     }
 
     /// A lagged or closed revocation receiver must invalidate cached authorization.
@@ -110,7 +126,7 @@ impl StorageHandle {
         self.revocations
             .upgrade()
             .map(|revocations| RevocationWatch::new(revocations.subscribe()))
-            .ok_or(StorageError::ShuttingDown)
+            .ok_or_else(|| self.mailbox.closed_error())
     }
 
     pub async fn subscribe_waiter(
@@ -125,7 +141,7 @@ impl StorageHandle {
             state.subscriptions.push_back((execution_id, send));
             Ok(())
         })?;
-        recv.await.map_err(|_| StorageError::ActorStopped)
+        recv.await.map_err(|_| self.mailbox.closed_error())
     }
 
     pub async fn read_snapshot<T, E>(
@@ -139,6 +155,7 @@ impl StorageHandle {
         self.readers.snapshot(read).await
     }
 
+    #[allow(dead_code, reason = "work lane write seam for hub modules")]
     pub(crate) async fn execute_work<T, E, F>(
         &self,
         bytes: usize,
@@ -155,6 +172,7 @@ impl StorageHandle {
         self.execute(Some(bytes), op).await
     }
 
+    #[allow(dead_code, reason = "priority lane write seam for hub modules")]
     pub(crate) async fn execute_priority<T, E, F>(
         &self,
         _kind: PriorityKind,
@@ -194,7 +212,7 @@ impl StorageHandle {
             }
             Ok(())
         })?;
-        response.await.map_err(|_| StorageError::ActorStopped)?
+        response.await.map_err(|_| self.mailbox.closed_error())?
     }
 }
 
@@ -209,25 +227,21 @@ impl OpenedDb {
         let found: u32 = self
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        for version in found + 1..=CURRENT_SCHEMA_VERSION {
-            let tx = self
-                .conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            apply_migration(&tx, version)?;
-            tx.pragma_update(None, "user_version", version)?;
-            tx.commit()?;
-        }
+        migrate_to_current(&mut self.conn, found)?;
 
         let readers = ReadPool::open(database_path(&self.lock))?;
         let mailbox = Arc::new(Mailbox::default());
         let (events, _) = broadcast::channel(EVENTS_CAPACITY);
         let (revocations, _) = broadcast::channel(REVOCATIONS_CAPACITY);
+        let (stopped_tx, stopped_rx) = watch::channel(false);
         let waiters = restore_waiters(&self.conn)?;
         let active_waiters = Arc::new(AtomicUsize::new(waiters.len()));
+        let gc_errors = Arc::new(AtomicU64::new(0));
         let handle = StorageHandle {
             hub_id: self.hub_id,
             max_page_count: self.config.max_page_count,
             active_waiters: Arc::clone(&active_waiters),
+            gc_errors: Arc::clone(&gc_errors),
             mailbox: Arc::clone(&mailbox),
             readers: Arc::clone(&readers),
             events: events.downgrade(),
@@ -236,7 +250,7 @@ impl OpenedDb {
         let mut actor = DbActor {
             waiters,
             active_waiters,
-            maintenance: Maintenance::new(&self)?,
+            maintenance: Maintenance::new(&self, gc_errors)?,
             events,
             revocations,
         };
@@ -249,30 +263,38 @@ impl OpenedDb {
                     actor.run(&self, &writer_mailbox)
                 }))
                 .unwrap_or(Err(StorageError::ActorStopped));
-                writer_mailbox.stop();
+                let failed = result.is_err();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    writer_mailbox.stop(failed);
+                }));
                 // End live streams promptly if the writer can no longer publish.
                 drop(actor);
-                writer_readers.finish_close();
-                finish_writer(self, result)
+                writer_readers.finish_close(failed);
+                let (report, lock) = finish_writer(self, result);
+                let _ = stopped_tx.send(true);
+                (report, lock)
             })?;
         Ok((
             handle,
             StorageRuntime {
                 mailbox,
                 readers,
+                stopped: stopped_rx,
                 thread: Some(thread),
             },
         ))
     }
 }
 
-fn finish_writer(db: OpenedDb, result: Result<(), StorageError>) -> ShutdownReport {
+fn finish_writer(
+    db: OpenedDb,
+    result: Result<(), StorageError>,
+) -> (ShutdownReport, LockedStateDir) {
     let checkpoint =
         result.and_then(|()| truncate_checkpoint(&db.conn, db.config.shutdown_checkpoint_timeout));
     let OpenedDb { conn, lock, .. } = db;
     let close = close_writer(conn);
-    drop(lock);
-    match checkpoint.and_then(|outcome| close.map(|()| outcome)) {
+    let report = match checkpoint.and_then(|outcome| close.map(|()| outcome)) {
         Ok(WalCheckpointOutcome::Truncated) => ShutdownReport::Complete,
         Ok(WalCheckpointOutcome::Incomplete {
             busy,
@@ -284,7 +306,8 @@ fn finish_writer(db: OpenedDb, result: Result<(), StorageError>) -> ShutdownRepo
             checkpointed,
         },
         Ok(WalCheckpointOutcome::Failed(error)) | Err(error) => ShutdownReport::Failed(error),
-    }
+    };
+    (report, lock)
 }
 
 struct DbActor {
@@ -309,13 +332,15 @@ impl DbActor {
                     .map(watch::Sender::subscribe);
                 let _ = reply.send(result);
             }
-            if !turn.commands.is_empty() {
-                self.execute_batch(db, turn.commands, turn.bytes)?;
-            }
-            if !mailbox.state().shutting_down {
+            let wrote_wal = if turn.commands.is_empty() {
+                false
+            } else {
+                self.execute_batch(db, turn.commands, turn.bytes)?
+            };
+            if !mailbox.is_shutting_down() {
                 let now = db.clock.monotonic_now()?;
-                if !mailbox.state().shutting_down {
-                    self.maintenance.tick(db, now)?;
+                if !mailbox.is_shutting_down() {
+                    self.maintenance.tick(db, now, wrote_wal)?;
                     timeout = self.maintenance.wait_for(db, now);
                 }
             }
@@ -327,17 +352,20 @@ impl DbActor {
         db: &OpenedDb,
         mut commands: Vec<Box<dyn Command>>,
         bytes: usize,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         let mut effects = Effects::default();
         let mut probe = PressureProbe {
             cached: self.maintenance.level(),
             changed: false,
         };
-        let outcome = run_transaction(db, &mut commands, &mut effects, &self.waiters, &mut probe);
+        let (outcome, fatal_commit) =
+            run_transaction(db, &mut commands, &mut effects, &self.waiters, &mut probe);
         let appended = effects.events.len();
-        let result = match outcome {
-            BatchOutcome::Committed => self.publish(effects),
-            BatchOutcome::UncertainCommit => Err(StorageError::ActorStopped),
+        let wrote_result_blob = effects.wrote_result_blob;
+        let committed = matches!(outcome, BatchOutcome::Committed);
+        let result = match (outcome, fatal_commit) {
+            (BatchOutcome::Committed, _) => self.publish(effects),
+            (_, Some(error)) => Err(error),
             _ if db.conn.is_autocommit() => Ok(()),
             _ => db
                 .conn
@@ -355,11 +383,13 @@ impl DbActor {
         }
         self.maintenance.after_write(
             db,
-            matches!(outcome, BatchOutcome::Committed),
+            committed,
             bytes,
+            wrote_result_blob,
             appended,
             probe.changed,
-        )
+        )?;
+        Ok(committed)
     }
 
     fn publish(&mut self, effects: Effects) -> Result<(), StorageError> {
@@ -367,6 +397,11 @@ impl DbActor {
             let _ = self.revocations.send(Arc::new(signal));
         }
         self.waiters.extend(effects.registered);
+        for (id, snapshot) in effects.updated {
+            if let Some(sender) = self.waiters.get(&id) {
+                sender.send_replace(snapshot);
+            }
+        }
         for (id, snapshot) in effects.finished {
             if let Some(sender) = self.waiters.remove(&id) {
                 sender.send_replace(snapshot);
@@ -395,9 +430,9 @@ fn run_transaction(
     effects: &mut Effects,
     waiters: &Waiters,
     probe: &mut PressureProbe,
-) -> BatchOutcome {
+) -> (BatchOutcome, Option<StorageError>) {
     let Ok(mut tx) = Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate) else {
-        return BatchOutcome::Aborted;
+        return (BatchOutcome::Aborted, None);
     };
     for command in commands {
         if tx.is_autocommit()
@@ -406,15 +441,15 @@ fn run_transaction(
             if !tx.is_autocommit() {
                 let _ = tx.rollback();
             }
-            return BatchOutcome::Aborted;
+            return (BatchOutcome::Aborted, None);
         }
     }
     match tx.execute_batch("COMMIT") {
-        Ok(()) => BatchOutcome::Committed,
+        Ok(()) => (BatchOutcome::Committed, None),
         // A connection that has already left the transaction cannot prove it
         // rolled back. Stop publication and require a fresh database snapshot.
-        Err(_) if tx.is_autocommit() => BatchOutcome::UncertainCommit,
-        Err(_) => BatchOutcome::Unknown,
+        Err(error) if tx.is_autocommit() => (BatchOutcome::Unknown, Some(error.into())),
+        Err(_) => (BatchOutcome::Unknown, None),
     }
 }
 
@@ -449,10 +484,10 @@ fn run_command(
 fn restore_waiters(conn: &Connection) -> Result<Waiters, StorageError> {
     let mut stmt = conn.prepare(
         "SELECT execution_id, state, finished_at_ms
-                                 FROM executions WHERE state IN ('accepted', 'running')",
+         FROM executions WHERE state IN ('accepted', 'running')",
     )?;
     let rows = stmt.query_map([], |row| {
-        let state = if row.get::<_, String>(1)? == "accepted" {
+        let state = if row.get_ref(1)?.as_str()? == "accepted" {
             ExecutionState::Accepted
         } else {
             ExecutionState::Running
@@ -480,8 +515,10 @@ struct Effects {
     events: Vec<StoredEvent>,
     revocations: Vec<RevocationSignal>,
     registered: Waiters,
+    updated: Vec<(ExecutionId, ExecutionSnapshot)>,
     finished: Vec<(ExecutionId, ExecutionSnapshot)>,
     hooks: Vec<Box<dyn FnOnce() + Send>>,
+    wrote_result_blob: bool,
 }
 
 impl Effects {
@@ -489,8 +526,10 @@ impl Effects {
         self.events.extend(other.events);
         self.revocations.extend(other.revocations);
         self.registered.extend(other.registered);
+        self.updated.extend(other.updated);
         self.finished.extend(other.finished);
         self.hooks.extend(other.hooks);
+        self.wrote_result_blob |= other.wrote_result_blob;
     }
 }
 
@@ -510,6 +549,7 @@ pub(crate) struct WriteTx<'a> {
     probe: &'a mut PressureProbe,
 }
 
+#[allow(dead_code, reason = "write transaction seams for hub modules")]
 impl WriteTx<'_> {
     fn finish(self, result: CommandResult) -> Result<Option<Effects>, ()> {
         match result {
@@ -537,15 +577,19 @@ impl WriteTx<'_> {
         self.probe.changed |= level != self.probe.cached;
     }
 
+    pub(crate) fn note_result_blob_written(&mut self) {
+        self.effects.wrote_result_blob = true;
+    }
+
     pub(super) fn stage_event(&mut self, event: StoredEvent) {
         self.effects.events.push(event);
     }
 
-    pub(super) fn stage_revocation(&mut self, signal: RevocationSignal) {
+    pub(crate) fn stage_revocation(&mut self, signal: RevocationSignal) {
         self.effects.revocations.push(signal);
     }
 
-    pub(super) fn stage_waiter_register(
+    pub(crate) fn stage_waiter_register(
         &mut self,
         execution_id: ExecutionId,
         snapshot: ExecutionSnapshot,
@@ -555,7 +599,7 @@ impl WriteTx<'_> {
         recv
     }
 
-    pub(super) fn waiter(
+    pub(crate) fn waiter(
         &self,
         execution_id: ExecutionId,
     ) -> Option<watch::Receiver<ExecutionSnapshot>> {
@@ -567,7 +611,16 @@ impl WriteTx<'_> {
             .map(watch::Sender::subscribe)
     }
 
-    pub(super) fn stage_waiter_finish(
+    /// Update an active waiter in place (e.g., `Accepted -> Running`) after commit.
+    pub(crate) fn stage_waiter_update(
+        &mut self,
+        execution_id: ExecutionId,
+        snapshot: ExecutionSnapshot,
+    ) {
+        self.effects.updated.push((execution_id, snapshot));
+    }
+
+    pub(crate) fn stage_waiter_finish(
         &mut self,
         execution_id: ExecutionId,
         snapshot: ExecutionSnapshot,
@@ -576,16 +629,17 @@ impl WriteTx<'_> {
     }
 
     /// Runs on the writer thread after event publication and must return promptly.
-    #[allow(dead_code, reason = "post-commit dispatch seam")]
     pub(crate) fn on_commit(&mut self, hook: impl FnOnce() + Send + 'static) {
         self.effects.hooks.push(Box::new(hook));
     }
 }
 
 #[derive(Debug)]
+#[allow(dead_code, reason = "write transaction error variants for hub modules")]
 pub(crate) enum WriteTxError<E> {
     Domain(E),
     StoragePressure,
+    InvalidDatabase(&'static str),
     Sqlite(rusqlite::Error),
 }
 
@@ -595,14 +649,35 @@ impl<E> From<rusqlite::Error> for WriteTxError<E> {
     }
 }
 
+impl<E> From<StorageError> for WriteTxError<E> {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::StoragePressure => Self::StoragePressure,
+            StorageError::InvalidDatabase(msg) => Self::InvalidDatabase(msg),
+            StorageError::Sqlite(error) => Self::Sqlite(error),
+            other => Self::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(other))),
+        }
+    }
+}
+
+fn is_local_sqlite_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::QueryReturnedNoRows
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::ToSqlConversionFailure(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+    ) || error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation)
+}
+
 impl<E> WriteTxError<E> {
     fn into_local_error(self) -> Option<WriteError<E>> {
         match self {
             Self::Domain(error) => Some(WriteError::Domain(error)),
             Self::StoragePressure => Some(StorageError::StoragePressure.into()),
-            Self::Sqlite(error)
-                if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) =>
-            {
+            Self::InvalidDatabase(msg) => Some(StorageError::InvalidDatabase(msg).into()),
+            Self::Sqlite(error) if is_local_sqlite_error(&error) => {
                 Some(StorageError::from(error).into())
             }
             Self::Sqlite(_) => None,
@@ -611,6 +686,7 @@ impl<E> WriteTxError<E> {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code, reason = "priority lane categories for hub modules")]
 pub(crate) enum PriorityKind {
     RevokeToken,
     DisablePrincipal,
@@ -625,7 +701,6 @@ enum BatchOutcome {
     Committed,
     Aborted,
     Unknown,
-    UncertainCommit,
 }
 
 enum CommandResult {
@@ -682,9 +757,7 @@ where
                 .result
                 .unwrap_or(Err(StorageError::ActorStopped.into())),
             BatchOutcome::Aborted => Err(WriteError::PreCommitAborted),
-            BatchOutcome::Unknown | BatchOutcome::UncertainCommit => {
-                Err(WriteError::CommitOutcomeUnknown)
-            }
+            BatchOutcome::Unknown => Err(WriteError::CommitOutcomeUnknown),
         };
         let _ = self.reply.send(response);
     }
@@ -707,6 +780,7 @@ struct MailboxState {
     work: VecDeque<Work>,
     subscriptions: VecDeque<(ExecutionId, SubscribeReply)>,
     shutting_down: bool,
+    stopped: bool,
     priority_streak: usize,
 }
 
@@ -714,12 +788,24 @@ struct MailboxState {
 struct Turn {
     bytes: usize,
     commands: Vec<Box<dyn Command>>,
-    subscriptions: Vec<(ExecutionId, SubscribeReply)>,
+    subscriptions: VecDeque<(ExecutionId, SubscribeReply)>,
 }
 
 impl Mailbox {
     fn state(&self) -> MutexGuard<'_, MailboxState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.state().shutting_down
+    }
+
+    fn closed_error(&self) -> StorageError {
+        if self.state().shutting_down {
+            StorageError::ShuttingDown
+        } else {
+            StorageError::ActorStopped
+        }
     }
 
     fn enqueue(
@@ -729,6 +815,9 @@ impl Mailbox {
         let mut state = self.state();
         if state.shutting_down {
             return Err(StorageError::ShuttingDown);
+        }
+        if state.stopped {
+            return Err(StorageError::ActorStopped);
         }
         push(&mut state)?;
         self.wake.notify_one();
@@ -740,12 +829,22 @@ impl Mailbox {
         self.wake.notify_one();
     }
 
-    fn stop(&self) {
-        let mut state = self.state();
-        state.shutting_down = true;
-        state.priority.clear();
-        state.work.clear();
-        state.subscriptions.clear();
+    fn stop(&self, failed: bool) {
+        // Move queued closures out of the mutex before running their Drop impls.
+        let (priority, work, subscriptions) = {
+            let mut state = self.state();
+            if failed {
+                state.stopped = true;
+            } else {
+                state.shutting_down = true;
+            }
+            (
+                std::mem::take(&mut state.priority),
+                std::mem::take(&mut state.work),
+                std::mem::take(&mut state.subscriptions),
+            )
+        };
+        drop((priority, work, subscriptions));
     }
 
     fn next(&self, timeout: Duration, defer_work: bool) -> Option<Turn> {
@@ -756,13 +855,17 @@ impl Mailbox {
                     && (defer_work || state.work.is_empty())
                     && state.subscriptions.is_empty()
                     && !state.shutting_down
+                    && !state.stopped
             })
             .unwrap_or_else(PoisonError::into_inner);
 
-        let mut turn = Turn::default();
-        let subscription_count = state.subscriptions.len().min(MAX_COMMANDS);
-        turn.subscriptions
-            .extend(state.subscriptions.drain(..subscription_count));
+        if state.stopped {
+            return None;
+        }
+        let mut turn = Turn {
+            subscriptions: std::mem::take(&mut state.subscriptions),
+            ..Turn::default()
+        };
         let work_waiting = !state.work.is_empty();
         let work_ready = work_waiting && (!defer_work || state.shutting_down);
         if !state.priority.is_empty() && (!work_ready || state.priority_streak < PRIORITY_BURST) {

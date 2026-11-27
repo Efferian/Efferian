@@ -2,20 +2,20 @@ use std::num::NonZeroU64;
 
 use efferian_protocol::{
     AccountId, ActorId, Event, ExecutionEventPayload, ExecutionId, ExecutionState,
-    ExecutionSummary, InvokeKind, MAX_EXECUTION_ERROR_MESSAGE_BYTES, NodeId, PrincipalId,
-    ProfileId, ProfileToolBinding, RequestDigestInput, RequestId, TerminalExecutionState, TokenId,
-    ToolId, UpstreamId, compute_request_digest, validate_profile_bindings,
+    ExecutionSummary, InvokeKind, NodeId, PreparedArgumentsDigest, PrincipalId, ProfileId,
+    ProfileToolBinding, RequestDigestMetadata, RequestId, TerminalExecutionState, TokenId, ToolId,
+    UpstreamId, validate_profile_bindings, validate_terminal_summary,
 };
 use rusqlite::{OptionalExtension, params};
-use serde_json::{Map, Value};
 use tokio::sync::watch;
 
 use super::actor::{ExecutionSnapshot, WriteTx, WriteTxError};
 use super::events::{id, json, json_write_error, opt_id, scalar, scalar_text};
-use super::{PrincipalLiveness, StorageError, StorageHandle, WriteError};
+use super::{PrincipalLiveness, StorageError, WriteError};
 
 #[derive(Clone, Copy)]
-pub enum InvokeResource {
+#[allow(dead_code, reason = "execution admission seam for hub modules")]
+pub(crate) enum InvokeResource {
     Profile {
         profile_id: ProfileId,
         version: NonZeroU64,
@@ -37,27 +37,62 @@ impl InvokeResource {
 }
 
 #[derive(Clone, Copy)]
-pub enum ExecutionTarget {
+#[allow(dead_code, reason = "execution target seam for hub modules")]
+pub(crate) enum ExecutionTarget {
     Node { node_id: NodeId, session_epoch: u64 },
     Upstream(UpstreamId),
 }
 
-/// The application resolves the target and authorizes the request before admission.
-pub struct InvokeWrite {
+/// Recorded execution metadata returned by [`WriteTx::lookup_invocation_replay`]
+/// so the caller can re-authorize replay against current permissions before
+/// checking the request digest or exposing execution state.
+#[derive(Clone, Debug)]
+#[allow(dead_code, reason = "replay authorization seam for hub modules")]
+pub(crate) struct RecordedInvocation {
+    pub execution_id: ExecutionId,
+    pub invoke_kind: InvokeKind,
+    pub request_digest: String,
+    pub caller_principal_id: PrincipalId,
+    pub caller_token_id: TokenId,
+    pub profile_id: Option<ProfileId>,
+    pub profile_version: Option<u64>,
+    pub tool_id: ToolId,
+    pub tool_version: u64,
+    pub public_name: String,
+    pub node_id: Option<NodeId>,
+    pub upstream_id: Option<UpstreamId>,
+    pub snapshot: ExecutionSnapshot,
+}
+
+/// Client-supplied intent fields needed to verify an authorized replay without
+/// resolving a live target or active edition first.
+#[allow(dead_code, reason = "replay verification seam for hub modules")]
+pub(crate) struct InvokeReplayInput<'a> {
+    pub resource: InvokeResource,
+    pub public_name: &'a str,
+    pub requested_target: Option<&'a str>,
+    pub arguments: &'a PreparedArgumentsDigest,
+}
+
+/// Fully authorized parameters for inserting a brand-new execution after
+/// `lookup_invocation_replay` returns `None`.
+#[allow(dead_code, reason = "new execution admission seam for hub modules")]
+pub(crate) struct NewExecutionWrite {
     pub request_id: RequestId,
     pub caller: PrincipalId,
     pub token: TokenId,
     pub resource: InvokeResource,
     pub public_name: String,
     pub requested_target: Option<String>,
-    pub arguments: Map<String, Value>,
+    pub arguments: PreparedArgumentsDigest,
     pub executor: ExecutionTarget,
     pub account_id: Option<AccountId>,
     pub deadline_at_ms: i64,
 }
 
 #[derive(Debug)]
-pub struct InvokeOutcome {
+#[allow(dead_code, reason = "invoke outcome fields for hub modules")]
+pub(crate) struct InvokeOutcome {
     pub execution_id: ExecutionId,
     pub snapshot: ExecutionSnapshot,
     pub replayed: bool,
@@ -65,7 +100,8 @@ pub struct InvokeOutcome {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum InvokeWriteError {
+#[allow(dead_code, reason = "invoke write error variants for hub modules")]
+pub(crate) enum InvokeWriteError {
     #[error("request ID was already used for a different invocation")]
     RequestIdConflict,
     #[error("invocation profile binding is unavailable")]
@@ -74,11 +110,14 @@ pub enum InvokeWriteError {
     PrincipalUnavailable,
     #[error("invocation does not match the resolved tool version")]
     InvalidToolVersion,
+    #[error("invocation numeric field exceeds SQLite signed integer range")]
+    IntegerOutOfRange,
     #[error(transparent)]
     Digest(#[from] efferian_protocol::DigestError),
 }
 
-pub struct ReceiptWrite {
+#[allow(dead_code, reason = "receipt write seam for hub modules")]
+pub(crate) struct ReceiptWrite {
     pub execution_id: ExecutionId,
     pub node_id: NodeId,
     pub state: TerminalExecutionState,
@@ -89,7 +128,8 @@ pub struct ReceiptWrite {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReceiptOutcome {
+#[allow(dead_code, reason = "receipt outcome seam for hub modules")]
+pub(crate) enum ReceiptOutcome {
     AppliedTerminal,
     LateReceiptRecorded,
     AlreadyTerminalOwned,
@@ -98,23 +138,15 @@ pub enum ReceiptOutcome {
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid terminal receipt metadata")]
-pub struct InvalidReceipt;
+pub(crate) struct InvalidReceipt;
 
-impl InvokeWrite {
-    pub(crate) fn payload_bytes(&self) -> Result<usize, StorageError> {
-        Ok(serde_json::to_vec(&self.arguments)
-            .map_err(json_write_error)?
-            .len()
-            .saturating_add(self.public_name.len())
-            .saturating_add(self.requested_target.as_ref().map_or(0, String::len)))
-    }
-}
-
+#[allow(dead_code, reason = "prepared receipt seam for hub modules")]
 pub(crate) struct PreparedReceipt {
     receipt: ReceiptWrite,
     summary_json: String,
 }
 
+#[allow(dead_code, reason = "prepared receipt seam for hub modules")]
 impl PreparedReceipt {
     pub(crate) fn payload_bytes(&self) -> usize {
         self.summary_json
@@ -123,15 +155,16 @@ impl PreparedReceipt {
     }
 }
 
+#[allow(dead_code, reason = "receipt preparation seam for hub modules")]
 impl ReceiptWrite {
     pub(crate) fn prepare(self) -> Result<PreparedReceipt, WriteError<InvalidReceipt>> {
-        if self.summary.effect_may_have_occurred.is_none()
-            || self
-                .summary
-                .error_message
-                .as_ref()
-                .is_some_and(|message| message.len() > MAX_EXECUTION_ERROR_MESSAGE_BYTES)
-            || self.sealed_result_blob.as_ref().is_some_and(Vec::is_empty)
+        let has_blob = match &self.sealed_result_blob {
+            Some(blob) if blob.is_empty() => return Err(WriteError::Domain(InvalidReceipt)),
+            Some(_) => true,
+            None => false,
+        };
+        if validate_terminal_summary(self.state, &self.summary, has_blob, self.result_truncated)
+            .is_err()
         {
             return Err(WriteError::Domain(InvalidReceipt));
         }
@@ -145,16 +178,65 @@ impl ReceiptWrite {
     }
 }
 
-impl StorageHandle {
-    pub async fn invoke(
+#[cfg(test)]
+pub(crate) struct InvokeWrite {
+    pub request_id: RequestId,
+    pub caller: PrincipalId,
+    pub token: TokenId,
+    pub resource: InvokeResource,
+    pub public_name: String,
+    pub requested_target: Option<String>,
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+    pub executor: ExecutionTarget,
+    pub account_id: Option<AccountId>,
+    pub deadline_at_ms: i64,
+}
+
+#[cfg(test)]
+impl super::StorageHandle {
+    pub(crate) async fn invoke(
         &self,
         request: InvokeWrite,
     ) -> Result<InvokeOutcome, WriteError<InvokeWriteError>> {
-        self.execute_work(request.payload_bytes()?, move |tx| tx.invoke(request))
-            .await
+        let arguments = PreparedArgumentsDigest::new(&request.arguments)
+            .map_err(|error| WriteError::Domain(InvokeWriteError::Digest(error)))?;
+        let work_bytes = request
+            .public_name
+            .len()
+            .saturating_add(request.requested_target.as_ref().map_or(0, String::len));
+        let write = NewExecutionWrite {
+            request_id: request.request_id,
+            caller: request.caller,
+            token: request.token,
+            resource: request.resource,
+            public_name: request.public_name,
+            requested_target: request.requested_target,
+            arguments,
+            executor: request.executor,
+            account_id: request.account_id,
+            deadline_at_ms: request.deadline_at_ms,
+        };
+        self.execute_work(work_bytes, move |tx| {
+            if tx.principal_liveness(write.caller)? != PrincipalLiveness::Enabled {
+                return Err(WriteTxError::Domain(InvokeWriteError::PrincipalUnavailable));
+            }
+            if let Some(recorded) = tx.lookup_invocation_replay(write.caller, write.request_id)? {
+                return tx.verify_invocation_replay(
+                    &recorded,
+                    &InvokeReplayInput {
+                        resource: write.resource,
+                        public_name: &write.public_name,
+                        requested_target: write.requested_target.as_deref(),
+                        arguments: &write.arguments,
+                    },
+                );
+            }
+            tx.insert_execution(write)
+        })
+        .await
     }
 
-    pub async fn apply_receipt(
+    pub(crate) async fn apply_receipt(
         &self,
         receipt: ReceiptWrite,
     ) -> Result<ReceiptOutcome, WriteError<InvalidReceipt>> {
@@ -164,60 +246,155 @@ impl StorageHandle {
     }
 }
 
+#[allow(dead_code, reason = "execution write seams for hub modules")]
 impl WriteTx<'_> {
-    pub(crate) fn invoke(
-        &mut self,
-        request: InvokeWrite,
-    ) -> Result<InvokeOutcome, WriteTxError<InvokeWriteError>> {
-        let caller = request.caller.to_string();
-        let request_id = request.request_id.canonical_str();
-        let recorded = self
-            .conn()
-            .query_row(
-                "SELECT execution_id, invoke_kind, request_digest, profile_id, profile_version,
-                    tool_id, public_name, state, finished_at_ms
+    /// Look up an existing `(caller, request_id)` row inside the active write
+    /// snapshot (including earlier uncommitted savepoints in the same batch).
+    pub(crate) fn lookup_invocation_replay(
+        &self,
+        caller: PrincipalId,
+        request_id: RequestId,
+    ) -> Result<Option<RecordedInvocation>, StorageError> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT execution_id, invoke_kind, request_digest, caller_principal_id,
+                    caller_token_id, profile_id, profile_version, tool_id, tool_version,
+                    public_name, node_id, upstream_id, state, finished_at_ms
              FROM executions WHERE caller_principal_id = ?1 AND request_id = ?2",
-                params![caller, request_id],
+        )?;
+        let recorded = stmt
+            .query_row(
+                params![caller.to_string(), request_id.canonical_str()],
                 |row| {
                     Ok(RecordedInvocation {
                         execution_id: id(row, 0)?,
-                        kind: scalar(row, 1)?,
-                        digest: row.get(2)?,
-                        profile_id: opt_id(row, 3)?,
-                        profile_version: row.get(4)?,
-                        tool_id: id(row, 5)?,
-                        public_name: row.get(6)?,
+                        invoke_kind: scalar(row, 1)?,
+                        request_digest: row.get(2)?,
+                        caller_principal_id: id(row, 3)?,
+                        caller_token_id: id(row, 4)?,
+                        profile_id: opt_id(row, 5)?,
+                        profile_version: row.get(6)?,
+                        tool_id: id(row, 7)?,
+                        tool_version: row.get(8)?,
+                        public_name: row.get(9)?,
+                        node_id: opt_id(row, 10)?,
+                        upstream_id: opt_id(row, 11)?,
                         snapshot: ExecutionSnapshot {
-                            state: scalar(row, 7)?,
-                            finished_at_ms: row.get(8)?,
+                            state: scalar(row, 12)?,
+                            finished_at_ms: row.get(13)?,
                         },
                     })
                 },
             )
             .optional()?;
+        Ok(recorded)
+    }
 
-        if let Some(recorded) = recorded {
-            return replay(self, &request, recorded);
+    /// Verify client intent against a previously recorded invocation after the
+    /// caller has re-authorized access to `recorded`. Reads historical profile
+    /// editions regardless of `disabled_at_ms` so replays after republishing
+    /// compare against the original `fixed_node_id`.
+    pub(crate) fn verify_invocation_replay(
+        &self,
+        recorded: &RecordedInvocation,
+        input: &InvokeReplayInput<'_>,
+    ) -> Result<InvokeOutcome, WriteTxError<InvokeWriteError>> {
+        let conflict = || WriteTxError::Domain(InvokeWriteError::RequestIdConflict);
+        if recorded.invoke_kind != input.resource.kind()
+            || recorded.public_name != input.public_name
+        {
+            return Err(conflict());
         }
+        let (fixed_node_id, requested_version) = match input.resource {
+            InvokeResource::Profile { profile_id, .. } => {
+                if recorded.profile_id != Some(profile_id) {
+                    return Err(conflict());
+                }
+                let version = recorded
+                    .profile_version
+                    .ok_or(WriteTxError::InvalidDatabase(
+                        "missing profile version on execution",
+                    ))?;
+                let original =
+                    load_binding(self, profile_id, version, &recorded.public_name, false)?
+                        .filter(|binding| binding.tool_id == recorded.tool_id)
+                        .ok_or(WriteTxError::InvalidDatabase(
+                            "missing recorded profile binding",
+                        ))?;
+                (original.fixed_node_id, None)
+            }
+            InvokeResource::ToolTest {
+                tool_id,
+                requested_version,
+                ..
+            } => {
+                if recorded.tool_id != tool_id {
+                    return Err(conflict());
+                }
+                (None, requested_version)
+            }
+        };
+        let computed = finish_digest(
+            input.arguments,
+            input.resource.kind(),
+            recorded.profile_id,
+            recorded.tool_id,
+            input.public_name,
+            input.requested_target,
+            fixed_node_id,
+            requested_version,
+        )?;
+        if computed != recorded.request_digest {
+            return Err(conflict());
+        }
+        let waiter = if recorded.snapshot.state.is_terminal() {
+            None
+        } else {
+            // An active row always has either a committed or a staged sender.
+            Some(
+                self.waiter(recorded.execution_id)
+                    .ok_or(WriteTxError::InvalidDatabase(
+                        "missing active execution waiter",
+                    ))?,
+            )
+        };
+        Ok(InvokeOutcome {
+            execution_id: recorded.execution_id,
+            snapshot: recorded.snapshot,
+            replayed: true,
+            waiter,
+        })
+    }
+
+    /// Admit a brand-new execution after replay lookup misses and caller
+    /// authorization succeeds. Checks hard storage pressure, principal liveness,
+    /// and active profile/edition state.
+    pub(crate) fn insert_execution(
+        &mut self,
+        request: NewExecutionWrite,
+    ) -> Result<InvokeOutcome, WriteTxError<InvokeWriteError>> {
         self.check_hard_storage_pressure()?;
         if self.principal_liveness(request.caller)? != PrincipalLiveness::Enabled {
             return Err(WriteTxError::Domain(InvokeWriteError::PrincipalUnavailable));
         }
 
-        let (profile_id, profile_version, tool_id, version, fixed_node_id, requested_version) =
+        let (profile_id, profile_version, tool_id, tool_version, fixed_node_id, requested_version) =
             match request.resource {
                 InvokeResource::Profile {
                     profile_id,
                     version,
                 } => {
+                    let version_i64 = i64::try_from(version.get())
+                        .map_err(|_| WriteTxError::Domain(InvokeWriteError::BindingUnavailable))?;
                     let binding =
-                        binding(self, profile_id, version.get(), &request.public_name)?
+                        load_binding(self, profile_id, version.get(), &request.public_name, true)?
                             .ok_or(WriteTxError::Domain(InvokeWriteError::BindingUnavailable))?;
+                    let tool_version_i64 = i64::try_from(binding.tool_version)
+                        .map_err(|_| WriteTxError::Domain(InvokeWriteError::IntegerOutOfRange))?;
                     (
                         Some(profile_id),
-                        Some(version.get()),
+                        Some(version_i64),
                         binding.tool_id,
-                        binding.tool_version,
+                        tool_version_i64,
                         binding.fixed_node_id,
                         None,
                     )
@@ -230,48 +407,108 @@ impl WriteTx<'_> {
                     if requested_version.is_some_and(|pin| pin != resolved_version) {
                         return Err(WriteTxError::Domain(InvokeWriteError::InvalidToolVersion));
                     }
+                    let tool_version_i64 = i64::try_from(resolved_version.get())
+                        .map_err(|_| WriteTxError::Domain(InvokeWriteError::IntegerOutOfRange))?;
                     (
                         None,
                         None,
                         tool_id,
-                        resolved_version.get(),
+                        tool_version_i64,
                         None,
                         requested_version,
                     )
                 }
             };
-        let digest = digest(
-            &request,
+        let digest = finish_digest(
+            &request.arguments,
+            request.resource.kind(),
             profile_id,
             tool_id,
+            &request.public_name,
+            request.requested_target.as_deref(),
             fixed_node_id,
             requested_version,
         )?;
-        let (kind, node_id, node_epoch, upstream_id) = match request.executor {
-            ExecutionTarget::Node {
-                node_id,
-                session_epoch,
-            } => ("node", Some(node_id), Some(session_epoch), None),
-            ExecutionTarget::Upstream(upstream_id) => ("upstream", None, None, Some(upstream_id)),
-        };
+        let (executor_kind, node_id, node_epoch, upstream_id, initial_state, started_at_ms) =
+            match request.executor {
+                ExecutionTarget::Node {
+                    node_id,
+                    session_epoch,
+                } => {
+                    let epoch_i64 = i64::try_from(session_epoch)
+                        .map_err(|_| WriteTxError::Domain(InvokeWriteError::IntegerOutOfRange))?;
+                    (
+                        "node",
+                        Some(node_id),
+                        Some(epoch_i64),
+                        None,
+                        ExecutionState::Accepted,
+                        None,
+                    )
+                }
+                ExecutionTarget::Upstream(upstream_id) => (
+                    "upstream",
+                    None,
+                    None,
+                    Some(upstream_id),
+                    ExecutionState::Running,
+                    Some(self.now_ms()),
+                ),
+            };
         let execution_id = ExecutionId::new();
         let now = self.now_ms();
-        self.conn().execute(
-            "INSERT INTO executions(execution_id, invoke_kind, request_id, request_digest,
-                 caller_principal_id, caller_token_id, profile_id, profile_version, tool_id, tool_version,
-                 public_name, executor_kind, node_id, node_session_epoch, upstream_id, account_id,
-                 state, deadline_at_ms, created_at_ms, result_expires_at_ms, expires_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 'accepted', ?17, ?18, ?19, ?20)",
-            params![execution_id.to_string(), scalar_text(request.resource.kind())?, request_id, digest, caller,
-                request.token.to_string(), profile_id.map(|id| id.to_string()), profile_version,
-                tool_id.to_string(), version, request.public_name, kind, node_id.map(|id| id.to_string()),
-                node_epoch, upstream_id.map(|id| id.to_string()), request.account_id.map(|id| id.to_string()),
-                request.deadline_at_ms, now, now.saturating_add(self.config.result_ttl_ms),
-                now.saturating_add(self.config.execution_ttl_ms)],
-        )?;
+        {
+            let mut insert = self.conn().prepare_cached(
+                "INSERT INTO executions(execution_id, invoke_kind, request_id, request_digest,
+                     caller_principal_id, caller_token_id, profile_id, profile_version, tool_id, tool_version,
+                     public_name, executor_kind, node_id, node_session_epoch, upstream_id, account_id,
+                     state, deadline_at_ms, started_at_ms, created_at_ms, result_expires_at_ms, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17, ?18, ?19, ?20, ?21, ?22)",
+            )?;
+            insert.execute(params![
+                execution_id.to_string(),
+                scalar_text(request.resource.kind())?,
+                request.request_id.canonical_str(),
+                digest,
+                request.caller.to_string(),
+                request.token.to_string(),
+                profile_id.map(|id| id.to_string()),
+                profile_version,
+                tool_id.to_string(),
+                tool_version,
+                request.public_name,
+                executor_kind,
+                node_id.map(|id| id.to_string()),
+                node_epoch,
+                upstream_id.map(|id| id.to_string()),
+                request.account_id.map(|id| id.to_string()),
+                scalar_text(initial_state)?,
+                request.deadline_at_ms,
+                started_at_ms,
+                now,
+                now.saturating_add(self.config.result_ttl_ms),
+                now.saturating_add(self.config.execution_ttl_ms),
+            ])?;
+        }
+        if initial_state == ExecutionState::Running {
+            self.append_event(
+                ActorId::Principal(request.caller),
+                Event::ExecutionStarted(ExecutionEventPayload {
+                    execution_id,
+                    state: ExecutionState::Running,
+                    profile_id,
+                    tool_id,
+                    public_name: request.public_name,
+                    node_id: None,
+                    exit_code: None,
+                    error_code: None,
+                    duration_ms: None,
+                }),
+            )?;
+        }
         let snapshot = ExecutionSnapshot {
-            state: ExecutionState::Accepted,
+            state: initial_state,
             finished_at_ms: None,
         };
         let waiter = self.stage_waiter_register(execution_id, snapshot);
@@ -293,23 +530,22 @@ impl WriteTx<'_> {
         } = prepared;
         let execution_id = receipt.execution_id.to_string();
         let node_id = receipt.node_id.to_string();
-        let Some((old_state, profile, tool, public_name)) = self
-            .conn()
-            .query_row(
+        let found = {
+            let mut stmt = self.conn().prepare_cached(
                 "SELECT state, profile_id, tool_id, public_name FROM executions
-             WHERE execution_id = ?1 AND node_id = ?2",
-                params![execution_id, node_id],
-                |row| {
-                    Ok((
-                        scalar::<ExecutionState>(row, 0)?,
-                        opt_id(row, 1)?,
-                        id(row, 2)?,
-                        row.get(3)?,
-                    ))
-                },
-            )
+                 WHERE execution_id = ?1 AND node_id = ?2",
+            )?;
+            stmt.query_row(params![&execution_id, &node_id], |row| {
+                Ok((
+                    scalar::<ExecutionState>(row, 0)?,
+                    opt_id(row, 1)?,
+                    id(row, 2)?,
+                    row.get(3)?,
+                ))
+            })
             .optional()?
-        else {
+        };
+        let Some((old_state, profile, tool, public_name)) = found else {
             return Ok(ReceiptOutcome::NotOwnedOrNotFound);
         };
         let state = ExecutionState::from(receipt.state);
@@ -326,11 +562,13 @@ impl WriteTx<'_> {
         };
         let actor = ActorId::Node(receipt.node_id);
         if old_state == ExecutionState::Unknown {
-            let changed = self.conn().execute(
-                "UPDATE executions SET late_receipt_at_ms = ?1 WHERE execution_id = ?2
-                 AND node_id = ?3 AND state = 'unknown' AND late_receipt_at_ms IS NULL",
-                params![self.now_ms(), execution_id, node_id],
-            )?;
+            let changed = {
+                let mut stmt = self.conn().prepare_cached(
+                    "UPDATE executions SET late_receipt_at_ms = ?1 WHERE execution_id = ?2
+                     AND node_id = ?3 AND state = 'unknown' AND late_receipt_at_ms IS NULL",
+                )?;
+                stmt.execute(params![self.now_ms(), &execution_id, &node_id])?
+            };
             if changed == 0 {
                 return Ok(ReceiptOutcome::AlreadyTerminalOwned);
             }
@@ -344,14 +582,26 @@ impl WriteTx<'_> {
         let bytes = receipt.sealed_result_blob.as_ref().map_or(0, Vec::len);
         // A receipt can itself report Unknown. Record that it was seen so a
         // retransmission does not look like the first late receipt.
-        self.conn().execute(
-            "UPDATE executions SET state = ?1, summary_json = ?2, sealed_result_blob = ?3, result_bytes = ?4,
-                 result_truncated = ?5, finished_at_ms = ?6, late_receipt_at_ms = ?7
-             WHERE execution_id = ?8",
-            params![scalar_text(state)?, summary_json, receipt.sealed_result_blob, bytes, receipt.result_truncated,
-                receipt.finished_at_ms, (state == ExecutionState::Unknown).then_some(self.now_ms()),
-                execution_id],
-        )?;
+        {
+            let mut stmt = self.conn().prepare_cached(
+                "UPDATE executions SET state = ?1, summary_json = ?2, sealed_result_blob = ?3, result_bytes = ?4,
+                     result_truncated = ?5, finished_at_ms = ?6, late_receipt_at_ms = ?7
+                 WHERE execution_id = ?8",
+            )?;
+            stmt.execute(params![
+                scalar_text(state)?,
+                summary_json,
+                receipt.sealed_result_blob,
+                bytes,
+                receipt.result_truncated,
+                receipt.finished_at_ms,
+                (state == ExecutionState::Unknown).then_some(self.now_ms()),
+                &execution_id,
+            ])?;
+        }
+        if bytes != 0 {
+            self.note_result_blob_written();
+        }
         let event = if state == ExecutionState::Cancelled {
             Event::ExecutionCancelled(payload)
         } else {
@@ -369,120 +619,58 @@ impl WriteTx<'_> {
     }
 }
 
-struct RecordedInvocation {
-    execution_id: ExecutionId,
-    kind: InvokeKind,
-    digest: String,
-    profile_id: Option<ProfileId>,
-    profile_version: Option<u64>,
-    tool_id: ToolId,
-    public_name: String,
-    snapshot: ExecutionSnapshot,
-}
-
-fn replay(
-    tx: &WriteTx<'_>,
-    request: &InvokeWrite,
-    recorded: RecordedInvocation,
-) -> Result<InvokeOutcome, WriteTxError<InvokeWriteError>> {
-    let conflict = || WriteTxError::Domain(InvokeWriteError::RequestIdConflict);
-    if recorded.kind != request.resource.kind() || recorded.public_name != request.public_name {
-        return Err(conflict());
-    }
-    let (fixed_node_id, requested_version) = match request.resource {
-        InvokeResource::Profile { profile_id, .. } => {
-            if recorded.profile_id != Some(profile_id) {
-                return Err(conflict());
-            }
-            let original = binding(
-                tx,
-                profile_id,
-                recorded
-                    .profile_version
-                    .ok_or(rusqlite::Error::InvalidQuery)?,
-                &recorded.public_name,
-            )?
-            .filter(|binding| binding.tool_id == recorded.tool_id)
-            .ok_or(rusqlite::Error::InvalidQuery)?;
-            (original.fixed_node_id, None)
-        }
-        InvokeResource::ToolTest {
-            tool_id,
-            requested_version,
-            ..
-        } => {
-            if recorded.tool_id != tool_id {
-                return Err(conflict());
-            }
-            (None, requested_version)
-        }
-    };
-    if digest(
-        request,
-        recorded.profile_id,
-        recorded.tool_id,
-        fixed_node_id,
-        requested_version,
-    )? != recorded.digest
-    {
-        return Err(conflict());
-    }
-    let waiter = if recorded.snapshot.state.is_terminal() {
-        None
-    } else {
-        // An active row always has either a committed or a staged sender.
-        Some(
-            tx.waiter(recorded.execution_id)
-                .ok_or(rusqlite::Error::InvalidQuery)?,
-        )
-    };
-    Ok(InvokeOutcome {
-        execution_id: recorded.execution_id,
-        snapshot: recorded.snapshot,
-        replayed: true,
-        waiter,
-    })
-}
-
-fn binding(
+fn load_binding(
     tx: &WriteTx<'_>,
     profile_id: ProfileId,
     version: u64,
     name: &str,
-) -> rusqlite::Result<Option<ProfileToolBinding>> {
-    let bindings: Option<Vec<ProfileToolBinding>> = tx
-        .conn()
-        .query_row(
-            "SELECT bindings_json FROM profile_editions WHERE profile_id = ?1 AND version = ?2",
-            params![profile_id.to_string(), version],
-            |row| json(row, 0),
-        )
+    require_active: bool,
+) -> Result<Option<ProfileToolBinding>, StorageError> {
+    let Ok(version) = i64::try_from(version) else {
+        return Ok(None);
+    };
+    let sql = if require_active {
+        "SELECT pe.bindings_json FROM profile_editions pe
+         JOIN profiles p ON p.profile_id = pe.profile_id
+         WHERE pe.profile_id = ?1 AND pe.version = ?2
+           AND p.disabled_at_ms IS NULL AND pe.disabled_at_ms IS NULL"
+    } else {
+        "SELECT bindings_json FROM profile_editions WHERE profile_id = ?1 AND version = ?2"
+    };
+    let mut stmt = tx.conn().prepare_cached(sql)?;
+    let bindings: Option<Vec<ProfileToolBinding>> = stmt
+        .query_row(params![profile_id.to_string(), version], |row| json(row, 0))
         .optional()?;
     let Some(bindings) = bindings else {
         return Ok(None);
     };
-    validate_profile_bindings(&bindings).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    validate_profile_bindings(&bindings)
+        .map_err(|_| StorageError::InvalidDatabase("invalid profile edition bindings"))?;
     Ok(bindings
         .into_iter()
         .find(|binding| binding.public_name == name))
 }
 
-fn digest(
-    request: &InvokeWrite,
+#[allow(clippy::too_many_arguments)]
+fn finish_digest(
+    arguments: &PreparedArgumentsDigest,
+    invoke_kind: InvokeKind,
     profile_id: Option<ProfileId>,
     tool_id: ToolId,
+    public_name: &str,
+    requested_target: Option<&str>,
     fixed_node_id: Option<NodeId>,
     requested_tool_version: Option<NonZeroU64>,
 ) -> Result<String, WriteTxError<InvokeWriteError>> {
-    compute_request_digest(&RequestDigestInput {
-        invoke_kind: request.resource.kind(),
-        profile_id,
-        tool_id,
-        public_name: &request.public_name,
-        requested_target: request.requested_target.as_deref(),
-        fixed_node_id,
-        arguments: &request.arguments,
-        requested_tool_version,
-    })
-    .map_err(|error| WriteTxError::Domain(error.into()))
+    arguments
+        .finish(&RequestDigestMetadata {
+            invoke_kind,
+            profile_id,
+            tool_id,
+            public_name,
+            requested_target,
+            fixed_node_id,
+            requested_tool_version,
+        })
+        .map_err(|error| WriteTxError::Domain(error.into()))
 }

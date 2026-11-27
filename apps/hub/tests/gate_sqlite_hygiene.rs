@@ -79,6 +79,7 @@ async fn gate_sqlite_hygiene() -> TestResult {
             ("table", TABLES.as_slice()),
             ("index", INDEXES.as_slice()),
             ("trigger", &[]),
+            ("view", &[]),
         ] {
             let names = stmt
                 .query_map([kind], |row| row.get::<_, String>(0))?
@@ -119,13 +120,20 @@ async fn gate_sqlite_hygiene() -> TestResult {
         assert!(matches!(write, Err(error) if error.sqlite_error_code() == Some(ErrorCode::ReadOnly)));
         Ok::<_, StorageError>(())
     }).await?;
+    assert_eq!(
+        fs::metadata(&db.dir)?.permissions().mode() & 0o7777,
+        0o700,
+        "{}",
+        db.dir.display()
+    );
     for path in [
+        db.dir.join("hub.lock"),
         db.path(),
         db.dir.join("hub.sqlite3-wal"),
         db.dir.join("hub.sqlite3-shm"),
     ] {
         assert_eq!(
-            fs::metadata(&path)?.permissions().mode() & 0o777,
+            fs::metadata(&path)?.permissions().mode() & 0o7777,
             0o600,
             "{}",
             path.display()
@@ -203,10 +211,10 @@ fn v1_constraints_enforce_identity_scopes_and_execution_shape() -> TestResult {
         )?;
         let view = read_principal(conn, orchestrator)?.ok_or("missing orchestrator")?;
         assert!(view.allowed_node_tags.contains("allowed"));
-        for malformed in ["{", "[42]"] {
+        for malformed in ["{", "[42]", "[\"INVALID TAG\"]", "[\"allowed\",\"allowed\"]"] {
             conn.execute("UPDATE principals SET allowed_node_tags_json = ?1 WHERE principal_id = ?2",
                 params![malformed, orchestrator.to_string()])?;
-            assert!(read_principal(conn, orchestrator).is_err());
+            assert!(read_principal(conn, orchestrator).is_err(), "{malformed}");
         }
         Ok(())
     })?;

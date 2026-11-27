@@ -501,6 +501,45 @@ impl PrivateFs {
         Ok(canonical)
     }
 
+    /// Verify an owned, single-link private regular file (mode 0400 or 0600)
+    /// without reading its contents, returning its byte length.
+    pub fn verify_private_file(path: &Path) -> Result<u64, PlatformError> {
+        let path = checked_path(path, false)?;
+        let (_file, metadata) = open_linked_file(path, || open_regular_file(path))?;
+        check_owner(path, &metadata, current_euid())?;
+        check_mode(
+            path,
+            &metadata,
+            |mode| matches!(mode, 0o400 | PRIVATE_FILE_MODE),
+            "expected mode 0400 or 0600",
+        )?;
+        Ok(metadata.len())
+    }
+
+    /// Read a fixed prefix from an owned, single-link private regular file
+    /// (mode 0400 or 0600), returning its full byte length.
+    pub fn read_private_file_header(path: &Path, header: &mut [u8]) -> Result<u64, PlatformError> {
+        let path = checked_path(path, false)?;
+        let (mut file, metadata) = open_linked_file(path, || open_regular_file(path))?;
+        check_owner(path, &metadata, current_euid())?;
+        check_mode(
+            path,
+            &metadata,
+            |mode| matches!(mode, 0o400 | PRIVATE_FILE_MODE),
+            "expected mode 0400 or 0600",
+        )?;
+        if metadata.len() < header.len() as u64 {
+            return Err(PlatformError::io(
+                "read_private_file_header",
+                path,
+                io::ErrorKind::UnexpectedEof.into(),
+            ));
+        }
+        file.read_exact(header)
+            .map_err(|error| PlatformError::io("read_private_file_header", path, error))?;
+        Ok(metadata.len())
+    }
+
     /// Read at most `max_bytes` from an owned, single-link file with mode 0400 or 0600.
     pub fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, PlatformError> {
         let path = checked_path(path, false)?;

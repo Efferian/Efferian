@@ -548,3 +548,33 @@ fn event_observers_see_only_metadata_in_authorized_projections() {
     assert!(can_observe_event(&context(foreign, vec![]), &revoke));
     assert!(can_observe_event(&admin(), &revoke));
 }
+
+#[test]
+fn principal_view_validation_rejects_non_agent_manager_and_invalid_node_tags() {
+    let manager_id = PrincipalId::new_service();
+    for kind in [
+        PrincipalKind::Admin,
+        PrincipalKind::Member,
+        PrincipalKind::Service,
+    ] {
+        let invalid = PrincipalView {
+            managed_by_principal_id: Some(manager_id),
+            ..principal(kind)
+        };
+        assert_eq!(invalid.validate(), Err(AuthzError::InvalidAuthContext));
+    }
+
+    for bad_tag in ["", "INVALID TAG", "UPPER", "*", "has/slash"] {
+        let invalid = PrincipalView {
+            allowed_node_tags: BTreeSet::from([bad_tag.to_owned()]),
+            ..orchestrator()
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(AuthzError::InvalidAuthContext),
+            "{bad_tag:?}"
+        );
+    }
+
+    assert_eq!(orchestrator().validate(), Ok(()));
+}

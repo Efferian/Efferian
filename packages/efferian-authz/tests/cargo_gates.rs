@@ -369,7 +369,7 @@ fn gate_banned_crates() -> Result {
 
 #[test]
 fn gate_sqlite_hygiene() -> Result {
-    let status = Command::new(env!("CARGO"))
+    let output = Command::new(env!("CARGO"))
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
         .args([
             "test",
@@ -380,9 +380,27 @@ fn gate_sqlite_hygiene() -> Result {
             "--locked",
             "--offline",
         ])
-        .status()?;
-    if !status.success() {
-        return Err(format!("Hub SQLite hygiene gate failed ({status})").into());
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "Hub SQLite hygiene gate failed ({}):\n{stdout}\n{stderr}",
+            output.status
+        )
+        .into());
+    }
+    let passed = stdout
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("test result: ok. ")?;
+            rest.split_whitespace().next()?.parse::<usize>().ok()
+        })
+        .unwrap_or(0);
+    if passed == 0 {
+        return Err(
+            format!("Hub SQLite hygiene gate executed zero tests:\n{stdout}\n{stderr}").into(),
+        );
     }
     Ok(())
 }

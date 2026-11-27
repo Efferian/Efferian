@@ -56,6 +56,7 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
 }
 
 #[derive(Deserialize)]
+#[serde(transparent)]
 pub(crate) struct WireString<'a>(#[serde(borrow)] pub(crate) Cow<'a, str>);
 
 // Internally tagged enums may be nested inside Serde's buffered content, where

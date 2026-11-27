@@ -300,6 +300,83 @@ fn canonical_digests_retain_client_intent() -> Result<(), Box<dyn std::error::Er
     }
     assert!(serde_json::from_value::<NonZeroU64>(json!(0)).is_err());
     assert!(serde_json::from_value::<serde_json::Map<String, Value>>(Value::Null).is_err());
+
+    // PreparedArgumentsDigest must produce the exact same digest as
+    // compute_request_digest without rebuilding or re-serializing arguments.
+    let nested = json!({
+        "z": [{"b": 2, "a": 1}, true, null, "text"],
+        "a": {"y": "hello", "x": 42}
+    });
+    let nested_map = nested.as_object().expect("nested object");
+    let prepared = PreparedArgumentsDigest::new(nested_map)?;
+    assert_eq!(
+        prepared.canonical_bytes(),
+        canonical_json_bytes(&nested)?.len()
+    );
+    let cases = [
+        (InvokeKind::ToolTest, None, tool_id, "run", None, None, None),
+        (
+            InvokeKind::ToolTest,
+            None,
+            tool_id,
+            "run",
+            Some("build-node"),
+            None,
+            NonZeroU64::new(3),
+        ),
+        (
+            InvokeKind::Profile,
+            Some(ProfileId::parse(&format!("prof_{V7}"))?),
+            tool_id,
+            "alias",
+            Some("node-a"),
+            Some(NodeId::new()),
+            None,
+        ),
+    ];
+    for (
+        invoke_kind,
+        profile_id,
+        tool_id,
+        public_name,
+        requested_target,
+        fixed_node_id,
+        requested_tool_version,
+    ) in cases
+    {
+        let expected = compute_request_digest(&RequestDigestInput {
+            invoke_kind,
+            profile_id,
+            tool_id,
+            public_name,
+            requested_target,
+            fixed_node_id,
+            arguments: nested_map,
+            requested_tool_version,
+        })?;
+        let actual = prepared.finish(&RequestDigestMetadata {
+            invoke_kind,
+            profile_id,
+            tool_id,
+            public_name,
+            requested_target,
+            fixed_node_id,
+            requested_tool_version,
+        })?;
+        assert_eq!(actual, expected);
+    }
+    assert!(matches!(
+        prepared.finish(&RequestDigestMetadata {
+            invoke_kind: InvokeKind::Profile,
+            profile_id: Some(ProfileId::new()),
+            tool_id,
+            public_name: "alias",
+            requested_target: None,
+            fixed_node_id: None,
+            requested_tool_version: NonZeroU64::new(1),
+        }),
+        Err(DigestError::InvalidInvocation)
+    ));
     Ok(())
 }
 

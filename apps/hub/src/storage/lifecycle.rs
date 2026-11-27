@@ -1,11 +1,11 @@
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use efferian_platform::{FileLock, PrivateFs};
+use efferian_platform::{FileLock, PlatformError, PrivateFs};
 use efferian_protocol::HubId;
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
@@ -19,7 +19,10 @@ const DATABASE: &str = "hub.sqlite3";
 const SIDECARS: [&str; 3] = ["hub.sqlite3-wal", "hub.sqlite3-shm", "hub.sqlite3-journal"];
 const STAGING_DIR: &str = ".staging-hub-init";
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const SQLITE_HEADER_LEN: usize = 20;
+const STATEMENT_CACHE_CAPACITY: usize = 64;
 pub(super) const WAL_FILE: &str = SIDECARS[0];
+const SHM_FILE: &str = SIDECARS[1];
 
 const NOFOLLOW: OpenFlags = OpenFlags::SQLITE_OPEN_NO_MUTEX.union(OpenFlags::SQLITE_OPEN_NOFOLLOW);
 const RW: OpenFlags = NOFOLLOW.union(OpenFlags::SQLITE_OPEN_READ_WRITE);
@@ -147,20 +150,40 @@ pub fn create_staged<T, E>(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(StorageError::from)?;
-    for version in 1..=CURRENT_SCHEMA_VERSION {
-        apply_migration(&tx, version)?;
-    }
+    tx.execute_batch(include_str!("v1.sql"))
+        .map_err(StorageError::from)?;
     tx.execute(
         "INSERT INTO hub_meta(id, hub_id, active_key_id, master_key_fingerprint, created_at_ms, updated_at_ms)
          VALUES (1, ?1, ?2, ?3, ?4, ?4)",
-        params![identity.hub_id.to_string(), identity.active_key_id, identity.master_key_fingerprint, clock.wall_now_ms()],
-    ).map_err(StorageError::from)?;
-    let value = seed(&tx).map_err(WriteError::Domain)?;
-    tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+        params![
+            identity.hub_id.to_string(),
+            identity.active_key_id,
+            identity.master_key_fingerprint,
+            clock.wall_now_ms(),
+        ],
+    )
+    .map_err(StorageError::from)?;
+    tx.pragma_update(None, "user_version", 1u32)
         .map_err(StorageError::from)?;
-    #[cfg(test)]
-    super::tests::stage_point("pre-commit");
-    tx.commit().map_err(|_| WriteError::CommitOutcomeUnknown)?;
+    let value = if CURRENT_SCHEMA_VERSION == 1 {
+        let value = seed(&tx).map_err(WriteError::Domain)?;
+        #[cfg(test)]
+        super::tests::stage_point("pre-commit");
+        // The file is still private inside staging and has never been published.
+        tx.commit().map_err(StorageError::from)?;
+        value
+    } else {
+        tx.commit().map_err(StorageError::from)?;
+        migrate_to_current(&mut conn, 1)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StorageError::from)?;
+        let value = seed(&tx).map_err(WriteError::Domain)?;
+        #[cfg(test)]
+        super::tests::stage_point("pre-commit");
+        tx.commit().map_err(StorageError::from)?;
+        value
+    };
 
     if !matches!(
         truncate_checkpoint(&conn, BUSY_TIMEOUT)?,
@@ -196,39 +219,65 @@ pub fn open_existing(
     let path = lock.path();
     clean_staging(path)?;
     let database = path.join(DATABASE);
-    let metadata = fs::symlink_metadata(&database)?;
-    if !metadata.is_file() || metadata.len() < 100 {
+    let mut header = [0; SQLITE_HEADER_LEN];
+    let db_len = match PrivateFs::read_private_file_header(&database, &mut header) {
+        Ok(len) => len,
+        Err(PlatformError::Io { source, .. }) if source.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(StorageError::InvalidDatabase(
+                "expected a SQLite database file",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if db_len < 100 {
         return Err(StorageError::InvalidDatabase(
             "expected a SQLite database file",
         ));
     }
-    let mut header = [0; SQLITE_MAGIC.len()];
-    File::open(&database)?.read_exact(&mut header)?;
-    if &header != SQLITE_MAGIC {
+    if &header[..SQLITE_MAGIC.len()] != SQLITE_MAGIC {
         return Err(StorageError::InvalidDatabase("invalid SQLite header"));
     }
+    let wal_format = header[18..20] == [2, 2];
+
     let mut wal_existed = false;
+    let mut shm_existed = false;
     let mut journal_existed = false;
     for name in SIDECARS {
-        if let Some(metadata) = entry_metadata(&path.join(name))? {
+        let sidecar = path.join(name);
+        if let Some(metadata) = entry_metadata(&sidecar)? {
             if !metadata.is_file() {
                 return Err(StorageError::SidecarConflict(name));
             }
+            PrivateFs::verify_private_file(&sidecar)?;
             wal_existed |= name == WAL_FILE;
+            shm_existed |= name == SHM_FILE;
             journal_existed |= name == SIDECARS[2];
         }
+    }
+    // Reject leftover WAL sidecars beside a non-WAL database (such as a restored
+    // VACUUM INTO snapshot) before SQLite can replay mismatched pages into it.
+    if !wal_format && (wal_existed || shm_existed) {
+        return Err(StorageError::SidecarConflict(if wal_existed {
+            WAL_FILE
+        } else {
+            SHM_FILE
+        }));
     }
 
     if journal_existed {
         preflight_rollback_journal(path, mode, &expected, config, wal_existed)?;
     }
 
-    let conn = Connection::open_with_flags(database, RW)?;
-    let hub_id = validate_identity(&conn, mode, &expected, config, wal_existed)?;
+    let conn = Connection::open_with_flags(&database, RW)?;
+    if wal_existed {
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    }
     // SQLite can satisfy a read-write open by falling back to read-only.
+    // Check before any read so WAL recovery never surfaces as a raw SQLite error.
     if conn.is_readonly("main")? {
         return Err(StorageError::ReadOnlyDatabase);
     }
+    let hub_id = validate_identity(&conn, mode, &expected, config, wal_existed)?;
     conn.pragma_update(None, "query_only", false)?;
     configure_writer(&conn, config)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
@@ -253,7 +302,8 @@ fn preflight_rollback_journal(
     config: &StorageConfig,
     wal_existed: bool,
 ) -> Result<(), StorageError> {
-    let reader = Connection::open_with_flags(path.join(DATABASE), RO)?;
+    let database = path.join(DATABASE);
+    let reader = Connection::open_with_flags(&database, RO)?;
     match validate_identity(&reader, mode, expected, config, wal_existed) {
         Ok(_) => return Ok(()),
         Err(StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
@@ -262,18 +312,34 @@ fn preflight_rollback_journal(
     }
     drop(reader);
 
+    // Check write access before paying for a full database copy into staging.
+    let probe = Connection::open_with_flags(&database, RW)?;
+    if wal_existed {
+        probe.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    }
+    if probe.is_readonly("main")? {
+        return Err(StorageError::ReadOnlyDatabase);
+    }
+    drop(probe);
+
     let scratch = PrivateFs::create_ephemeral_dir(path, STAGING_DIR)?;
     for name in [DATABASE, SIDECARS[2]] {
-        fs::copy(path.join(name), scratch.path().join(name))?;
+        let dest = scratch.path().join(name);
+        fs::copy(path.join(name), &dest)?;
+        fs::set_permissions(&dest, Permissions::from_mode(0o600))?;
     }
     if wal_existed {
-        fs::copy(path.join(WAL_FILE), scratch.path().join(WAL_FILE))?;
+        let dest = scratch.path().join(WAL_FILE);
+        fs::copy(path.join(WAL_FILE), &dest)?;
+        fs::set_permissions(&dest, Permissions::from_mode(0o600))?;
     }
     let copy = Connection::open_with_flags(scratch.path().join(DATABASE), RW)?;
     validate_identity(&copy, mode, expected, config, wal_existed)?;
     Ok(())
 }
 
+// Runs before forward migrations: hub_meta(id, hub_id, active_key_id,
+// master_key_fingerprint) is a permanent cross-version identity contract.
 fn validate_identity(
     conn: &Connection,
     mode: OpenMode,
@@ -336,6 +402,7 @@ fn check_pragma(conn: &Connection, name: &'static str, expected: i64) -> Result<
 }
 
 fn configure_writer(conn: &Connection, config: &StorageConfig) -> Result<(), StorageError> {
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     conn.busy_timeout(BUSY_TIMEOUT)?;
     let mode: String =
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
@@ -375,6 +442,7 @@ fn configure_writer(conn: &Connection, config: &StorageConfig) -> Result<(), Sto
 
 pub(super) fn open_reader(path: &Path) -> Result<Connection, StorageError> {
     let conn = Connection::open_with_flags(path, RO)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     conn.busy_timeout(BUSY_TIMEOUT)?;
     for (name, value) in [("query_only", 1), ("temp_store", 2), ("cache_size", -2000)] {
         conn.pragma_update(None, name, value)?;
@@ -433,10 +501,21 @@ pub(super) fn immediate<T, E>(
     Ok(value)
 }
 
-pub(super) fn apply_migration(tx: &Transaction<'_>, version: u32) -> Result<(), StorageError> {
-    match version {
-        1 => tx.execute_batch(include_str!("v1.sql"))?,
-        _ => return Err(StorageError::InvalidDatabase("missing schema migration")),
+/// Apply forward-only migrations from `found + 1` up to `CURRENT_SCHEMA_VERSION`.
+/// Taking `&mut Connection` allows future v2+ migrations to toggle
+/// `PRAGMA foreign_keys = OFF` outside a transaction for SQLite table rebuilds
+/// and run `PRAGMA foreign_key_check` before re-enabling foreign keys.
+pub(super) fn migrate_to_current(conn: &mut Connection, found: u32) -> Result<(), StorageError> {
+    for version in found + 1..=CURRENT_SCHEMA_VERSION {
+        match version {
+            1 => {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute_batch(include_str!("v1.sql"))?;
+                tx.pragma_update(None, "user_version", version)?;
+                tx.commit()?;
+            }
+            _ => return Err(StorageError::InvalidDatabase("missing schema migration")),
+        }
     }
     Ok(())
 }

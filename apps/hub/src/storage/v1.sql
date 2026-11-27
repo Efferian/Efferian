@@ -98,13 +98,13 @@ CREATE TABLE upstreams (
     upstream_id           TEXT    PRIMARY KEY,
     slug                  TEXT    NOT NULL UNIQUE,
     url                   TEXT    NOT NULL,
-    headers_template_json TEXT    NOT NULL DEFAULT '{}',
     config_version        INTEGER NOT NULL DEFAULT 1,
-    discovered_tools_json TEXT    NOT NULL DEFAULT '[]',
     discovered_at_ms      INTEGER,
     disabled_at_ms        INTEGER,
     created_at_ms         INTEGER NOT NULL,
-    updated_at_ms         INTEGER NOT NULL
+    updated_at_ms         INTEGER NOT NULL,
+    headers_template_json TEXT    NOT NULL DEFAULT '{}',
+    discovered_tools_json TEXT    NOT NULL DEFAULT '[]'
 );
 
 
@@ -115,10 +115,10 @@ CREATE TABLE accounts (
     visibility         TEXT    NOT NULL CHECK (visibility IN ('private', 'shared')),
     kind               TEXT    NOT NULL CHECK (kind IN ('http_auth', 'ssh_key', 'secret_kv')),
     upstream_id        TEXT    REFERENCES upstreams(upstream_id) ON DELETE RESTRICT,
-    sealed_secret_blob BLOB    NOT NULL,
     secret_version     INTEGER NOT NULL DEFAULT 1,
     created_at_ms      INTEGER NOT NULL,
     updated_at_ms      INTEGER NOT NULL,
+    sealed_secret_blob BLOB    NOT NULL,
     CHECK (upstream_id IS NULL OR kind = 'http_auth')
 );
 CREATE UNIQUE INDEX idx_accounts_shared_slug ON accounts(slug) WHERE visibility = 'shared';
@@ -149,9 +149,9 @@ CREATE TABLE tools (
 CREATE TABLE tool_revisions (
     tool_id             TEXT    NOT NULL REFERENCES tools(tool_id) ON DELETE RESTRICT,
     version             INTEGER NOT NULL,
-    definition_json     TEXT    NOT NULL,
     input_schema_sha256 TEXT    NOT NULL,
     created_at_ms       INTEGER NOT NULL,
+    definition_json     TEXT    NOT NULL,
     PRIMARY KEY (tool_id, version)
 );
 
@@ -161,10 +161,10 @@ CREATE TABLE profiles (
     slug                TEXT    NOT NULL UNIQUE,
     discovery_mode      TEXT    NOT NULL CHECK (discovery_mode IN ('full', 'curated', 'search')),
     published_version   INTEGER NOT NULL DEFAULT 0,
-    draft_bindings_json TEXT    NOT NULL DEFAULT '[]',
     disabled_at_ms      INTEGER,
     created_at_ms       INTEGER NOT NULL,
-    updated_at_ms       INTEGER NOT NULL
+    updated_at_ms       INTEGER NOT NULL,
+    draft_bindings_json TEXT    NOT NULL DEFAULT '[]'
 );
 
 
@@ -172,10 +172,10 @@ CREATE TABLE profile_editions (
     profile_id      TEXT    NOT NULL REFERENCES profiles(profile_id) ON DELETE RESTRICT,
     version         INTEGER NOT NULL,
     discovery_mode  TEXT    NOT NULL CHECK (discovery_mode IN ('full', 'curated', 'search')),
-    bindings_json   TEXT    NOT NULL,
     published_by    TEXT    NOT NULL REFERENCES principals(principal_id) ON DELETE RESTRICT,
     published_at_ms INTEGER NOT NULL,
     disabled_at_ms  INTEGER,
+    bindings_json   TEXT    NOT NULL,
     PRIMARY KEY (profile_id, version)
 );
 
@@ -218,8 +218,6 @@ CREATE TABLE executions (
                            )),
     cancel_requested_at_ms INTEGER,
     late_receipt_at_ms     INTEGER,
-    summary_json           TEXT    NOT NULL DEFAULT '{}',
-    sealed_result_blob     BLOB,
     result_bytes           INTEGER NOT NULL DEFAULT 0,
     result_truncated       INTEGER NOT NULL DEFAULT 0 CHECK (result_truncated IN (0, 1)),
     result_expired         INTEGER NOT NULL DEFAULT 0 CHECK (result_expired IN (0, 1)),
@@ -229,6 +227,8 @@ CREATE TABLE executions (
     created_at_ms          INTEGER NOT NULL,
     result_expires_at_ms   INTEGER NOT NULL,
     expires_at_ms          INTEGER NOT NULL,
+    summary_json           TEXT    NOT NULL DEFAULT '{}',
+    sealed_result_blob     BLOB,
     UNIQUE (caller_principal_id, request_id),
     CHECK ((invoke_kind = 'profile' AND profile_id IS NOT NULL AND profile_version IS NOT NULL)
         OR (invoke_kind = 'tool_test' AND profile_id IS NULL AND profile_version IS NULL)),
@@ -257,7 +257,7 @@ CREATE TABLE events (
     agent_owner_principal_id TEXT,
     node_id                  TEXT,
     profile_id               TEXT,
-    payload_json             TEXT    NOT NULL DEFAULT '{}',
     created_at_ms            INTEGER NOT NULL,
-    expires_at_ms            INTEGER NOT NULL
+    expires_at_ms            INTEGER NOT NULL,
+    payload_json             TEXT    NOT NULL DEFAULT '{}'
 );

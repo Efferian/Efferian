@@ -8,12 +8,13 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::{
-    OutputDiscardedReason, ValidationError,
+    OutputDiscardedReason, TerminalExecutionState, ValidationError, error_codes,
     wire::{deserialize_object, strict_struct},
 };
 
 pub const MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
 pub const DEFAULT_OUTPUT_BYTES: u32 = MAX_OUTPUT_BYTES;
+pub const MAX_EXECUTION_ERROR_CODE_BYTES: usize = 64;
 pub const MAX_EXECUTION_ERROR_MESSAGE_BYTES: usize = 512;
 
 strict_struct! {
@@ -26,7 +27,7 @@ strict_struct! {
         pub http_status: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub duration_ms: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "deserialize_error_code", skip_serializing_if = "Option::is_none")]
         pub error_code: Option<String>,
         #[serde(default, deserialize_with = "deserialize_error_message", skip_serializing_if = "Option::is_none")]
         pub error_message: Option<String>,
@@ -37,19 +38,62 @@ strict_struct! {
     }
 }
 
+pub(crate) fn deserialize_error_code<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    let code = Option::deserialize(d)?;
+    validate_error_code(code.as_deref()).map_err(de::Error::custom)?;
+    Ok(code)
+}
+
 fn deserialize_error_message<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     let message = Option::deserialize(d)?;
     validate_error_message(message.as_deref()).map_err(de::Error::custom)?;
     Ok(message)
 }
 
-pub(crate) fn validate_error_message(message: Option<&str>) -> Result<(), ValidationError> {
+pub fn validate_error_code(code: Option<&str>) -> Result<(), ValidationError> {
+    if let Some(code) = code
+        && (!(1..=MAX_EXECUTION_ERROR_CODE_BYTES).contains(&code.len())
+            || !code
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+    {
+        return Err(ValidationError::InvalidField("execution error code"));
+    }
+    Ok(())
+}
+
+pub fn validate_error_message(message: Option<&str>) -> Result<(), ValidationError> {
     if message.is_some_and(|message| message.len() > MAX_EXECUTION_ERROR_MESSAGE_BYTES) {
         return Err(ValidationError::InvalidField(
             "execution error message length",
         ));
     }
     Ok(())
+}
+
+pub fn validate_terminal_summary(
+    state: TerminalExecutionState,
+    summary: &ExecutionSummary,
+    has_result: bool,
+    truncated: bool,
+) -> Result<(), ValidationError> {
+    use TerminalExecutionState::{Cancelled, TimedOut, Unknown};
+
+    let Some(effect) = summary.effect_may_have_occurred else {
+        return Err(ValidationError::InvalidReceipt);
+    };
+    if (matches!(state, Unknown | Cancelled | TimedOut) && !effect)
+        || (summary.error_code.as_deref() == Some(error_codes::NODE_BUSY) && effect)
+    {
+        return Err(ValidationError::InvalidReceipt);
+    }
+    if summary.output_discarded_reason.is_some() && (!truncated || has_result) {
+        return Err(ValidationError::InvalidReceipt);
+    }
+    validate_error_code(summary.error_code.as_deref())?;
+    validate_error_message(summary.error_message.as_deref())
 }
 
 strict_enum! {

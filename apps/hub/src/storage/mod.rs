@@ -1,9 +1,9 @@
 //! SQLite storage for the Hub.
 
 mod access;
-pub(crate) mod actor;
+mod actor;
 mod events;
-pub(crate) mod executions;
+mod executions;
 mod lifecycle;
 mod maintenance;
 mod readers;
@@ -14,16 +14,20 @@ pub use events::{
     EventsPageRaw, EventsReadError, RevocationReason, RevocationSignal, RevocationWatch,
     StoredEvent,
 };
-
-pub use executions::{
-    ExecutionTarget, InvalidReceipt, InvokeOutcome, InvokeResource, InvokeWrite, InvokeWriteError,
-    ReceiptOutcome, ReceiptWrite,
-};
 pub use lifecycle::{
     ExpectedHubIdentity, LockedStateDir, NewHubIdentity, OfflineTxOutcome, OpenMode, OpenedDb,
     WalCheckpointOutcome, acquire_state_lock, create_staged, open_existing,
 };
 pub use maintenance::{StoragePressure, StorageStatus};
+
+#[allow(unused_imports, reason = "storage write seams for hub modules")]
+pub(crate) use actor::{PriorityKind, WriteTx, WriteTxError};
+#[allow(unused_imports, reason = "storage execution seams for hub modules")]
+pub(crate) use executions::{
+    ExecutionTarget, InvalidReceipt, InvokeOutcome, InvokeReplayInput, InvokeResource,
+    InvokeWriteError, NewExecutionWrite, PreparedReceipt, ReceiptOutcome, ReceiptWrite,
+    RecordedInvocation,
+};
 
 use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,6 +39,7 @@ const PAGE_SIZE: u32 = 4096;
 const MIN_PAGES: u32 = 64;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DAY_MS: i64 = 86_400_000;
+const SOFT_PRESSURE_GRACE_MS: i64 = 60_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SqliteSynchronous {
@@ -52,6 +57,7 @@ pub struct StorageConfig {
     pub gc_interval: Duration,
     pub wal_escalate_cooldown: Duration,
     pub shutdown_checkpoint_timeout: Duration,
+    pub soft_pressure_grace_ms: i64,
     pub result_ttl_ms: i64,
     pub execution_ttl_ms: i64,
     pub event_ttl_ms: i64,
@@ -69,6 +75,7 @@ impl Default for StorageConfig {
             gc_interval: Duration::from_secs(60),
             wal_escalate_cooldown: Duration::from_secs(30),
             shutdown_checkpoint_timeout: BUSY_TIMEOUT,
+            soft_pressure_grace_ms: SOFT_PRESSURE_GRACE_MS,
             result_ttl_ms: 7 * DAY_MS,
             execution_ttl_ms: 30 * DAY_MS,
             event_ttl_ms: 14 * DAY_MS,
@@ -90,6 +97,7 @@ impl StorageConfig {
             || self.gc_interval.is_zero()
             || self.wal_escalate_cooldown.is_zero()
             || self.shutdown_checkpoint_timeout.as_millis() > i32::MAX as u128
+            || self.soft_pressure_grace_ms < 0
             || self.result_ttl_ms <= 0
             || self.execution_ttl_ms < self.result_ttl_ms
             || self.event_ttl_ms <= 0

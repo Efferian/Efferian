@@ -20,6 +20,7 @@ struct PoolState {
     idle: Vec<Connection>,
     in_flight: usize,
     closing: bool,
+    stopped: bool,
 }
 
 impl ReadPool {
@@ -34,6 +35,7 @@ impl ReadPool {
                 idle,
                 in_flight: 0,
                 closing: false,
+                stopped: false,
             }),
             closed: Condvar::new(),
         }))
@@ -41,6 +43,14 @@ impl ReadPool {
 
     fn state(&self) -> MutexGuard<'_, PoolState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn closed_error(&self) -> StorageError {
+        if self.state().closing {
+            StorageError::ShuttingDown
+        } else {
+            StorageError::ActorStopped
+        }
     }
 
     pub(super) async fn snapshot<T, E>(
@@ -54,7 +64,7 @@ impl ReadPool {
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await
-            .map_err(|_| StorageError::ShuttingDown)?;
+            .map_err(|_| self.closed_error())?;
         let pool = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -76,9 +86,17 @@ impl ReadPool {
         self.permits.close();
     }
 
-    pub(super) fn finish_close(&self) {
-        self.begin_close();
-        let idle = std::mem::take(&mut self.state().idle);
+    pub(super) fn finish_close(&self, failed: bool) {
+        let idle = {
+            let mut state = self.state();
+            if failed {
+                state.stopped = true;
+            } else {
+                state.closing = true;
+            }
+            self.permits.close();
+            std::mem::take(&mut state.idle)
+        };
         drop(idle);
         let _state = self
             .closed
@@ -91,6 +109,9 @@ impl ReadPool {
             let mut state = self.state();
             if state.closing {
                 return Err(StorageError::ShuttingDown);
+            }
+            if state.stopped {
+                return Err(StorageError::ActorStopped);
             }
             state.in_flight += 1;
             state.idle.pop()
@@ -115,7 +136,7 @@ impl Drop for Reader<'_> {
                 || (conn.execute_batch("ROLLBACK").is_ok() && conn.is_autocommit());
             if clean && !std::thread::panicking() {
                 let mut state = self.pool.state();
-                if !state.closing {
+                if !state.closing && !state.stopped {
                     state.idle.push(conn);
                     state.in_flight -= 1;
                     return;
