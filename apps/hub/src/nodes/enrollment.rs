@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::IgnoredAny};
 use utoipa::ToSchema;
 
 use crate::http::{ApiCaller, ApiError, ApiJson, ApiPath, ApiResult, AppState, EnrollmentCaller};
-use crate::node_bridge::{BridgeCloseReason, NodeBridgeControl};
+use crate::node_bridge::{BridgeCloseReason, NodeDispatcher};
 use crate::storage::{PrincipalLiveness, WriteTx, WriteTxError, principal_liveness};
 use crate::vault::{
     IssuedCredential,
@@ -439,7 +439,7 @@ pub(super) async fn exchange(
 
 fn rotate(
     tx: &mut WriteTx<'_>,
-    bridge: Arc<dyn NodeBridgeControl>,
+    bridge: Arc<dyn NodeDispatcher>,
     node_id: NodeId,
     key_id: u16,
     verifier: &str,

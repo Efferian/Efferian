@@ -266,6 +266,37 @@ impl WriteTx<'_> {
         Ok(false)
     }
 
+    pub(crate) fn revoke_profile_grants(&mut self, profile: ProfileId) -> Result<(), StorageError> {
+        let mut grantees: BTreeSet<PrincipalId> = {
+            let mut stmt = self.conn().prepare_cached(
+                "DELETE FROM grants WHERE scope_kind = 'profile' AND scope_id = ?1
+                 RETURNING principal_id",
+            )?;
+            stmt.query_map([profile.to_string()], |row| id(row, 0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let purging: Option<PrincipalId> = self.conn().query_row(
+            "SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1",
+            [],
+            |row| opt_id(row, 0),
+        )?;
+        if let Some(purging) = purging {
+            grantees.remove(&purging);
+        }
+        let mut affected_principals = grantees.clone();
+        let mut affected_nodes = BTreeSet::new();
+        for principal in grantees {
+            affected_principals.extend(related_agents(self.conn(), principal)?);
+            affected_nodes.extend(managed_nodes(self.conn(), principal)?);
+        }
+        self.stage_revocation(RevocationSignal {
+            reason: RevocationReason::ProfileDeleted(profile),
+            affected_principals: affected_principals.into_iter().collect(),
+            affected_nodes: affected_nodes.into_iter().collect(),
+        });
+        Ok(())
+    }
+
     pub(crate) fn disable_edition(
         &mut self,
         profile: ProfileId,
@@ -485,22 +516,22 @@ fn stage_cascade(
     affected_nodes: Vec<NodeId>,
 ) -> Result<(), StorageError> {
     let mut affected_principals = vec![principal];
-    let principal_id = principal.to_string();
-    {
-        let conn = tx.conn();
-        let mut agents = conn.prepare_cached(
-            "SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1
-             WHERE p.kind = 'agent' AND p.principal_id != ?1 AND p.principal_id IS NOT h.gc_purging_principal_id
-             AND (p.owner_principal_id = ?1 OR p.managed_by_principal_id = ?1) ORDER BY p.principal_id",
-        )?;
-        for agent in agents.query_map([&principal_id], |row| id(row, 0))? {
-            affected_principals.push(agent?);
-        }
-    }
+    affected_principals.extend(related_agents(tx.conn(), principal)?);
     tx.stage_revocation(RevocationSignal {
         reason,
         affected_principals,
         affected_nodes,
     });
     Ok(())
+}
+
+fn related_agents(conn: &Connection, principal: PrincipalId) -> rusqlite::Result<Vec<PrincipalId>> {
+    let mut agents = conn.prepare_cached(
+        "SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1
+         WHERE p.kind = 'agent' AND p.principal_id != ?1 AND p.principal_id IS NOT h.gc_purging_principal_id
+         AND (p.owner_principal_id = ?1 OR p.managed_by_principal_id = ?1) ORDER BY p.principal_id",
+    )?;
+    agents
+        .query_map([principal.to_string()], |row| id(row, 0))?
+        .collect()
 }

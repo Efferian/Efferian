@@ -6,12 +6,16 @@ use efferian_protocol::{
     ProfileToolBinding, RequestDigestMetadata, RequestId, TerminalExecutionState, TokenId, ToolId,
     UpstreamId, validate_profile_bindings, validate_terminal_summary,
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::watch;
 
 use super::actor::{ExecutionSnapshot, WriteTx, WriteTxError};
-use super::events::{id, json, json_write_error, opt_id, scalar, scalar_text};
+use super::events::{id, json, opt_id, scalar, scalar_text};
 use super::{PrincipalLiveness, StorageError, WriteError};
+
+mod transitions;
+
+pub(crate) use transitions::{CloseExecutions, PreparedOutcome, TRANSITION_BATCH};
 
 #[derive(Clone, Copy)]
 #[allow(dead_code, reason = "execution admission seam for hub modules")]
@@ -78,6 +82,7 @@ pub(crate) struct InvokeReplayInput<'a> {
 /// `lookup_invocation_replay` returns `None`.
 #[allow(dead_code, reason = "new execution admission seam for hub modules")]
 pub(crate) struct NewExecutionWrite {
+    pub execution_id: ExecutionId,
     pub request_id: RequestId,
     pub caller: PrincipalId,
     pub token: TokenId,
@@ -121,7 +126,7 @@ pub(crate) struct ReceiptWrite {
     pub execution_id: ExecutionId,
     pub node_id: NodeId,
     pub state: TerminalExecutionState,
-    pub finished_at_ms: i64,
+    pub frame_epoch: u64,
     pub summary: ExecutionSummary,
     pub sealed_result_blob: Option<Vec<u8>>,
     pub result_truncated: bool,
@@ -143,15 +148,13 @@ pub(crate) struct InvalidReceipt;
 #[allow(dead_code, reason = "prepared receipt seam for hub modules")]
 pub(crate) struct PreparedReceipt {
     receipt: ReceiptWrite,
-    summary_json: String,
+    payload_bytes: usize,
 }
 
 #[allow(dead_code, reason = "prepared receipt seam for hub modules")]
 impl PreparedReceipt {
     pub(crate) fn payload_bytes(&self) -> usize {
-        self.summary_json
-            .len()
-            .saturating_add(self.receipt.sealed_result_blob.as_ref().map_or(0, Vec::len))
+        self.payload_bytes
     }
 }
 
@@ -168,12 +171,11 @@ impl ReceiptWrite {
         {
             return Err(WriteError::Domain(InvalidReceipt));
         }
-        let summary_json = serde_json::to_string(&self.summary)
-            .map_err(json_write_error)
-            .map_err(StorageError::from)?;
+        let payload_bytes =
+            transitions::terminal_work_bytes(&self.summary, self.sealed_result_blob.as_deref())?;
         Ok(PreparedReceipt {
             receipt: self,
-            summary_json,
+            payload_bytes,
         })
     }
 }
@@ -205,6 +207,7 @@ impl super::StorageHandle {
             .len()
             .saturating_add(request.requested_target.as_ref().map_or(0, String::len));
         let write = NewExecutionWrite {
+            execution_id: ExecutionId::new(),
             request_id: request.request_id,
             caller: request.caller,
             token: request.token,
@@ -235,7 +238,13 @@ impl super::StorageHandle {
         })
         .await
     }
+}
 
+impl super::StorageHandle {
+    #[allow(
+        dead_code,
+        reason = "managed terminal receipt seam for the node bridge"
+    )]
     pub(crate) async fn apply_receipt(
         &self,
         receipt: ReceiptWrite,
@@ -255,38 +264,7 @@ impl WriteTx<'_> {
         caller: PrincipalId,
         request_id: RequestId,
     ) -> Result<Option<RecordedInvocation>, StorageError> {
-        let mut stmt = self.conn().prepare_cached(
-            "SELECT execution_id, invoke_kind, request_digest, caller_principal_id,
-                    caller_token_id, profile_id, profile_version, tool_id, tool_version,
-                    public_name, node_id, upstream_id, state, finished_at_ms
-             FROM executions WHERE caller_principal_id = ?1 AND request_id = ?2",
-        )?;
-        let recorded = stmt
-            .query_row(
-                params![caller.to_string(), request_id.canonical_str()],
-                |row| {
-                    Ok(RecordedInvocation {
-                        execution_id: id(row, 0)?,
-                        invoke_kind: scalar(row, 1)?,
-                        request_digest: row.get(2)?,
-                        caller_principal_id: id(row, 3)?,
-                        caller_token_id: id(row, 4)?,
-                        profile_id: opt_id(row, 5)?,
-                        profile_version: row.get(6)?,
-                        tool_id: id(row, 7)?,
-                        tool_version: row.get(8)?,
-                        public_name: row.get(9)?,
-                        node_id: opt_id(row, 10)?,
-                        upstream_id: opt_id(row, 11)?,
-                        snapshot: ExecutionSnapshot {
-                            state: scalar(row, 12)?,
-                            finished_at_ms: row.get(13)?,
-                        },
-                    })
-                },
-            )
-            .optional()?;
-        Ok(recorded)
+        lookup_invocation_replay(self.conn(), caller, request_id)
     }
 
     /// Verify client intent against a previously recorded invocation after the
@@ -455,7 +433,7 @@ impl WriteTx<'_> {
                     Some(self.now_ms()),
                 ),
             };
-        let execution_id = ExecutionId::new();
+        let execution_id = request.execution_id;
         let now = self.now_ms();
         {
             let mut insert = self.conn().prepare_cached(
@@ -519,104 +497,45 @@ impl WriteTx<'_> {
             waiter: Some(waiter),
         })
     }
+}
 
-    pub(crate) fn apply_receipt(
-        &mut self,
-        prepared: PreparedReceipt,
-    ) -> Result<ReceiptOutcome, WriteTxError<InvalidReceipt>> {
-        let PreparedReceipt {
-            receipt,
-            summary_json,
-        } = prepared;
-        let execution_id = receipt.execution_id.to_string();
-        let node_id = receipt.node_id.to_string();
-        let found = {
-            let mut stmt = self.conn().prepare_cached(
-                "SELECT state, profile_id, tool_id, public_name FROM executions
-                 WHERE execution_id = ?1 AND node_id = ?2",
-            )?;
-            stmt.query_row(params![&execution_id, &node_id], |row| {
-                Ok((
-                    scalar::<ExecutionState>(row, 0)?,
-                    opt_id(row, 1)?,
-                    id(row, 2)?,
-                    row.get(3)?,
-                ))
-            })
-            .optional()?
-        };
-        let Some((old_state, profile, tool, public_name)) = found else {
-            return Ok(ReceiptOutcome::NotOwnedOrNotFound);
-        };
-        let state = ExecutionState::from(receipt.state);
-        let payload = ExecutionEventPayload {
-            execution_id: receipt.execution_id,
-            state,
-            profile_id: profile,
-            tool_id: tool,
-            public_name,
-            node_id: Some(receipt.node_id),
-            exit_code: receipt.summary.exit_code,
-            error_code: receipt.summary.error_code,
-            duration_ms: receipt.summary.duration_ms,
-        };
-        let actor = ActorId::Node(receipt.node_id);
-        if old_state == ExecutionState::Unknown {
-            let changed = {
-                let mut stmt = self.conn().prepare_cached(
-                    "UPDATE executions SET late_receipt_at_ms = ?1 WHERE execution_id = ?2
-                     AND node_id = ?3 AND state = 'unknown' AND late_receipt_at_ms IS NULL",
-                )?;
-                stmt.execute(params![self.now_ms(), &execution_id, &node_id])?
-            };
-            if changed == 0 {
-                return Ok(ReceiptOutcome::AlreadyTerminalOwned);
-            }
-            self.append_event(actor, Event::ExecutionLateReceipt(payload))?;
-            return Ok(ReceiptOutcome::LateReceiptRecorded);
-        }
-        if old_state.is_terminal() {
-            return Ok(ReceiptOutcome::AlreadyTerminalOwned);
-        }
-
-        let bytes = receipt.sealed_result_blob.as_ref().map_or(0, Vec::len);
-        // A receipt can itself report Unknown. Record that it was seen so a
-        // retransmission does not look like the first late receipt.
-        {
-            let mut stmt = self.conn().prepare_cached(
-                "UPDATE executions SET state = ?1, summary_json = ?2, sealed_result_blob = ?3, result_bytes = ?4,
-                     result_truncated = ?5, finished_at_ms = ?6, late_receipt_at_ms = ?7
-                 WHERE execution_id = ?8",
-            )?;
-            stmt.execute(params![
-                scalar_text(state)?,
-                summary_json,
-                receipt.sealed_result_blob,
-                bytes,
-                receipt.result_truncated,
-                receipt.finished_at_ms,
-                (state == ExecutionState::Unknown).then_some(self.now_ms()),
-                &execution_id,
-            ])?;
-        }
-        if bytes != 0 {
-            self.note_result_blob_written();
-        }
-        let event = if state == ExecutionState::Cancelled {
-            Event::ExecutionCancelled(payload)
-        } else {
-            Event::ExecutionFinished(payload)
-        };
-        self.append_event(actor, event)?;
-        self.stage_waiter_finish(
-            receipt.execution_id,
-            ExecutionSnapshot {
-                state,
-                finished_at_ms: Some(receipt.finished_at_ms),
+pub(crate) fn lookup_invocation_replay(
+    conn: &Connection,
+    caller: PrincipalId,
+    request_id: RequestId,
+) -> Result<Option<RecordedInvocation>, StorageError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT execution_id, invoke_kind, request_digest, caller_principal_id,
+                caller_token_id, profile_id, profile_version, tool_id, tool_version,
+                public_name, node_id, upstream_id, state, finished_at_ms
+         FROM executions WHERE caller_principal_id = ?1 AND request_id = ?2",
+    )?;
+    let recorded = stmt
+        .query_row(
+            params![caller.to_string(), request_id.canonical_str()],
+            |row| {
+                Ok(RecordedInvocation {
+                    execution_id: id(row, 0)?,
+                    invoke_kind: scalar(row, 1)?,
+                    request_digest: row.get(2)?,
+                    caller_principal_id: id(row, 3)?,
+                    caller_token_id: id(row, 4)?,
+                    profile_id: opt_id(row, 5)?,
+                    profile_version: row.get(6)?,
+                    tool_id: id(row, 7)?,
+                    tool_version: row.get(8)?,
+                    public_name: row.get(9)?,
+                    node_id: opt_id(row, 10)?,
+                    upstream_id: opt_id(row, 11)?,
+                    snapshot: ExecutionSnapshot {
+                        state: scalar(row, 12)?,
+                        finished_at_ms: row.get(13)?,
+                    },
+                })
             },
-        );
-        Ok(ReceiptOutcome::AppliedTerminal)
-    }
+        )
+        .optional()?;
+    Ok(recorded)
 }
 
 fn load_binding(

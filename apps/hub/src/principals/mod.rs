@@ -1,7 +1,7 @@
 //! Principal management and the caller's current identity.
 
 mod data;
-mod introspection;
+pub(crate) mod introspection;
 
 use axum::{Json, extract::State};
 use efferian_authz::{PrincipalAccess, authorize_principal_manage};
@@ -146,6 +146,7 @@ async fn disable(
     _: EmptyBody,
 ) -> ApiResult<StatusCode> {
     let bridge = state.bridge;
+    let upstream = state.upstream;
     state
         .storage
         .execute_priority(PriorityKind::DisablePrincipal, move |tx| {
@@ -156,9 +157,11 @@ async fn disable(
             authorize_principal_manage(&ctx, &target, PrincipalAccess::Disable)?;
             if let Some(revoked) =
                 tx.disable_principal(ActorId::Principal(ctx.caller.principal_id), principal)?
-                && !revoked.is_empty()
             {
                 tx.on_commit(move || {
+                    upstream.invalidate(crate::upstream_dispatch::UpstreamInvalidation::Principal(
+                        principal,
+                    ));
                     for (node, epoch) in revoked {
                         bridge.close_session(node, epoch, BridgeCloseReason::NodeRevoked);
                     }

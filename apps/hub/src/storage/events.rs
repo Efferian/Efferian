@@ -1,13 +1,13 @@
 use std::error::Error;
 use std::str::FromStr;
 
-use efferian_authz::EventAuthTarget;
+use efferian_authz::{AuthContext, EventAuthTarget};
 use efferian_protocol::{
     ActorId, AggregateId, AggregateType, Event, EventEnvelope, EventId, EventKind,
     ExecutionEventPayload, GrantId, HubId, NodeId, PrincipalId, ProfileId, TokenId,
 };
 use rusqlite::types::Type;
-use rusqlite::{Row, params};
+use rusqlite::{Connection, Row, params};
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IntoDeserializer, value::Error as DeError};
 use tokio::sync::broadcast;
@@ -28,6 +28,22 @@ pub struct RevocationSignal {
     pub affected_nodes: Vec<NodeId>,
 }
 
+impl RevocationSignal {
+    /// Match reductions that invalidate a request's cached authorization.
+    pub(crate) fn affects_caller(&self, ctx: &AuthContext) -> bool {
+        match self.reason {
+            RevocationReason::TokenRevoked(token_id) => token_id == ctx.token.token_id,
+            RevocationReason::PrincipalDisabled(_)
+            | RevocationReason::GrantRevoked(_)
+            | RevocationReason::PrincipalPermissionsReduced(_)
+            | RevocationReason::ProfileDeleted(_) => {
+                self.affected_principals.contains(&ctx.caller.principal_id)
+            }
+            RevocationReason::EditionDisabled { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevocationReason {
     TokenRevoked(TokenId),
@@ -35,6 +51,7 @@ pub enum RevocationReason {
     GrantRevoked(GrantId),
     EditionDisabled { profile_id: ProfileId, version: u64 },
     PrincipalPermissionsReduced(PrincipalId),
+    ProfileDeleted(ProfileId),
 }
 
 struct EmptyPayload;
@@ -219,6 +236,23 @@ impl StorageHandle {
         upper_bound: Option<i64>,
         limit: u32,
     ) -> Result<EventsPageRaw, EventsReadError> {
+        let source = *self.hub_id();
+        self.read_snapshot(move |conn| {
+            Self::read_events_page(conn, source, after, upper_bound, limit, true)
+        })
+        .await
+    }
+
+    /// Read a page within the caller's snapshot so the initial authorization,
+    /// cursor bounds, and event rows can share the same SQLite view.
+    pub(crate) fn read_events_page(
+        conn: &Connection,
+        source: HubId,
+        after: i64,
+        upper_bound: Option<i64>,
+        limit: u32,
+        allow_bootstrap_zero: bool,
+    ) -> Result<EventsPageRaw, EventsReadError> {
         if after < 0
             || !(1..=500).contains(&limit)
             || upper_bound.is_some_and(|upper| upper < after)
@@ -226,41 +260,38 @@ impl StorageHandle {
             return Err(EventsReadError::InvalidCursor);
         }
 
-        let source = *self.hub_id();
-        self.read_snapshot(move |conn| {
-            let mut meta = conn.prepare_cached(
-                "SELECT events_head_seq, events_pruned_through_seq FROM hub_meta WHERE id = 1",
-            )?;
-            let (head, pruned): (i64, i64) =
-                meta.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            let oldest_available_seq = pruned.saturating_add(1);
-            let upper = upper_bound.unwrap_or(head);
-            if upper > head || after > head || (after > 0 && after < pruned) {
-                return Err(EventsReadError::ResyncRequired {
-                    oldest_available_seq,
-                    latest_seq: head,
-                });
-            }
-
-            let mut stmt = conn.prepare_cached(
-                "SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id, created_at_ms,
-                        payload_json, owner_principal_id, agent_owner_principal_id, node_id, profile_id
-                 FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
-            )?;
-            let items = stmt
-                .query_map(params![after, upper, limit], |row| read_event(row, source))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let last = items.last().map_or(upper, |item| item.envelope.seq);
-            let has_more = items.len() == limit as usize && last < upper;
-            Ok(EventsPageRaw {
-                items,
-                scanned_through: if has_more { last } else { upper },
+        let mut meta = conn.prepare_cached(
+            "SELECT events_head_seq, events_pruned_through_seq FROM hub_meta WHERE id = 1",
+        )?;
+        let (head, pruned): (i64, i64) =
+            meta.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let oldest_available_seq = pruned.saturating_add(1);
+        let upper = upper_bound.unwrap_or(head);
+        if upper > head || after > head || (after < pruned && !(allow_bootstrap_zero && after == 0))
+        {
+            return Err(EventsReadError::ResyncRequired {
                 oldest_available_seq,
                 latest_seq: head,
-                has_more,
-            })
+            });
+        }
+
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, event_id, kind, aggregate_type, aggregate_id, actor_id, created_at_ms,
+                    payload_json, owner_principal_id, agent_owner_principal_id, node_id, profile_id
+             FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let items = stmt
+            .query_map(params![after, upper, limit], |row| read_event(row, source))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let last = items.last().map_or(upper, |item| item.envelope.seq);
+        let has_more = items.len() == limit as usize && last < upper;
+        Ok(EventsPageRaw {
+            items,
+            scanned_through: if has_more { last } else { upper },
+            oldest_available_seq,
+            latest_seq: head,
+            has_more,
         })
-        .await
     }
 }
 

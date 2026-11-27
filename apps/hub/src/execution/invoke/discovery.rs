@@ -1,0 +1,277 @@
+use std::sync::Arc;
+
+use axum::{Json, extract::State};
+use efferian_authz::{
+    AuthContext, AuthzError, ExecutionTarget, authorize_discovery_target,
+    authorize_profile_discover,
+};
+use efferian_protocol::{
+    ExecutionMode, NodeId, ProblemDetails, ProfileId, ProfileToolBinding, ToolAnnotations,
+    ToolDefinition, ToolSpec, validate_public_tool_name, validate_slug,
+};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
+
+use crate::catalog::profiles::{ProfileEditionSummary, read_edition};
+use crate::catalog::tools::read_tool_revision;
+use crate::catalog::upstreams::read_upstream_config;
+use crate::http::{
+    ApiCaller, ApiError, ApiPath, ApiQuery, ApiResult, AppState, checked_page_limit,
+};
+use crate::vault::auth::refresh_api;
+
+use super::published_profile;
+use super::selection::{AvailableTarget, discovery_targets};
+
+pub(super) fn routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_tools))
+        .routes(routes!(get_tool))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoverQuery {
+    q: Option<String>,
+    limit: Option<u16>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct DiscoverTools {
+    items: Vec<DiscoveredProfileTool>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct DiscoveredProfileTool {
+    public_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    execution_mode: ExecutionMode,
+    curated_featured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<ToolAnnotations>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct DiscoveredProfileToolDetail {
+    #[serde(flatten)]
+    summary: DiscoveredProfileTool,
+    #[schema(value_type = Object)]
+    input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixed_node_id: Option<NodeId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_targets: Option<Vec<AvailableTarget>>,
+}
+
+enum Visibility {
+    Hidden,
+    Upstream,
+    Nodes(Vec<AvailableTarget>),
+}
+
+#[utoipa::path(
+    get, path = "/v1/profiles/{slug}/tools", tag = "Profiles",
+    params(
+        ("slug" = String, Path, description = "Profile slug"),
+        ("q" = Option<String>, Query, description = "Case-insensitive name or description search"),
+        ("limit" = Option<u16>, Query, minimum = 1, maximum = 200, description = "Maximum results, defaults to 50"),
+    ),
+    security(("api_bearer" = [])),
+    responses(
+        (status = 200, description = "Tools visible in the active edition", body = DiscoverTools),
+        (status = 404, description = "No active edition visible to this caller", body = ProblemDetails, content_type = "application/problem+json"),
+    )
+)]
+async fn list_tools(
+    State(state): State<AppState>,
+    ApiCaller(caller): ApiCaller,
+    ApiPath(slug): ApiPath<String>,
+    ApiQuery(query): ApiQuery<DiscoverQuery>,
+) -> ApiResult<Json<DiscoverTools>> {
+    validate_slug(&slug).map_err(|_| ApiError::bad_input())?;
+    let limit = checked_page_limit(query.limit)?;
+    let search = query.q.as_deref().map(str::to_lowercase);
+    let clock = Arc::clone(&state.clock);
+    let items = state
+        .storage
+        .read_snapshot(move |conn| -> ApiResult<_> {
+            let ctx = refresh_api(conn, &caller.credential, clock.wall_now_ms())?;
+            let mut edition = active_edition(conn, &ctx, &slug)?;
+            edition
+                .bindings
+                .sort_unstable_by(|a, b| a.public_name.cmp(&b.public_name));
+            let mut items = Vec::new();
+            for binding in edition.bindings {
+                let Some(revision) =
+                    read_tool_revision(conn, binding.tool_id, binding.tool_version)?
+                else {
+                    continue;
+                };
+                if revision.disabled_at_ms.is_some() {
+                    continue;
+                }
+                let summary = summary(&binding, &revision.definition);
+                if let Some(search) = &search
+                    && !summary.public_name.to_lowercase().contains(search)
+                    && !summary
+                        .description
+                        .as_ref()
+                        .is_some_and(|description| description.to_lowercase().contains(search))
+                {
+                    continue;
+                }
+                if matches!(
+                    tool_visibility(
+                        conn,
+                        &ctx,
+                        edition.profile_id,
+                        &binding,
+                        &revision.definition
+                    )?,
+                    Visibility::Hidden,
+                ) {
+                    continue;
+                }
+                items.push(summary);
+                if items.len() == limit {
+                    break;
+                }
+            }
+            Ok(items)
+        })
+        .await?;
+    Ok(Json(DiscoverTools { items }))
+}
+
+#[utoipa::path(
+    get, path = "/v1/profiles/{slug}/tools/{public_name}", tag = "Profiles",
+    params(
+        ("slug" = String, Path, description = "Profile slug"),
+        ("public_name" = String, Path, description = "Published tool name"),
+    ),
+    security(("api_bearer" = [])),
+    responses(
+        (status = 200, description = "Tool schema and visible targets", body = DiscoveredProfileToolDetail),
+        (status = 404, description = "No active published tool visible to this caller", body = ProblemDetails, content_type = "application/problem+json"),
+    )
+)]
+async fn get_tool(
+    State(state): State<AppState>,
+    ApiCaller(caller): ApiCaller,
+    ApiPath((slug, public_name)): ApiPath<(String, String)>,
+) -> ApiResult<Json<DiscoveredProfileToolDetail>> {
+    validate_slug(&slug).map_err(|_| ApiError::bad_input())?;
+    validate_public_tool_name(&public_name).map_err(|_| ApiError::bad_input())?;
+    let clock = Arc::clone(&state.clock);
+    let detail = state
+        .storage
+        .read_snapshot(move |conn| -> ApiResult<_> {
+            let ctx = refresh_api(conn, &caller.credential, clock.wall_now_ms())?;
+            let edition = active_edition(conn, &ctx, &slug)?;
+            let binding = edition
+                .bindings
+                .iter()
+                .find(|binding| binding.public_name == public_name)
+                .ok_or_else(ApiError::not_found)?;
+            let revision = read_tool_revision(conn, binding.tool_id, binding.tool_version)?
+                .filter(|revision| revision.disabled_at_ms.is_none())
+                .ok_or_else(ApiError::not_found)?;
+            let visible = tool_visibility(
+                conn,
+                &ctx,
+                edition.profile_id,
+                binding,
+                &revision.definition,
+            )?;
+            let available_targets = match visible {
+                Visibility::Hidden => return Err(ApiError::not_found()),
+                Visibility::Upstream => None,
+                Visibility::Nodes(nodes) => Some(nodes),
+            };
+            Ok(DiscoveredProfileToolDetail {
+                summary: summary(binding, &revision.definition),
+                input_schema: revision
+                    .definition
+                    .input_schema
+                    .ok_or_else(ApiError::internal)?,
+                fixed_node_id: binding.fixed_node_id,
+                available_targets,
+            })
+        })
+        .await?;
+    Ok(Json(detail))
+}
+
+fn active_edition(
+    conn: &Connection,
+    ctx: &AuthContext,
+    slug: &str,
+) -> ApiResult<ProfileEditionSummary> {
+    let profile = published_profile(conn, slug)?;
+    authorize_profile_discover(ctx, profile.map(|(id, _)| id))?;
+    let (id, version) = profile.ok_or_else(ApiError::not_found)?;
+    read_edition(conn, id, version.get())?
+        .filter(|edition| edition.disabled_at_ms.is_none())
+        .ok_or_else(ApiError::not_found)
+}
+
+fn tool_visibility(
+    conn: &Connection,
+    ctx: &AuthContext,
+    profile_id: ProfileId,
+    binding: &ProfileToolBinding,
+    definition: &ToolDefinition,
+) -> ApiResult<Visibility> {
+    match &definition.spec {
+        ToolSpec::UpstreamRef {
+            upstream_id,
+            account_mode,
+            ..
+        } => {
+            let target = ExecutionTarget::Upstream {
+                upstream_id: *upstream_id,
+                account: *account_mode,
+            };
+            match authorize_discovery_target(ctx, profile_id, target) {
+                Ok(()) => {}
+                Err(AuthzError::ResourceNotFound | AuthzError::ScopeNarrowedOut) => {
+                    return Ok(Visibility::Hidden);
+                }
+                Err(error) => return Err(error.into()),
+            }
+            if read_upstream_config(conn, *upstream_id)?
+                .is_some_and(|upstream| upstream.disabled_at_ms.is_none())
+            {
+                Ok(Visibility::Upstream)
+            } else {
+                Ok(Visibility::Hidden)
+            }
+        }
+        spec => {
+            let selector = spec.target_selector().ok_or_else(ApiError::internal)?;
+            let nodes = discovery_targets(conn, ctx, profile_id, selector, binding.fixed_node_id)?;
+            if nodes.is_empty() {
+                Ok(Visibility::Hidden)
+            } else {
+                Ok(Visibility::Nodes(nodes))
+            }
+        }
+    }
+}
+
+fn summary(binding: &ProfileToolBinding, definition: &ToolDefinition) -> DiscoveredProfileTool {
+    DiscoveredProfileTool {
+        public_name: binding.public_name.clone(),
+        description: binding
+            .description_override
+            .clone()
+            .or_else(|| definition.description.clone()),
+        execution_mode: binding.execution_mode,
+        curated_featured: binding.curated_featured,
+        annotations: definition.annotations.clone(),
+    }
+}

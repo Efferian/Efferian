@@ -137,14 +137,14 @@ impl Fixture {
         .unwrap();
         let (storage, runtime) = opened.migrate_and_start_runtime().unwrap();
         let egress = EgressClient::new(config.egress_policy().unwrap()).unwrap();
-        let state = AppState {
+        let state = AppState::new(
             storage,
             vault,
             clock,
             config,
-            bridge: Arc::new(OfflineNodeBridge),
+            Arc::new(OfflineNodeBridge),
             egress,
-        };
+        );
         let bearer = |secret: efferian_protocol::SecretString| {
             let mut value =
                 HeaderValue::from_str(&format!("Bearer {}", secret.expose_secret())).unwrap();
@@ -291,6 +291,7 @@ fn routes_for_tests(gate: Arc<Gate>) -> RouteGroups {
             .route("/v1/enrollment/exchange", post(enrollment_json)),
         node_handshake: OpenApiRouter::default().route("/v1/bridge/connect", get(node_only)),
         mcp: OpenApiRouter::default().route("/mcp/{slug}", any_service(FakeMcp)),
+        ..RouteGroups::default()
     }
 }
 
@@ -1361,7 +1362,8 @@ async fn openapi_metadata_caps_extensions_and_live_response_schemas() {
                     for param in params {
                         if param["name"] == "limit" {
                             assert_eq!(param["schema"]["minimum"].as_f64(), Some(1.0));
-                            assert_eq!(param["schema"]["maximum"].as_f64(), Some(200.0));
+                            let max = if path == "/v1/events" { 500.0 } else { 200.0 };
+                            assert_eq!(param["schema"]["maximum"].as_f64(), Some(max));
                         }
                     }
                 }

@@ -20,7 +20,7 @@ pub use lifecycle::{
 };
 pub use maintenance::{StoragePressure, StorageStatus};
 
-pub(crate) use actor::{MAX_WORK_BYTES, PriorityKind, WriteTx, WriteTxError};
+pub(crate) use actor::{FollowUpWrite, MAX_WORK_BYTES, PriorityKind, WriteTx, WriteTxError};
 pub(crate) use events::{
     id, invalid_text_msg, json, opt_id, optional_json, optional_scalar, read_grant_scope, scalar,
     scalar_text,
@@ -28,9 +28,9 @@ pub(crate) use events::{
 
 #[allow(unused_imports, reason = "storage execution seams for hub modules")]
 pub(crate) use executions::{
-    ExecutionTarget, InvalidReceipt, InvokeOutcome, InvokeReplayInput, InvokeResource,
-    InvokeWriteError, NewExecutionWrite, PreparedReceipt, ReceiptOutcome, ReceiptWrite,
-    RecordedInvocation,
+    CloseExecutions, ExecutionTarget, InvalidReceipt, InvokeOutcome, InvokeReplayInput,
+    InvokeResource, InvokeWriteError, NewExecutionWrite, PreparedOutcome, PreparedReceipt,
+    ReceiptOutcome, ReceiptWrite, RecordedInvocation, TRANSITION_BATCH, lookup_invocation_replay,
 };
 
 use std::io;
@@ -71,6 +71,7 @@ impl FromStr for SqliteSynchronous {
 pub struct StorageConfig {
     pub synchronous: SqliteSynchronous,
     pub max_page_count: u32,
+    pub max_concurrent_waiters: usize,
     pub journal_size_limit_bytes: i64,
     pub max_events_rows: usize,
     pub gc_interval: Duration,
@@ -89,6 +90,7 @@ impl Default for StorageConfig {
         Self {
             synchronous: SqliteSynchronous::Full,
             max_page_count: 1_048_576,
+            max_concurrent_waiters: 512,
             journal_size_limit_bytes: 64 * 1024 * 1024,
             max_events_rows: 500_000,
             gc_interval: Duration::from_secs(60),
@@ -109,6 +111,11 @@ impl StorageConfig {
         if !(MIN_PAGES..=0xffff_fffe).contains(&self.max_page_count) {
             return Err(StorageError::InvalidConfig(
                 "max_page_count is out of range",
+            ));
+        }
+        if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_concurrent_waiters) {
+            return Err(StorageError::InvalidConfig(
+                "max_concurrent_waiters is out of range",
             ));
         }
         if self.journal_size_limit_bytes <= 0

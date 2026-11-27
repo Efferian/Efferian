@@ -131,7 +131,7 @@ impl Fixture {
             execution_id,
             node_id: self.node,
             state,
-            finished_at_ms: 77,
+            frame_epoch: 0,
             sealed_result_blob: Some(vec![1, 2, 3]),
             summary: ExecutionSummary {
                 exit_code: Some(42),
@@ -466,6 +466,7 @@ async fn late_receipt_is_deduplicated_even_after_event_pruning() -> TestResult {
         handle.apply_receipt(not_owned).await?,
         ReceiptOutcome::NotOwnedOrNotFound
     );
+    f.set_wall_ms(12);
     assert_eq!(
         handle
             .apply_receipt(f.receipt(exec, TerminalExecutionState::Failed))
@@ -479,7 +480,7 @@ async fn late_receipt_is_deduplicated_even_after_event_pruning() -> TestResult {
     assert_eq!(payload.state, ExecutionState::Failed);
     assert_eq!(payload.exit_code, Some(42));
     assert_eq!(payload.error_code.as_deref(), Some("receipt_code"));
-    assert_eq!(payload.duration_ms, Some(5));
+    assert_eq!(payload.duration_ms, Some(12));
     let row = handle.read_snapshot(move |conn| {
         let row = conn.query_row("SELECT state, summary_json, sealed_result_blob FROM executions WHERE execution_id = ?1",
             [exec.to_string()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
@@ -2162,7 +2163,7 @@ fn receipt_prepare_enforces_error_code_and_summary_invariants() {
         execution_id: ExecutionId::new(),
         node_id: NodeId::new(),
         state: TerminalExecutionState::Failed,
-        finished_at_ms: 10,
+        frame_epoch: 0,
         summary: ExecutionSummary {
             effect_may_have_occurred: Some(true),
             error_code: Some("ok_code".to_owned()),

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, Permissions};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -17,11 +17,12 @@ use tower_service::Service;
 use crate::config::Config;
 use crate::egress::EgressClient;
 use crate::http::{self, AppState};
-use crate::node_bridge::{BridgeCloseReason, NodeBridgeControl, NodeLiveStatus};
+use crate::node_bridge::{BridgeCloseReason, NodeDispatcher, NodeLiveStatus, ReadyNode};
 use crate::operations;
 use crate::storage::{
     OpenMode, ShutdownReport, StorageClock, StorageError, StorageRuntime, WriteTxError, id,
 };
+use crate::upstream_dispatch::{OfflineUpstreamDispatcher, UpstreamDispatcher};
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -46,25 +47,40 @@ impl Drop for TestDir {
     }
 }
 
-pub(crate) struct ManualClock(AtomicI64);
+pub(crate) struct ManualClock {
+    wall_ms: AtomicI64,
+    monotonic_ms: AtomicU64,
+}
 
 impl ManualClock {
     pub fn new(ms: i64) -> Self {
-        Self(AtomicI64::new(ms))
+        Self {
+            wall_ms: AtomicI64::new(ms),
+            monotonic_ms: AtomicU64::new(0),
+        }
     }
 
     pub fn set(&self, ms: i64) {
-        self.0.store(ms, Ordering::SeqCst);
+        self.wall_ms.store(ms, Ordering::SeqCst);
+    }
+
+    pub fn set_monotonic(&self, time: Duration) {
+        self.monotonic_ms.store(
+            u64::try_from(time.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
     }
 }
 
 impl StorageClock for ManualClock {
     fn wall_now_ms(&self) -> i64 {
-        self.0.load(Ordering::SeqCst)
+        self.wall_ms.load(Ordering::SeqCst)
     }
 
     fn monotonic_now(&self) -> Result<Duration, StorageError> {
-        Ok(Duration::ZERO)
+        Ok(Duration::from_millis(
+            self.monotonic_ms.load(Ordering::SeqCst),
+        ))
     }
 }
 
@@ -101,7 +117,7 @@ impl RecordingBridge {
     }
 }
 
-impl NodeBridgeControl for RecordingBridge {
+impl NodeDispatcher for RecordingBridge {
     fn live_status(&self, node_id: NodeId) -> NodeLiveStatus {
         if self.sessions().contains_key(&node_id) {
             NodeLiveStatus::Ready
@@ -112,6 +128,13 @@ impl NodeBridgeControl for RecordingBridge {
 
     fn online_nodes_count(&self) -> usize {
         self.sessions().len()
+    }
+
+    fn ready_node(&self, node_id: NodeId) -> Option<ReadyNode> {
+        self.sessions().get(&node_id).map(|&epoch| ReadyNode {
+            epoch,
+            max_concurrent_executions: 64,
+        })
     }
 
     fn close_session(&self, node_id: NodeId, through_epoch: u64, reason: BridgeCloseReason) {
@@ -163,7 +186,7 @@ pub(crate) async fn send_json(
     };
     let response = router.clone().call(req.body(body)?).await?;
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 256 * 1024).await?;
+    let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024).await?;
     let data = if bytes.is_empty() {
         Value::Null
     } else {
@@ -185,6 +208,23 @@ pub(crate) struct TestHub {
 
 impl TestHub {
     pub async fn start(prefix: &str, config: Config, start_ms: i64) -> TestResult<Self> {
+        Self::start_with_dispatchers(
+            prefix,
+            config,
+            start_ms,
+            None,
+            Arc::new(OfflineUpstreamDispatcher),
+        )
+        .await
+    }
+
+    pub async fn start_with_dispatchers(
+        prefix: &str,
+        config: Config,
+        start_ms: i64,
+        node: Option<Arc<dyn NodeDispatcher>>,
+        upstream: Arc<dyn UpstreamDispatcher>,
+    ) -> TestResult<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = TestDir::new(prefix)?;
         let state_dir = dir.join("state");
@@ -211,14 +251,16 @@ impl TestHub {
             })
             .await?;
         let bridge = Arc::new(RecordingBridge::new(state_dir.join("hub.sqlite3")));
-        let state = AppState {
+        let egress = EgressClient::new(config.egress_policy()?)?;
+        let mut state = AppState::new(
             storage,
             vault,
-            clock: Arc::clone(&clock) as Arc<dyn StorageClock>,
-            egress: EgressClient::new(config.egress_policy()?)?,
-            config: Arc::new(config),
-            bridge: Arc::clone(&bridge) as Arc<dyn NodeBridgeControl>,
-        };
+            Arc::clone(&clock) as Arc<dyn StorageClock>,
+            Arc::new(config),
+            node.unwrap_or_else(|| Arc::clone(&bridge) as Arc<dyn NodeDispatcher>),
+            egress,
+        );
+        state.upstream = upstream;
         let router = http::router(state.clone(), 8080)?;
         Ok(Self {
             router,

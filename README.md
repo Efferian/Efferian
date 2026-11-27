@@ -47,6 +47,8 @@ efferian-hub serve --state-dir ./hub-state
 
 The default listener is `127.0.0.1:8080`. See the operator guide for configuration, live backups and offline administrator recovery. [Hub operations](docs/hub-operations.md)
 
+The Hub serves a versioned tool catalog, profile publishing, execution state, and an NDJSON event feed. The checked-in OpenAPI 3.1 snapshot is generated from the Hub's router and verified by `make check`. [Hub OpenAPI contract](contracts/openapi-hub.json)
+
 ## Hub storage
 
 The Hub storage module owns a single `hub.sqlite3` writer under the `hub.lock` sidecar. The database uses WAL, full synchronous commits by default and eight read-only connections for snapshots. State changes and their outbox events commit together. Live subscribers also receive a dedicated revocation feed and must invalidate cached permissions if it reports a gap or closes.

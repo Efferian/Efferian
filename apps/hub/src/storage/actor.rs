@@ -19,6 +19,7 @@ use super::{OpenMode, StorageConfig, StorageError, WriteError};
 
 const PRIORITY_CAPACITY: usize = 128;
 const WORK_CAPACITY: usize = 256;
+const MIN_SUBSCRIPTION_CAPACITY: usize = 512;
 const MAX_COMMANDS: usize = 32;
 const PRIORITY_BURST: usize = 16;
 pub(crate) const MAX_WORK_BYTES: usize = 4 * 1024 * 1024;
@@ -135,7 +136,7 @@ impl StorageHandle {
     ) -> Result<Option<watch::Receiver<ExecutionSnapshot>>, StorageError> {
         let (send, recv) = oneshot::channel();
         self.mailbox.enqueue(|state| {
-            if state.subscriptions.len() == WORK_CAPACITY {
+            if state.subscriptions.len() >= self.mailbox.subscription_capacity {
                 return Err(StorageError::Overloaded);
             }
             state.subscriptions.push_back((execution_id, send));
@@ -195,6 +196,17 @@ impl StorageHandle {
         self.execute(None, op).await
     }
 
+    pub(crate) async fn work_barrier(&self) -> Result<(), WriteError<std::convert::Infallible>> {
+        loop {
+            match self.execute_work(0, |_| Ok(())).await {
+                Err(WriteError::Storage(StorageError::Overloaded)) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn execute<T, E, F>(&self, bytes: Option<usize>, op: F) -> Result<T, WriteError<E>>
     where
         T: Send + 'static,
@@ -239,7 +251,12 @@ impl OpenedDb {
         migrate_to_current(&mut self.conn, found)?;
 
         let readers = ReadPool::open(database_path(&self.lock))?;
-        let mailbox = Arc::new(Mailbox::default());
+        let mailbox = Arc::new(Mailbox {
+            subscription_capacity: MIN_SUBSCRIPTION_CAPACITY
+                .max(self.config.max_concurrent_waiters),
+            state: Mutex::default(),
+            wake: Condvar::new(),
+        });
         let (events, _) = broadcast::channel(EVENTS_CAPACITY);
         let (revocations, _) = broadcast::channel(REVOCATIONS_CAPACITY);
         let (stopped_tx, stopped_rx) = watch::channel(false);
@@ -372,8 +389,14 @@ impl DbActor {
         let appended = effects.events.len();
         let wrote_result_blob = effects.wrote_result_blob;
         let committed = matches!(outcome, BatchOutcome::Committed);
+        let mut reply_outcome = outcome;
         let result = match (outcome, fatal_commit) {
-            (BatchOutcome::Committed, _) => self.publish(effects),
+            (BatchOutcome::Committed, _) => match self.publish(effects) {
+                Ok(follow_ups) => self.run_follow_ups(db, follow_ups).inspect_err(|_| {
+                    reply_outcome = BatchOutcome::Unknown;
+                }),
+                Err(error) => Err(error),
+            },
             (_, Some(error)) => Err(error),
             _ if db.conn.is_autocommit() => Ok(()),
             _ => db
@@ -382,7 +405,7 @@ impl DbActor {
                 .map_err(StorageError::from),
         };
         for command in commands {
-            command.reply(outcome);
+            command.reply(reply_outcome);
         }
         result?;
         if !db.conn.is_autocommit() {
@@ -401,7 +424,43 @@ impl DbActor {
         Ok(committed)
     }
 
-    fn publish(&mut self, effects: Effects) -> Result<(), StorageError> {
+    fn run_follow_ups(
+        &mut self,
+        db: &OpenedDb,
+        mut commands: Vec<Box<dyn Command>>,
+    ) -> Result<(), StorageError> {
+        // Continuations are already accepted obligations. Never enqueue them
+        // behind an external request or drop them when ingress is full.
+        while !commands.is_empty() {
+            let mut effects = Effects::default();
+            let mut probe = PressureProbe {
+                cached: self.maintenance.level(),
+                changed: false,
+            };
+            let (outcome, error) =
+                run_transaction(db, &mut commands, &mut effects, &self.waiters, &mut probe);
+            if !matches!(outcome, BatchOutcome::Committed) {
+                if !db.conn.is_autocommit() {
+                    db.conn.execute_batch("ROLLBACK")?;
+                }
+                return Err(error.unwrap_or(StorageError::InvalidDatabase(
+                    "post-commit continuation could not be persisted",
+                )));
+            }
+            self.maintenance.after_write(
+                db,
+                true,
+                0,
+                effects.wrote_result_blob,
+                effects.events.len(),
+                probe.changed,
+            )?;
+            commands = self.publish(effects)?;
+        }
+        Ok(())
+    }
+
+    fn publish(&mut self, effects: Effects) -> Result<Vec<Box<dyn Command>>, StorageError> {
         for signal in effects.revocations {
             let _ = self.revocations.send(Arc::new(signal));
         }
@@ -421,14 +480,19 @@ impl DbActor {
         for event in effects.events {
             let _ = self.events.send(Arc::new(event));
         }
+        let mut follow_ups = Vec::<Box<dyn Command>>::new();
         let mut failed = false;
         for hook in effects.hooks {
-            failed |= std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)).is_err();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+                Ok(Some(write)) => follow_ups.push(Box::new(write)),
+                Ok(None) => {}
+                Err(_) => failed = true,
+            }
         }
         if failed {
             Err(StorageError::ActorStopped)
         } else {
-            Ok(())
+            Ok(follow_ups)
         }
     }
 }
@@ -526,7 +590,7 @@ struct Effects {
     registered: Waiters,
     updated: Vec<(ExecutionId, ExecutionSnapshot)>,
     finished: Vec<(ExecutionId, ExecutionSnapshot)>,
-    hooks: Vec<Box<dyn FnOnce() + Send>>,
+    hooks: Vec<Box<dyn FnOnce() -> Option<FollowUpWrite> + Send>>,
     wrote_result_blob: bool,
 }
 
@@ -639,6 +703,17 @@ impl WriteTx<'_> {
 
     /// Runs on the writer thread after event publication and must return promptly.
     pub(crate) fn on_commit(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.on_commit_follow_up(move || {
+            hook();
+            None
+        });
+    }
+
+    /// Run a nonblocking effect, optionally returning a writer-local continuation.
+    pub(crate) fn on_commit_follow_up(
+        &mut self,
+        hook: impl FnOnce() -> Option<FollowUpWrite> + Send + 'static,
+    ) {
         self.effects.hooks.push(Box::new(hook));
     }
 }
@@ -704,6 +779,9 @@ pub(crate) enum PriorityKind {
     DisablePrincipal,
     RevokeNode,
     RevokeGrant,
+    DisableUpstream,
+    DisableTool,
+    DisableProfile,
     DisableEdition,
     CancelExecution,
 }
@@ -724,6 +802,30 @@ enum CommandResult {
 trait Command: Send {
     fn run(&mut self, tx: &mut WriteTx<'_>) -> CommandResult;
     fn reply(self: Box<Self>, outcome: BatchOutcome);
+}
+
+type Continuation = Box<dyn FnOnce(&mut WriteTx<'_>) -> Result<(), StorageError> + Send>;
+
+/// A metadata write required by an effect that ran after a durable commit.
+pub(crate) struct FollowUpWrite(Option<Continuation>);
+
+impl FollowUpWrite {
+    pub(crate) fn new(
+        write: impl FnOnce(&mut WriteTx<'_>) -> Result<(), StorageError> + Send + 'static,
+    ) -> Self {
+        Self(Some(Box::new(write)))
+    }
+}
+
+impl Command for FollowUpWrite {
+    fn run(&mut self, tx: &mut WriteTx<'_>) -> CommandResult {
+        match self.0.take().map(|write| write(tx)) {
+            Some(Ok(())) => CommandResult::Success,
+            Some(Err(_)) | None => CommandResult::FatalError,
+        }
+    }
+
+    fn reply(self: Box<Self>, _outcome: BatchOutcome) {}
 }
 
 struct Operation<T, E, F> {
@@ -780,8 +882,8 @@ struct Work {
     command: Box<dyn Command>,
 }
 
-#[derive(Default)]
 struct Mailbox {
+    subscription_capacity: usize,
     state: Mutex<MailboxState>,
     wake: Condvar,
 }

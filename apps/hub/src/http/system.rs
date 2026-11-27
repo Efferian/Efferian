@@ -66,23 +66,38 @@ pub(super) fn admin_routes() -> RouteGroups {
     }
 }
 
-pub(super) fn document_boundary_errors(doc: &mut utoipa::openapi::OpenApi) {
-    for path in doc.paths.paths.values_mut() {
-        for (operation, checks_body) in [
-            (&mut path.get, false),
-            (&mut path.head, false),
-            (&mut path.options, false),
-            (&mut path.trace, false),
-            (&mut path.post, true),
-            (&mut path.put, true),
-            (&mut path.patch, true),
-            (&mut path.delete, true),
+pub(super) fn complete_operations(doc: &mut utoipa::openapi::OpenApi) {
+    for (template, path) in &mut doc.paths.paths {
+        for (method, operation, checks_body) in [
+            ("get", &mut path.get, false),
+            ("head", &mut path.head, false),
+            ("options", &mut path.options, false),
+            ("trace", &mut path.trace, false),
+            ("post", &mut path.post, true),
+            ("put", &mut path.put, true),
+            ("patch", &mut path.patch, true),
+            ("delete", &mut path.delete, true),
         ] {
             if let Some(operation) = operation {
+                operation.operation_id = Some(operation_id(method, template));
                 document_operation_errors(operation, checks_body);
             }
         }
     }
+}
+
+fn operation_id(method: &str, template: &str) -> String {
+    let mut id = method.to_owned();
+    for segment in template.trim_start_matches('/').split('/') {
+        id.push('_');
+        if segment.starts_with('{') {
+            id.push_str("by_");
+        }
+        for ch in segment.trim_matches(['{', '}']).chars() {
+            id.push(if ch.is_ascii_alphanumeric() { ch } else { '_' });
+        }
+    }
+    id
 }
 
 fn document_operation_errors(operation: &mut Operation, checks_body: bool) {
@@ -212,20 +227,25 @@ async fn admin_status(
     ApiCaller(caller): ApiCaller,
 ) -> ApiResult<Json<AdminStatus>> {
     let clock = state.clock;
-    let storage = state
+    let (storage, active_upstream_executions) = state
         .storage
-        .status_snapshot_with(move |conn| -> ApiResult<()> {
+        .status_snapshot_with(move |conn| -> ApiResult<usize> {
             let ctx = refresh_api(conn, &caller.credential, clock.wall_now_ms())?;
             authorize_admin(&ctx)?;
-            Ok(())
+            Ok(conn.query_row(
+                "SELECT count(*) FROM executions
+                 WHERE executor_kind = 'upstream' AND state IN ('accepted', 'running')",
+                [],
+                |row| row.get(0),
+            )?)
         })
         .await?;
     Ok(Json(AdminStatus {
         storage,
         gc_error_count: state.storage.gc_error_count(),
         online_nodes_count: state.bridge.online_nodes_count(),
-        upstream_pool_connections: 0,
-        active_upstream_executions: 0,
+        upstream_pool_connections: state.upstream.pool_connections_count(),
+        active_upstream_executions,
     }))
 }
 
@@ -259,7 +279,7 @@ async fn openapi(
 }
 
 pub(super) struct OpenApiArtifact {
-    bytes: Bytes,
+    pub(super) bytes: Bytes,
     etag: String,
 }
 

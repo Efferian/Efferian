@@ -369,23 +369,24 @@ fn gate_banned_crates() -> Result {
 
 #[test]
 fn gate_sqlite_hygiene() -> Result {
+    run_hub_gate("gate_sqlite_hygiene")
+}
+
+#[test]
+fn gate_openapi_drift() -> Result {
+    run_hub_gate("gate_openapi_drift")
+}
+
+fn run_hub_gate(name: &str) -> Result {
     let output = Command::new(env!("CARGO"))
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
-        .args([
-            "test",
-            "-p",
-            HUB,
-            "--test",
-            "gate_sqlite_hygiene",
-            "--locked",
-            "--offline",
-        ])
+        .args(["test", "-p", HUB, "--test", name, "--locked", "--offline"])
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         return Err(format!(
-            "Hub SQLite hygiene gate failed ({}):\n{stdout}\n{stderr}",
+            "Hub {name} gate failed ({}):\n{stdout}\n{stderr}",
             output.status
         )
         .into());
@@ -398,9 +399,7 @@ fn gate_sqlite_hygiene() -> Result {
         })
         .unwrap_or(0);
     if passed == 0 {
-        return Err(
-            format!("Hub SQLite hygiene gate executed zero tests:\n{stdout}\n{stderr}").into(),
-        );
+        return Err(format!("Hub {name} gate executed zero tests:\n{stdout}\n{stderr}").into());
     }
     Ok(())
 }

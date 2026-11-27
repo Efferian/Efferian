@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
 
 use axum::{Json, extract::State};
 use efferian_authz::{
@@ -7,7 +7,7 @@ use efferian_authz::{
 };
 use efferian_protocol::{
     Capability, NodeId, PrincipalId, PrincipalKind, ProfileId, ProfileToolBinding, TokenId,
-    ToolDefinition, ToolSpec, UpstreamAccountMode, UpstreamId,
+    ToolDefinition, ToolSpec, UpstreamAccountMode, UpstreamId, validate_profile_bindings,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -15,7 +15,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::UtoipaMethodRouter, routes};
 
 use crate::http::{ApiCaller, ApiError, ApiResult, AppState};
-use crate::storage::{id, json};
+use crate::storage::{StorageError, id, json};
 use crate::vault::auth::refresh_api_with_label;
 
 use super::data::{Principal, owned_agent_principals, principal_by_id};
@@ -51,9 +51,11 @@ struct OwnedAgent {
 }
 
 #[derive(Serialize, ToSchema)]
-struct CallerBoundUpstream {
-    upstream_id: UpstreamId,
+pub(crate) struct CallerBoundUpstream {
+    pub(crate) upstream_id: UpstreamId,
     slug: String,
+    #[serde(skip)]
+    pub(crate) caller_bound_profiles: Vec<ProfileId>,
 }
 
 #[utoipa::path(
@@ -118,7 +120,7 @@ fn owned_agents(conn: &Connection, ctx: &AuthContext) -> ApiResult<Vec<OwnedAgen
     Ok(visible)
 }
 
-fn caller_bound_upstreams(
+pub(crate) fn caller_bound_upstreams(
     conn: &Connection,
     ctx: &AuthContext,
 ) -> ApiResult<Vec<CallerBoundUpstream>> {
@@ -162,13 +164,13 @@ fn upstreams_for_profiles(
     let mut pinned_definition = conn.prepare_cached(
         "SELECT tr.definition_json FROM tools t JOIN tool_revisions tr ON tr.tool_id = t.tool_id
          WHERE t.tool_id = ?1 AND tr.version = ?2
-           AND t.kind = 'upstream_ref' AND t.disabled_at_ms IS NULL",
+           AND t.disabled_at_ms IS NULL",
     )?;
     let mut active_upstream = conn.prepare_cached(
         "SELECT slug FROM upstreams WHERE upstream_id = ?1 AND disabled_at_ms IS NULL",
     )?;
     let mut revisions = HashMap::new();
-    let mut visible = BTreeSet::new();
+    let mut visible = BTreeMap::<UpstreamId, Vec<ProfileId>>::new();
     for profile_id in profiles {
         let profile_id = profile_id?;
         if authorize_profile_discover(ctx, Some(profile_id)).is_err() {
@@ -182,6 +184,8 @@ fn upstreams_for_profiles(
         else {
             continue;
         };
+        validate_profile_bindings(&bindings)
+            .map_err(|_| StorageError::InvalidDatabase("invalid profile bindings"))?;
         let mut upstreams = BTreeSet::new();
         for binding in bindings {
             let key = (binding.tool_id, binding.tool_version);
@@ -207,17 +211,21 @@ fn upstreams_for_profiles(
                 account: UpstreamAccountMode::CallerBound,
             };
             if authorize_discovery_target(ctx, profile_id, target).is_ok() {
-                visible.insert(upstream_id);
+                visible.entry(upstream_id).or_default().push(profile_id);
             }
         }
     }
     let mut result = Vec::new();
-    for upstream_id in visible {
+    for (upstream_id, caller_bound_profiles) in visible {
         if let Some(slug) = active_upstream
             .query_row([upstream_id.to_string()], |row| row.get(0))
             .optional()?
         {
-            result.push(CallerBoundUpstream { upstream_id, slug });
+            result.push(CallerBoundUpstream {
+                upstream_id,
+                slug,
+                caller_bound_profiles,
+            });
         }
     }
     result.sort_unstable_by(|left, right| left.slug.cmp(&right.slug));

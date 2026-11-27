@@ -4,8 +4,10 @@ use efferian_protocol::{
 };
 
 use crate::{
-    AuthContext, AuthzError, InvokeBindingView, NodeAuthTarget,
+    AuthContext, AuthzError, ExecutionAccess, ExecutionAuthTarget, InvokeBindingView,
+    NodeAuthTarget,
     account::resolve_caller_bound_account,
+    authorize_execution_access,
     policy::{ActiveContext, CheckedContext, Phase, guard, verify_context},
 };
 
@@ -73,6 +75,36 @@ pub fn authorize_profile_invoke(
 ) -> Result<Option<AccountId>, AuthzError> {
     let (active, target) = profile_invoke_gate(ctx, published_profile, target)?;
     resolve_target_account(active, target, bindings)
+}
+
+/// Authorize an existing invocation before comparing its recorded intent.
+/// The execution target is read from history, independently of live catalog
+/// dependencies and node inventory.
+pub fn authorize_profile_invoke_replay(
+    ctx: &AuthContext,
+    published_profile: Option<ProfileId>,
+    recorded: &ExecutionAuthTarget,
+) -> Result<(), AuthzError> {
+    let checked = verify_context(ctx)?;
+    match checked.active(Phase::Invoke) {
+        Ok(_) => {
+            let capability = discover(checked, published_profile)?;
+            authorize_execution_access(ctx, Some(recorded), ExecutionAccess::ReadMetadata)?;
+            require_invoke(capability)
+        }
+        Err(AuthzError::OwnerDisabled) => {
+            let capability = discover(checked, published_profile)?;
+            if recorded.caller_principal_id != ctx.caller.principal_id
+                || !ctx.token.permits_profile(recorded.profile_id)
+                || !ctx.token.permits_node(recorded.node_id)
+            {
+                return Err(AuthzError::ResourceNotFound);
+            }
+            require_invoke(capability)?;
+            Err(AuthzError::OwnerDisabled)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Check a retained binding whose referenced tool or fixed account is gone.

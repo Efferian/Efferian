@@ -168,7 +168,6 @@ impl fmt::Debug for Vault {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code, reason = "account Vault AAD seam for #6")]
 pub struct AccountAad {
     pub account_id: AccountId,
     pub secret_version: NonZeroU64,
@@ -176,7 +175,6 @@ pub struct AccountAad {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code, reason = "execution Vault AAD seam for #6")]
 pub struct ExecutionAad {
     pub execution_id: ExecutionId,
     pub caller_principal_id: PrincipalId,
@@ -216,12 +214,10 @@ impl Vault {
         self.keys.issue(CredentialFamily::Node, id)
     }
 
-    #[allow(dead_code, reason = "account Vault seam for #6")]
     pub fn seal_account(&self, aad: &AccountAad, plaintext: &[u8]) -> Result<Vec<u8>, VaultError> {
         self.seal(&self.account_aad(aad), plaintext)
     }
 
-    #[allow(dead_code, reason = "account Vault seam for #6")]
     pub fn open_account(
         &self,
         aad: &AccountAad,
@@ -230,7 +226,6 @@ impl Vault {
         self.open(&self.account_aad(aad), envelope)
     }
 
-    #[allow(dead_code, reason = "execution Vault seam for #6")]
     pub fn seal_execution(
         &self,
         aad: &ExecutionAad,
@@ -239,7 +234,6 @@ impl Vault {
         self.seal(&self.execution_aad(aad), plaintext)
     }
 
-    #[allow(dead_code, reason = "execution Vault seam for #6")]
     pub fn open_execution(
         &self,
         aad: &ExecutionAad,
@@ -250,7 +244,6 @@ impl Vault {
 
     /// Run outside the SQLite actor. Ownership keeps the plaintext zeroizing
     /// even when a caller cancels while the blocking task is running.
-    #[allow(dead_code, reason = "async execution Vault seam for #6")]
     pub async fn seal_execution_async(
         self: &Arc<Self>,
         aad: ExecutionAad,
@@ -273,7 +266,6 @@ impl Vault {
     }
 
     /// Run outside the SQLite actor.
-    #[allow(dead_code, reason = "async execution Vault seam for #6")]
     pub async fn open_execution_async(
         self: &Arc<Self>,
         aad: ExecutionAad,

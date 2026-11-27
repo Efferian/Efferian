@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use crate::config::Config;
 use crate::egress::EgressClient;
 use crate::http::{AppState, router};
-use crate::node_bridge::{BridgeCloseReason, NodeBridgeControl};
+use crate::node_bridge::{BridgeCloseReason, NodeDispatcher};
 use crate::storage::{
     OpenMode, RevocationReason, ShutdownReport, StorageClock, StorageConfig, StorageRuntime,
     acquire_state_lock, create_staged, open_existing,
@@ -109,14 +109,15 @@ impl Fixture {
         )?;
         let (storage, runtime) = opened.migrate_and_start_runtime()?;
         let bridge = Arc::new(RecordingBridge::new(directory.join("hub.sqlite3")));
-        let state = AppState {
+        let egress = EgressClient::new(config.egress_policy()?)?;
+        let state = AppState::new(
             storage,
-            vault: Arc::new(keys.bind_hub(hub_id)),
-            clock: Arc::clone(&clock) as Arc<dyn StorageClock>,
-            egress: EgressClient::new(config.egress_policy()?)?,
-            config: Arc::new(config),
-            bridge: Arc::clone(&bridge) as Arc<dyn NodeBridgeControl>,
-        };
+            Arc::new(keys.bind_hub(hub_id)),
+            Arc::clone(&clock) as Arc<dyn StorageClock>,
+            Arc::new(config),
+            Arc::clone(&bridge) as Arc<dyn NodeDispatcher>,
+            egress,
+        );
         let api = router(state.clone(), 8080)?;
         Ok(Self {
             api,
@@ -703,8 +704,25 @@ async fn narrowed_and_non_global_anti_oracle_and_me_owned_agents() -> TestResult
             )?;
             tx.execute(
                 "INSERT INTO tool_revisions (tool_id, version, input_schema_sha256, created_at_ms, definition_json)
-                 VALUES (?1, 1, 'x', 1000, '{\"spec\":{\"kind\":\"command\"}}')",
-                [cmd_tool.to_string()],
+                 VALUES (?1, 1, 'x', 1000, ?2)",
+                params![
+                    cmd_tool.to_string(),
+                    json!({
+                        "description": "A managed fixture tool",
+                        "input_schema": {"type": "object"},
+                        "spec": {
+                            "kind": "command",
+                            "program": "/bin/echo",
+                            "args": [],
+                            "cwd": "/",
+                            "env": {},
+                            "target_selector": {"kind": "tag", "tag": "existing"},
+                            "runtime_ms": 1000,
+                            "max_output_bytes": 4096
+                        }
+                    })
+                    .to_string(),
+                ],
             )?;
             tx.execute(
                 "INSERT INTO profiles (profile_id, slug, discovery_mode, published_version, created_at_ms, updated_at_ms)

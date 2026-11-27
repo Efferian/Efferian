@@ -76,20 +76,23 @@ fn pressure(percent: u32) -> StoragePressure {
 
 impl StorageHandle {
     pub async fn status_snapshot(&self) -> Result<StorageStatus, StorageError> {
-        self.status_snapshot_with(|_| Ok(())).await
+        self.status_snapshot_with(|_| Ok(()))
+            .await
+            .map(|(status, ())| status)
     }
 
-    pub(crate) async fn status_snapshot_with<E>(
+    pub(crate) async fn status_snapshot_with<T, E>(
         &self,
-        authorize: impl FnOnce(&Connection) -> Result<(), E> + Send + 'static,
-    ) -> Result<StorageStatus, E>
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<(StorageStatus, T), E>
     where
+        T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
         let cap = self.max_page_count();
         let waiters = Arc::clone(&self.active_waiters);
         self.read_snapshot(move |conn| {
-            authorize(conn)?;
+            let details = read(conn)?;
             let pages = Pages::read(conn).map_err(StorageError::from)?;
             let mut meta = conn
                 .prepare_cached(
@@ -100,7 +103,7 @@ impl StorageHandle {
                 .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(StorageError::from)?;
             let used_percent = pages.percent(cap);
-            Ok(StorageStatus {
+            let status = StorageStatus {
                 page_count: pages.count,
                 freelist_count: pages.free,
                 max_page_count: cap,
@@ -109,7 +112,8 @@ impl StorageHandle {
                 events_head_seq,
                 events_pruned_through_seq,
                 active_waiters_count: waiters.load(Ordering::Acquire),
-            })
+            };
+            Ok((status, details))
         })
         .await
     }
