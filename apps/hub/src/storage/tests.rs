@@ -1700,3 +1700,77 @@ async fn revocation_is_observable_at_the_instant_the_outbox_wakes_a_subscriber()
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }
+
+#[tokio::test]
+async fn large_receipts_make_progress_at_the_soft_watermark_while_ttl_advances() -> TestResult {
+    let f = Fixture::create(StorageConfig {
+        max_page_count: 4350,
+        gc_interval: Duration::from_millis(1),
+        token_gc_grace_ms: 1,
+        ..StorageConfig::default()
+    })?;
+    let active: Vec<_> = (0..48).map(|_| ExecutionId::new()).collect();
+    f.open(OpenMode::OfflineExactVersion)?.run_offline_tx(|conn| {
+        conn.execute(
+            "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
+             VALUES ('account', 'account', ?1, 'private', 'secret_kv', zeroblob(12000000), 0, 0)",
+            [f.principal.to_string()],
+        )?;
+        conn.execute("UPDATE auth_tokens SET revoked_at_ms = 100", [])?;
+        let mut insert = conn.prepare(
+            "INSERT INTO executions(execution_id, invoke_kind, request_id, request_digest, caller_principal_id,
+                caller_token_id, tool_id, tool_version, public_name, executor_kind, node_id, state,
+                deadline_at_ms, created_at_ms, result_expires_at_ms, expires_at_ms, sealed_result_blob, result_bytes)
+             VALUES (?1, 'tool_test', ?1, 'digest', ?2, ?3, ?4, 1, 'example', 'node', ?5, ?6,
+                0, 0, ?7, 100000, CASE WHEN ?8 = 0 THEN NULL ELSE zeroblob(?8) END, ?8)",
+        )?;
+        for (id, state, expiry, bytes) in active.iter().copied().map(|id| (id, "accepted", 10000, 0))
+            .chain([(ExecutionId::new(), "succeeded", 1, 2_250_000)])
+        {
+            insert.execute(params![id.to_string(), f.principal.to_string(), f.token.to_string(),
+                f.tool.to_string(), f.node.to_string(), state, expiry, bytes])?;
+        }
+        Ok::<_, rusqlite::Error>(())
+    })?;
+
+    let opened = f.open(OpenMode::ServeAutoMigrate)?;
+    let pages: u32 = opened
+        .conn
+        .pragma_query_value(None, "page_count", |row| row.get(0))?;
+    let free: u32 = opened
+        .conn
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+    assert!((75..85).contains(&((pages - free) * 100 / f.config.max_page_count)));
+    let (handle, runtime) = opened.migrate_and_start_runtime()?;
+    let (release, anchor) = pause_writer(&handle).await?;
+    let mut queue = Vec::new();
+    for id in active {
+        let mut receipt = f.receipt(id, TerminalExecutionState::Succeeded);
+        receipt.sealed_result_blob = Some(vec![7; 2_250_000]);
+        let prepared = receipt.prepare()?;
+        let mut future = Box::pin(handle.execute_work(prepared.payload_bytes(), move |tx| {
+            let result = tx.apply_receipt(prepared)?;
+            let token_present =
+                tx.conn()
+                    .query_row("SELECT EXISTS (SELECT 1 FROM auth_tokens)", [], |row| {
+                        row.get::<_, bool>(0)
+                    })?;
+            Ok((result, token_present))
+        }));
+        assert!(poll!(&mut future).is_pending());
+        queue.push(future);
+    }
+    f.clock.0.store(200, Ordering::SeqCst);
+    release.send(()).map_err(|_| "writer stopped")?;
+    anchor.await?;
+    let mut observed_ttl_during_work = false;
+    for (position, entry) in queue.into_iter().enumerate() {
+        let (outcome, token_present) = tokio::time::timeout(TIMEOUT, entry).await??;
+        assert_eq!(outcome, ReceiptOutcome::AppliedTerminal);
+        observed_ttl_during_work |= position < 47 && !token_present;
+    }
+    assert!(observed_ttl_during_work);
+    assert_eq!(handle.status_snapshot().await?.active_waiters_count, 0);
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}

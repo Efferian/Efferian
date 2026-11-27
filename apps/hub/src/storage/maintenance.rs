@@ -113,6 +113,7 @@ pub(super) struct Maintenance {
     vacuum_pending: bool,
     soft_active: bool,
     soft_exhausted: bool,
+    soft_reclaim_pending: bool,
     used_percent: u32,
     live_events_count: usize,
     event_write_debt: usize,
@@ -141,6 +142,7 @@ impl Maintenance {
             vacuum_pending: false,
             soft_active: used_percent >= 75,
             soft_exhausted: false,
+            soft_reclaim_pending: used_percent >= 75,
             used_percent,
             live_events_count,
             event_write_debt: 0,
@@ -154,10 +156,12 @@ impl Maintenance {
         pressure(self.used_percent)
     }
 
-    /// A committed burst that exceeds the cap must leave room for retention
-    /// before the next work batch. Priority and shutdown drain stay available.
+    /// Give retention and soft reclamation time to recover capacity between
+    /// work batches. Priority and shutdown drain stay available.
     pub(super) fn defer_work(&self) -> bool {
-        self.event_write_debt != 0 && !self.hold_gc_until_tick
+        !self.hold_gc_until_tick
+            && (self.event_write_debt != 0
+                || (self.soft_reclaim_pending && self.soft_active && !self.soft_exhausted))
     }
 
     pub(super) fn after_write(
@@ -184,6 +188,7 @@ impl Maintenance {
             self.unsampled_commits += 1;
             if bytes != 0 {
                 self.soft_exhausted = false;
+                self.soft_reclaim_pending = true;
             }
         }
         if !committed
@@ -201,6 +206,7 @@ impl Maintenance {
         if self.used_percent < 65 {
             self.soft_active = false;
         } else if self.used_percent >= 75 {
+            self.soft_reclaim_pending |= !self.soft_active;
             self.soft_active = true;
         }
         self.unsampled_bytes = 0;
@@ -290,6 +296,7 @@ impl Maintenance {
             }
             GcLane::Soft => {
                 let changed = gc_transaction(conn, |tx| expire_results(tx, i64::MAX))?;
+                self.soft_reclaim_pending = false;
                 self.soft_exhausted = changed == 0;
                 self.vacuum_pending |= changed != 0;
                 self.sample(db)?;
