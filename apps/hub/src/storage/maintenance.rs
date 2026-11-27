@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use super::actor::{MAX_WORK_BYTES, WriteTx, WriteTxError};
 use super::lifecycle::{OpenedDb, WAL_FILE, WalCheckpointOutcome, truncate_checkpoint};
@@ -19,7 +20,7 @@ const REACTIVE_VACUUM_MIN_FREE_PAGES: u32 = 64;
 const SAMPLE_COMMITS: usize = 100;
 const SHORT_CHECKPOINT: Duration = Duration::from_millis(50);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StoragePressure {
     Normal,
@@ -27,7 +28,7 @@ pub enum StoragePressure {
     Hard,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct StorageStatus {
     pub page_count: u32,
     pub freelist_count: u32,
@@ -75,15 +76,29 @@ fn pressure(percent: u32) -> StoragePressure {
 
 impl StorageHandle {
     pub async fn status_snapshot(&self) -> Result<StorageStatus, StorageError> {
+        self.status_snapshot_with(|_| Ok(())).await
+    }
+
+    pub(crate) async fn status_snapshot_with<E>(
+        &self,
+        authorize: impl FnOnce(&Connection) -> Result<(), E> + Send + 'static,
+    ) -> Result<StorageStatus, E>
+    where
+        E: From<StorageError> + Send + 'static,
+    {
         let cap = self.max_page_count();
         let waiters = Arc::clone(&self.active_waiters);
         self.read_snapshot(move |conn| {
-            let pages = Pages::read(conn)?;
-            let mut meta = conn.prepare_cached(
-                "SELECT events_head_seq, events_pruned_through_seq FROM hub_meta WHERE id = 1",
-            )?;
-            let (events_head_seq, events_pruned_through_seq) =
-                meta.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            authorize(conn)?;
+            let pages = Pages::read(conn).map_err(StorageError::from)?;
+            let mut meta = conn
+                .prepare_cached(
+                    "SELECT events_head_seq, events_pruned_through_seq FROM hub_meta WHERE id = 1",
+                )
+                .map_err(StorageError::from)?;
+            let (events_head_seq, events_pruned_through_seq) = meta
+                .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(StorageError::from)?;
             let used_percent = pages.percent(cap);
             Ok(StorageStatus {
                 page_count: pages.count,
@@ -226,7 +241,13 @@ impl Maintenance {
         {
             self.sample(db)?;
         }
-        if committed && wrote_result_blob && !matches!(self.soft, SoftState::Idle) {
+        if committed
+            && wrote_result_blob
+            && !matches!(
+                self.soft,
+                SoftState::Idle | SoftState::Exhausted { at_hard: false }
+            )
+        {
             self.soft = SoftState::Active {
                 defer_next_work: true,
             };
@@ -693,17 +714,16 @@ const CLAIM_AGENT: &str = "SELECT p.principal_id FROM principals p
       AND NOT EXISTS (SELECT 1 FROM executions e WHERE e.caller_principal_id = p.principal_id)
       AND NOT EXISTS (SELECT 1 FROM auth_tokens t
                       WHERE t.created_by = p.principal_id AND t.principal_id != p.principal_id)
-      AND p.principal_id NOT IN (
-         SELECT owner_principal_id FROM accounts
-         UNION SELECT created_by FROM grants WHERE created_by != principal_id
-         UNION SELECT created_by FROM node_enrollments
-         UNION SELECT managed_by_principal_id FROM node_enrollments WHERE managed_by_principal_id IS NOT NULL
-         UNION SELECT managed_by_principal_id FROM nodes WHERE managed_by_principal_id IS NOT NULL
-         UNION SELECT owner_principal_id FROM principals WHERE owner_principal_id IS NOT NULL
-         UNION SELECT managed_by_principal_id FROM principals WHERE managed_by_principal_id IS NOT NULL
-         UNION SELECT published_by FROM profile_editions
-         UNION SELECT created_by FROM tools
-      )
+      AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.owner_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM grants g
+                      WHERE g.created_by = p.principal_id AND g.principal_id != p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM node_enrollments ne WHERE ne.created_by = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM node_enrollments ne WHERE ne.managed_by_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.managed_by_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM principals c WHERE c.owner_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM principals c WHERE c.managed_by_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM profile_editions pe WHERE pe.published_by = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM tools t WHERE t.created_by = p.principal_id)
     ORDER BY p.disabled_at_ms, p.principal_id LIMIT 1";
 
 fn claim_agent(conn: &Connection, cutoff: i64) -> rusqlite::Result<bool> {

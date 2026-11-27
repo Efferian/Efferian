@@ -20,7 +20,7 @@ const SIDECARS: [&str; 3] = ["hub.sqlite3-wal", "hub.sqlite3-shm", "hub.sqlite3-
 const STAGING_DIR: &str = ".staging-hub-init";
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_HEADER_LEN: usize = 20;
-const STATEMENT_CACHE_CAPACITY: usize = 64;
+const STATEMENT_CACHE_CAPACITY: usize = 256;
 pub(super) const WAL_FILE: &str = SIDECARS[0];
 const SHM_FILE: &str = SIDECARS[1];
 

@@ -8,9 +8,18 @@ publish.workspace = true
 
 [dependencies]
 axum = { workspace = true }
+bytes = { workspace = true }
+chacha20poly1305 = { workspace = true }
+clap = { workspace = true }
 efferian-authz = { workspace = true }
 efferian-platform = { workspace = true }
 efferian-protocol = { workspace = true, features = ["openapi"] }
+getrandom = { workspace = true }
+hmac = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 jsonschema = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
@@ -18,16 +27,25 @@ rusqlite = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sse-stream = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+toml = { workspace = true }
+tower-service = { workspace = true }
+tracing = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 efferian-client = { workspace = true }
 futures-util = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+rustls-pki-types = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true

@@ -2,13 +2,16 @@ use std::collections::BTreeSet;
 
 use efferian_authz::PrincipalView;
 use efferian_protocol::{
-    ActorId, Event, ExecutionId, GrantId, NodeId, PrincipalId, ProfileId, TokenId,
+    ActorId, Event, ExecutionEventPayload, ExecutionId, ExecutionState, ExecutionSummary, GrantId,
+    NodeId, PrincipalId, ProfileId, TokenId, ToolId, error_codes,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::StorageError;
 use super::actor::WriteTx;
-use super::events::{RevocationReason, RevocationSignal, id, json, opt_id, scalar};
+use super::events::{
+    RevocationReason, RevocationSignal, id, json, json_write_error, opt_id, scalar,
+};
+use super::{ExecutionSnapshot, StorageError};
 
 const LIVE_PRINCIPAL: &str = "SELECT p.disabled_at_ms FROM principals p
     JOIN hub_meta h ON h.id = 1
@@ -103,7 +106,7 @@ impl super::StorageHandle {
         &self,
         actor: ActorId,
         principal: PrincipalId,
-    ) -> Result<bool, super::WriteError<std::convert::Infallible>> {
+    ) -> Result<Option<Vec<(NodeId, u64)>>, super::WriteError<std::convert::Infallible>> {
         self.execute_priority(super::actor::PriorityKind::DisablePrincipal, move |tx| {
             Ok(tx.disable_principal(actor, principal)?)
         })
@@ -124,7 +127,7 @@ impl super::StorageHandle {
         &self,
         actor: ActorId,
         node: NodeId,
-    ) -> Result<bool, super::WriteError<std::convert::Infallible>> {
+    ) -> Result<Option<(NodeId, u64)>, super::WriteError<std::convert::Infallible>> {
         self.execute_priority(super::actor::PriorityKind::RevokeNode, move |tx| {
             Ok(tx.revoke_node(actor, node)?)
         })
@@ -182,43 +185,82 @@ impl WriteTx<'_> {
         Ok(false)
     }
 
+    /// Disable an active principal and return the revoked session fences. An
+    /// already disabled or absent principal has no new effects.
     pub(crate) fn disable_principal(
         &mut self,
         actor: ActorId,
         principal: PrincipalId,
-    ) -> Result<bool, StorageError> {
-        let changed = {
+    ) -> Result<Option<Vec<(NodeId, u64)>>, StorageError> {
+        let principal_id = principal.to_string();
+        let kind: Option<String> = {
             let mut stmt = self.conn().prepare_cached(
                 "UPDATE principals SET disabled_at_ms = ?1, updated_at_ms = ?1
                  WHERE principal_id = ?2 AND disabled_at_ms IS NULL
-                   AND principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1)",
+                   AND principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1)
+                 RETURNING kind",
             )?;
-            stmt.execute(params![self.now_ms(), principal.to_string()])? == 1
+            stmt.query_row(params![self.now_ms(), &principal_id], |row| row.get(0))
+                .optional()?
         };
-        if changed {
-            self.append_event(actor, Event::PrincipalRevoked(principal))?;
-            stage_cascade(
-                self,
-                principal,
-                RevocationReason::PrincipalDisabled(principal),
-                true,
-            )?;
+        let Some(kind) = kind else {
+            return Ok(None);
+        };
+        if kind == "admin" {
+            require_global_admin(self.conn())?;
         }
-        Ok(changed)
+        self.append_event(actor, Event::PrincipalRevoked(principal))?;
+
+        let nodes = managed_nodes(self.conn(), principal)?;
+        stage_cascade(
+            self,
+            principal,
+            RevocationReason::PrincipalDisabled(principal),
+            nodes.clone(),
+        )?;
+        {
+            let mut stmt = self.conn().prepare_cached(
+                "UPDATE node_enrollments SET revoked_at_ms = ?1
+                 WHERE (created_by = ?2 OR managed_by_principal_id = ?2
+                   OR target_node_id IN (SELECT node_id FROM nodes WHERE managed_by_principal_id = ?2))
+                   AND consumed_at_ms IS NULL AND revoked_at_ms IS NULL",
+            )?;
+            stmt.execute(params![self.now_ms(), principal_id])?;
+        }
+        let mut revoked = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if let Some(session) =
+                revoke_node_cascade(self, actor, node, Enrollments::AlreadyRevoked)?
+            {
+                revoked.push(session);
+            }
+        }
+        Ok(Some(revoked))
     }
 
     pub(crate) fn revoke_grant(&mut self, grant: GrantId) -> Result<bool, StorageError> {
-        let principal = {
+        let removed: Option<(PrincipalId, String, String)> = {
             let mut stmt = self.conn().prepare_cached(
                 "DELETE FROM grants WHERE grant_id = ?1
                    AND principal_id IS NOT (SELECT gc_purging_principal_id FROM hub_meta WHERE id = 1)
-                 RETURNING principal_id",
+                 RETURNING principal_id, scope_kind, capability",
             )?;
-            stmt.query_row([grant.to_string()], |row| id(row, 0))
-                .optional()?
+            stmt.query_row([grant.to_string()], |row| {
+                Ok((id(row, 0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?
         };
-        if let Some(principal) = principal {
-            stage_cascade(self, principal, RevocationReason::GrantRevoked(grant), true)?;
+        if let Some((principal, scope_kind, capability)) = removed {
+            if scope_kind == "global" && capability == "admin" {
+                require_global_admin(self.conn())?;
+            }
+            let nodes = managed_nodes(self.conn(), principal)?;
+            stage_cascade(
+                self,
+                principal,
+                RevocationReason::GrantRevoked(grant),
+                nodes,
+            )?;
             return Ok(true);
         }
         Ok(false)
@@ -252,22 +294,14 @@ impl WriteTx<'_> {
         Ok(changed)
     }
 
+    /// Revoke the node and return its current epoch, including on repeat calls
+    /// that only invalidate outstanding re-enrollment invitations.
     pub(crate) fn revoke_node(
         &mut self,
         actor: ActorId,
         node: NodeId,
-    ) -> Result<bool, StorageError> {
-        let changed = {
-            let mut stmt = self.conn().prepare_cached(
-                "UPDATE nodes SET revoked_at_ms = ?1, updated_at_ms = ?1
-                 WHERE node_id = ?2 AND revoked_at_ms IS NULL",
-            )?;
-            stmt.execute(params![self.now_ms(), node.to_string()])? == 1
-        };
-        if changed {
-            self.append_event(actor, Event::NodeRevoked(node))?;
-        }
-        Ok(changed)
+    ) -> Result<Option<(NodeId, u64)>, StorageError> {
+        revoke_node_cascade(self, actor, node, Enrollments::Revoke)
     }
 
     pub(crate) fn cancel_execution(&self, execution: ExecutionId) -> Result<bool, StorageError> {
@@ -287,7 +321,7 @@ impl WriteTx<'_> {
             self,
             principal,
             RevocationReason::PrincipalPermissionsReduced(principal),
-            false,
+            Vec::new(),
         )
     }
 
@@ -299,14 +333,158 @@ impl WriteTx<'_> {
     }
 }
 
+fn require_global_admin(conn: &Connection) -> Result<(), StorageError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM principals p JOIN grants g ON g.principal_id = p.principal_id
+           JOIN hub_meta h ON h.id = 1
+         WHERE p.kind = 'admin' AND p.disabled_at_ms IS NULL
+           AND p.principal_id IS NOT h.gc_purging_principal_id
+           AND g.scope_kind = 'global' AND g.scope_id = '' AND g.capability = 'admin')",
+    )?;
+    if stmt.query_row([], |row| row.get(0))? {
+        Ok(())
+    } else {
+        Err(StorageError::LastAdmin)
+    }
+}
+
+fn managed_nodes(conn: &Connection, principal: PrincipalId) -> rusqlite::Result<Vec<NodeId>> {
+    let mut nodes = conn.prepare_cached(
+        "SELECT node_id FROM nodes
+         WHERE managed_by_principal_id = ?1 AND revoked_at_ms IS NULL
+         ORDER BY node_id",
+    )?;
+    nodes
+        .query_map([principal.to_string()], |row| id(row, 0))?
+        .collect()
+}
+
+enum Enrollments {
+    Revoke,
+    // A principal disable revokes invitations for all its managed nodes together.
+    AlreadyRevoked,
+}
+
+fn revoke_node_cascade(
+    tx: &mut WriteTx<'_>,
+    actor: ActorId,
+    node: NodeId,
+    enrollments: Enrollments,
+) -> Result<Option<(NodeId, u64)>, StorageError> {
+    let node_id = node.to_string();
+    let now = tx.now_ms();
+    if matches!(enrollments, Enrollments::Revoke) {
+        let mut stmt = tx.conn().prepare_cached(
+            "UPDATE node_enrollments SET revoked_at_ms = ?1
+             WHERE target_node_id = ?2 AND consumed_at_ms IS NULL AND revoked_at_ms IS NULL",
+        )?;
+        stmt.execute(params![now, &node_id])?;
+    }
+    let found = {
+        let mut stmt = tx
+            .conn()
+            .prepare_cached("SELECT revoked_at_ms, session_epoch FROM nodes WHERE node_id = ?1")?;
+        stmt.query_row([&node_id], |row| {
+            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, u64>(1)?))
+        })
+        .optional()?
+    };
+    let Some((revoked_at, epoch)) = found else {
+        return Ok(None);
+    };
+    if revoked_at.is_none() {
+        tx.conn()
+            .prepare_cached(
+                "UPDATE nodes SET revoked_at_ms = ?1, updated_at_ms = ?1 WHERE node_id = ?2",
+            )?
+            .execute(params![now, &node_id])?;
+        tx.append_event(actor, Event::NodeRevoked(node))?;
+    }
+    finish_revoked_node_executions(tx, actor, node, &node_id)?;
+    Ok(Some((node, epoch)))
+}
+
+struct ActiveExecution {
+    id: ExecutionId,
+    profile: Option<ProfileId>,
+    tool: ToolId,
+    public_name: String,
+    started_or_created_at_ms: i64,
+}
+
+fn finish_revoked_node_executions(
+    tx: &mut WriteTx<'_>,
+    actor: ActorId,
+    node: NodeId,
+    node_id: &str,
+) -> Result<(), StorageError> {
+    let active = {
+        let mut stmt = tx.conn().prepare_cached(
+            "SELECT execution_id, profile_id, tool_id, public_name, COALESCE(started_at_ms, created_at_ms)
+             FROM executions WHERE node_id = ?1 AND state IN ('accepted', 'running')",
+        )?;
+        stmt.query_map([node_id], |row| {
+            Ok(ActiveExecution {
+                id: id(row, 0)?,
+                profile: opt_id(row, 1)?,
+                tool: id(row, 2)?,
+                public_name: row.get(3)?,
+                started_or_created_at_ms: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let now = tx.now_ms();
+    for execution in active {
+        let duration_ms = Some(
+            now.saturating_sub(execution.started_or_created_at_ms)
+                .max(0) as u64,
+        );
+        let summary = ExecutionSummary {
+            duration_ms,
+            error_code: Some(error_codes::NODE_REVOKED.to_owned()),
+            effect_may_have_occurred: Some(true),
+            ..ExecutionSummary::default()
+        };
+        let summary_json = serde_json::to_string(&summary).map_err(json_write_error)?;
+        tx.conn()
+            .prepare_cached(
+                "UPDATE executions SET state = 'unknown', summary_json = ?1, finished_at_ms = ?2,
+                   late_receipt_at_ms = NULL WHERE execution_id = ?3",
+            )?
+            .execute(params![summary_json, now, execution.id.to_string()])?;
+        tx.append_event(
+            actor,
+            Event::ExecutionFinished(ExecutionEventPayload {
+                execution_id: execution.id,
+                state: ExecutionState::Unknown,
+                profile_id: execution.profile,
+                tool_id: execution.tool,
+                public_name: execution.public_name,
+                node_id: Some(node),
+                exit_code: None,
+                error_code: summary.error_code,
+                duration_ms,
+            }),
+        )?;
+        tx.stage_waiter_finish(
+            execution.id,
+            ExecutionSnapshot {
+                state: ExecutionState::Unknown,
+                finished_at_ms: Some(now),
+            },
+        );
+    }
+    Ok(())
+}
+
 fn stage_cascade(
     tx: &mut WriteTx<'_>,
     principal: PrincipalId,
     reason: RevocationReason,
-    include_nodes: bool,
+    affected_nodes: Vec<NodeId>,
 ) -> Result<(), StorageError> {
     let mut affected_principals = vec![principal];
-    let mut affected_nodes = Vec::new();
     let principal_id = principal.to_string();
     {
         let conn = tx.conn();
@@ -317,14 +495,6 @@ fn stage_cascade(
         )?;
         for agent in agents.query_map([&principal_id], |row| id(row, 0))? {
             affected_principals.push(agent?);
-        }
-        if include_nodes {
-            let mut nodes = conn.prepare_cached(
-                "SELECT node_id FROM nodes WHERE managed_by_principal_id = ?1 ORDER BY node_id",
-            )?;
-            for node in nodes.query_map([&principal_id], |row| id(row, 0))? {
-                affected_nodes.push(node?);
-            }
         }
     }
     tx.stage_revocation(RevocationSignal {

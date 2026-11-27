@@ -18,6 +18,8 @@ use super::actor::{MAX_WORK_BYTES, WriteTxError};
 use super::executions::InvokeWrite;
 use super::*;
 
+mod revocation;
+
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -745,9 +747,13 @@ async fn revoke_publishes_deduplicated_dependents_and_lag_is_terminal() -> TestR
     let owner_only = PrincipalId::new_agent();
     let manager_only = PrincipalId::new_agent();
     let other = PrincipalId::new_user();
+    let backup_admin = PrincipalId::new_user();
     handle.execute_work(0, move |tx| {
         tx.conn().execute("INSERT INTO principals(principal_id, kind, name, created_at_ms, updated_at_ms)
             VALUES (?1, 'member', 'other', 0, 0)", [other.to_string()])?;
+        tx.conn().execute("INSERT INTO principals(principal_id, kind, name, created_at_ms, updated_at_ms)
+            VALUES (?1, 'admin', 'backup', 0, 0)", [backup_admin.to_string()])?;
+        revocation::seed_admin_grant(tx.conn(), backup_admin)?;
         for (agent, owner, manager) in [(both, admin, admin), (owner_only, admin, other), (manager_only, other, admin)] {
             let agent = agent.to_string();
             tx.conn().execute("INSERT INTO principals(principal_id, kind, name, owner_principal_id, managed_by_principal_id, created_at_ms, updated_at_ms)
@@ -758,15 +764,17 @@ async fn revoke_publishes_deduplicated_dependents_and_lag_is_terminal() -> TestR
         Ok::<_, WriteTxError<Infallible>>(())
     }).await?;
     let mut revocations = handle.subscribe_revocations()?;
+    assert_eq!(
+        handle
+            .disable_principal(ActorId::Hub(f.hub_id), admin)
+            .await?,
+        Some(vec![(node, 0)]),
+    );
     assert!(
         handle
             .disable_principal(ActorId::Hub(f.hub_id), admin)
             .await?
-    );
-    assert!(
-        !handle
-            .disable_principal(ActorId::Hub(f.hub_id), admin)
-            .await?
+            .is_none()
     );
     let signal = revocations.recv().await?;
     assert_eq!(signal.reason, RevocationReason::PrincipalDisabled(admin));
@@ -936,7 +944,7 @@ async fn ro_pool_retains_a_cancelled_workers_slot_and_shutdown_waits_for_readers
     let (handle, runtime) = f.start()?;
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut slots = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..6 {
         let handle = handle.clone();
         let entered = entered_tx.clone();
         let (release, held) = oneshot::channel();
@@ -952,11 +960,21 @@ async fn ro_pool_retains_a_cancelled_workers_slot_and_shutdown_waits_for_readers
         });
         slots.push((release, reader));
     }
-    for _ in 0..8 {
+    for _ in 0..6 {
         tokio::time::timeout(TIMEOUT, entered_rx.recv())
             .await?
             .ok_or("reader disconnected")?;
     }
+    // Control snapshots stay available while all 6 general readers are saturated.
+    let control_id = tokio::time::timeout(
+        TIMEOUT,
+        handle.read_control_snapshot(|conn| {
+            conn.query_row("SELECT id FROM hub_meta", [], |row| row.get::<_, i64>(0))
+                .map_err(StorageError::from)
+        }),
+    )
+    .await??;
+    assert_eq!(control_id, 1);
     let (cancelled_release, cancelled) = slots.pop().ok_or("missing reader to cancel")?;
     cancelled.abort();
     assert!(cancelled.await.is_err());
@@ -1747,7 +1765,7 @@ async fn large_receipts_make_progress_at_the_soft_watermark_while_ttl_advances()
 
 #[tokio::test]
 async fn writer_samples_a_payload_batch_crossing_the_soft_watermark() -> TestResult {
-    check_receipt_pressure(4096, 10_000_000, 5000, 73..75).await
+    check_receipt_pressure(4096, 9_900_000, 5000, 73..75).await
 }
 
 async fn check_receipt_pressure(
@@ -2380,11 +2398,15 @@ async fn revoke_token_and_grant_ignore_principal_being_purged() -> TestResult {
         revocations.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
-    assert!(handle.revoke_node(actor, f.node).await?);
-    assert!(!handle.revoke_node(actor, f.node).await?);
+    assert_eq!(handle.revoke_node(actor, f.node).await?, Some((f.node, 0)));
+    assert_eq!(handle.revoke_node(actor, f.node).await?, Some((f.node, 0)));
     assert!(matches!(
         events.try_recv()?.envelope.event,
         Event::NodeRevoked(id) if id == f.node
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())

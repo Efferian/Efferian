@@ -445,7 +445,7 @@ fn decode_empty_payload(raw: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub(super) fn id<T: FromStr>(row: &Row<'_>, column: usize) -> rusqlite::Result<T>
+pub(crate) fn id<T: FromStr>(row: &Row<'_>, column: usize) -> rusqlite::Result<T>
 where
     T::Err: Error + Send + Sync + 'static,
 {
@@ -455,7 +455,7 @@ where
         .map_err(|error| invalid_text(column, error))
 }
 
-pub(super) fn opt_id<T: FromStr>(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<T>>
+pub(crate) fn opt_id<T: FromStr>(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<T>>
 where
     T::Err: Error + Send + Sync + 'static,
 {
@@ -466,20 +466,62 @@ where
     }
 }
 
-pub(super) fn json<T: DeserializeOwned>(row: &Row<'_>, column: usize) -> rusqlite::Result<T> {
+pub(crate) fn json<T: DeserializeOwned>(row: &Row<'_>, column: usize) -> rusqlite::Result<T> {
     serde_json::from_str(row.get_ref(column)?.as_str()?)
         .map_err(|error| invalid_text(column, error))
 }
 
-pub(super) fn scalar<T: DeserializeOwned>(row: &Row<'_>, column: usize) -> rusqlite::Result<T> {
+pub(crate) fn optional_json<T: DeserializeOwned>(
+    row: &Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<T>> {
+    if row.get_ref(column)? == rusqlite::types::ValueRef::Null {
+        Ok(None)
+    } else {
+        json(row, column).map(Some)
+    }
+}
+
+pub(crate) fn scalar<T: DeserializeOwned>(row: &Row<'_>, column: usize) -> rusqlite::Result<T> {
     let text = row.get_ref(column)?.as_str()?;
     T::deserialize(text.into_deserializer()).map_err(|error: DeError| invalid_text(column, error))
 }
 
-pub(super) fn scalar_text<T: serde::Serialize>(value: T) -> rusqlite::Result<String> {
+pub(crate) fn optional_scalar<T: DeserializeOwned>(
+    row: &Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<T>> {
+    if row.get_ref(column)? == rusqlite::types::ValueRef::Null {
+        Ok(None)
+    } else {
+        scalar(row, column).map(Some)
+    }
+}
+
+pub(crate) fn read_grant_scope(
+    row: &Row<'_>,
+    kind_column: usize,
+    id_column: usize,
+) -> rusqlite::Result<efferian_protocol::GrantScope> {
+    match row.get_ref(kind_column)?.as_str()? {
+        "global" if row.get_ref(id_column)?.as_str()?.is_empty() => {
+            Ok(efferian_protocol::GrantScope::Global)
+        }
+        "profile" => id::<efferian_protocol::ProfileId>(row, id_column)
+            .map(efferian_protocol::GrantScope::Profile),
+        _ => Err(invalid_text_msg(kind_column, "invalid grant scope")),
+    }
+}
+
+pub(crate) fn scalar_text<T: serde::Serialize>(value: T) -> rusqlite::Result<String> {
     match serde_json::to_value(value).map_err(json_write_error)? {
         serde_json::Value::String(text) => Ok(text),
-        _ => Err(rusqlite::Error::InvalidQuery),
+        _ => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "expected string scalar serialization",
+            ),
+        ))),
     }
 }
 
@@ -491,7 +533,7 @@ fn invalid_text(index: usize, error: impl Error + Send + Sync + 'static) -> rusq
     rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
 }
 
-fn invalid_text_msg(index: usize, message: &'static str) -> rusqlite::Error {
+pub(crate) fn invalid_text_msg(index: usize, message: &'static str) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         index,
         Type::Text,

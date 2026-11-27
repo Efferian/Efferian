@@ -83,7 +83,10 @@ pub mod error_codes {
     pub const TOOL_DISABLED: &str = "tool_disabled";
     pub const RESOURCE_IN_USE: &str = "resource_in_use";
     pub const NODE_NAME_IN_USE: &str = "node_name_in_use";
+    pub const NODE_REVOKED: &str = "node_revoked";
     pub const HUB_IDENTITY_MISMATCH: &str = "hub_identity_mismatch";
+    pub const LAST_ADMIN: &str = "last_admin";
+    pub const QUOTA_EXCEEDED: &str = "quota_exceeded";
 
     pub const INVALID_INPUT: &str = "invalid_input";
     pub const INVALID_ARGUMENTS: &str = "invalid_arguments";
@@ -99,5 +102,8 @@ pub mod error_codes {
     pub const STORAGE_PRESSURE: &str = "storage_pressure";
     pub const RESYNC_REQUIRED: &str = "resync_required";
     pub const BODY_TOO_LARGE: &str = "body_too_large";
+    pub const METHOD_NOT_ALLOWED: &str = "method_not_allowed";
+    pub const UNSUPPORTED_MEDIA_TYPE: &str = "unsupported_media_type";
+    pub const REQUEST_TIMEOUT: &str = "request_timeout";
     pub const INTERNAL_ERROR: &str = "internal_error";
 }

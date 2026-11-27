@@ -205,12 +205,28 @@ async fn agent_purge_checks_all_restrict_edges_and_resumes_after_reopen() -> Tes
         .prepare(&format!("EXPLAIN QUERY PLAN {CLAIM_AGENT}"))?
         .query_map([0], |row| row.get::<_, String>(3))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let joined = steps.join(" | ");
     assert!(
-        steps
-            .iter()
-            .any(|step| step.contains("SEARCH t USING INDEX idx_auth_tokens_created_by")),
-        "{steps:?}"
+        joined.contains("idx_principals_disabled_agents"),
+        "{joined}"
     );
+    assert!(!joined.contains("TEMP B-TREE"), "{joined}");
+    assert!(!joined.contains("COMPOUND"), "{joined}");
+    for idx in [
+        "idx_accounts_owner",
+        "idx_auth_tokens_created_by",
+        "idx_grants_created_by",
+        "idx_node_enrollments_created_by",
+        "idx_node_enrollments_managed_by",
+        "idx_nodes_managed_by",
+        "idx_principals_owner",
+        "idx_principals_managed_by",
+        "idx_profile_editions_published_by",
+        "idx_tools_created_by",
+        "idx_executions_caller",
+    ] {
+        assert!(joined.contains(idx), "missing {idx} in {joined}");
+    }
 
     let agents: [PrincipalId; 12] = std::array::from_fn(|_| PrincipalId::new_agent());
     let [
@@ -413,7 +429,7 @@ fn periodic_token_gc_makes_progress_while_soft_pressure_remains_active() -> Test
     let conn = &db.conn;
     conn.execute(
         "INSERT INTO upstreams(upstream_id, slug, url, discovered_tools_json, created_at_ms, updated_at_ms)
-         VALUES ('large', 'large', 'https://example.test', zeroblob(740000), 0, 0)",
+         VALUES ('large', 'large', 'https://example.test', zeroblob(680000), 0, 0)",
         [],
     )?;
     conn.execute(
@@ -501,7 +517,7 @@ fn soft_pressure_clears_latch_in_normal_band_and_respects_recency_grace_until_ha
     let conn = &db.conn;
     conn.execute(
         "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
-         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(600000), 0, 0)",
+         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(560000), 0, 0)",
         [f.principal.to_string()],
     )?;
     let old = seed_execution(conn, &f, f.principal, "succeeded", 100, 200, 140_000)?;
@@ -553,7 +569,7 @@ fn soft_pressure_clears_latch_in_normal_band_and_respects_recency_grace_until_ha
     let conn2 = &db2.conn;
     conn2.execute(
         "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
-         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(610000), 0, 0)",
+         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(550000), 0, 0)",
         [f2.principal.to_string()],
     )?;
     let aged = seed_execution(
@@ -608,13 +624,32 @@ fn soft_pressure_clears_latch_in_normal_band_and_respects_recency_grace_until_ha
     );
     assert_eq!(m2.soft, SoftState::Exhausted { at_hard: false });
 
+    // Writing another small result blob while still in 75..84% must NOT re-arm
+    // SoftState::Exhausted { at_hard: false } (it waits for periodic GC or >= 85% hard crossing).
+    let fresh_two = seed_execution(
+        conn2,
+        &f2,
+        f2.principal,
+        "succeeded",
+        500_000,
+        600_000,
+        4_096,
+    )?;
+    conn2.execute(
+        "UPDATE executions SET finished_at_ms = 95000 WHERE execution_id = ?1",
+        [fresh_two.to_string()],
+    )?;
+    m2.after_write(&db2, true, 4_096, true, 0, false)?;
+    assert!((75..85).contains(&m2.used_percent), "{}", m2.used_percent);
+    assert_eq!(m2.soft, SoftState::Exhausted { at_hard: false });
+
     // Crossing >= 85% Hard pressure wakes Soft and bypasses recency grace immediately.
     conn2.execute(
         "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
-         VALUES ('push', 'push', ?1, 'private', 'secret_kv', zeroblob(140000), 0, 0)",
+         VALUES ('push', 'push', ?1, 'private', 'secret_kv', zeroblob(180000), 0, 0)",
         [f2.principal.to_string()],
     )?;
-    m2.after_write(&db2, true, 140_000, false, 0, false)?;
+    m2.after_write(&db2, true, 180_000, false, 0, false)?;
     assert!(m2.used_percent >= 85, "{}", m2.used_percent);
     assert!(matches!(
         m2.soft,
@@ -721,6 +756,27 @@ fn all_gc_and_waiter_queries_use_indexes_without_temp_btree() -> TestResult {
         "SELECT enrollment_id FROM node_enrollments WHERE expires_at_ms <= 0 ORDER BY expires_at_ms LIMIT 32",
         "idx_node_enrollments_expires",
     )?;
+    // Keyset pagination queries use composite indexes without TEMP B-TREE.
+    explain(
+        "SELECT principal_id FROM principals WHERE owner_principal_id = 'usr_1' AND principal_id > '' ORDER BY principal_id LIMIT 51",
+        "idx_principals_owner",
+    )?;
+    explain(
+        "SELECT principal_id FROM principals WHERE managed_by_principal_id = 'svc_1' AND principal_id > '' ORDER BY principal_id LIMIT 51",
+        "idx_principals_managed_by",
+    )?;
+    explain(
+        "SELECT token_id FROM auth_tokens WHERE principal_id = 'usr_1' AND token_id > '' ORDER BY token_id LIMIT 51",
+        "idx_auth_tokens_principal",
+    )?;
+    explain(
+        "SELECT grant_id FROM grants WHERE principal_id = 'usr_1' AND grant_id > '' ORDER BY grant_id LIMIT 51",
+        "idx_grants_principal",
+    )?;
+    explain(
+        "SELECT node_id FROM nodes WHERE managed_by_principal_id = 'svc_1' AND node_id > '' ORDER BY node_id LIMIT 51",
+        "idx_nodes_managed_by",
+    )?;
     Ok(())
 }
 
@@ -739,7 +795,7 @@ fn soft_state_handles_stale_hard_crossing_external_drop_and_held_scheduled_vacuu
     let conn = &db.conn;
     conn.execute(
         "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
-         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(740000), 0, 0)",
+         VALUES ('perm', 'perm', ?1, 'private', 'secret_kv', zeroblob(680000), 0, 0)",
         [f.principal.to_string()],
     )?;
     let fresh = seed_execution(
@@ -790,7 +846,7 @@ fn soft_state_handles_stale_hard_crossing_external_drop_and_held_scheduled_vacuu
     let conn2 = &db2.conn;
     conn2.execute(
         "INSERT INTO accounts(account_id, slug, owner_principal_id, visibility, kind, sealed_secret_blob, created_at_ms, updated_at_ms)
-         VALUES ('base', 'base', ?1, 'private', 'secret_kv', zeroblob(600000), 0, 0)",
+         VALUES ('base', 'base', ?1, 'private', 'secret_kv', zeroblob(550000), 0, 0)",
         [f2.principal.to_string()],
     )?;
     conn2.execute(
