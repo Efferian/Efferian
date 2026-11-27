@@ -30,9 +30,9 @@ impl TestDb {
     }
 
     pub fn create<T>(&self, seed: impl FnOnce(&Transaction<'_>) -> TestResult<T>) -> TestResult<T> {
-        let lock = acquire_state_lock(&self.dir)?;
+        let mut lock = acquire_state_lock(&self.dir)?;
         create_staged(
-            &lock,
+            &mut lock,
             self.identity(),
             &self.config,
             self.clock.as_ref(),

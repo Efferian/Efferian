@@ -28,9 +28,10 @@ const TABLES: [&str; 15] = [
     "upstreams",
 ];
 
-const INDEXES: [&str; 15] = [
+const INDEXES: [&str; 16] = [
     "idx_accounts_private_owner_slug",
     "idx_accounts_shared_slug",
+    "idx_auth_tokens_created_by",
     "idx_auth_tokens_expires",
     "idx_auth_tokens_principal",
     "idx_auth_tokens_revoked",

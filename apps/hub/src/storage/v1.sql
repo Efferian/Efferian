@@ -48,6 +48,7 @@ CREATE TABLE auth_tokens (
     revoked_at_ms         INTEGER,
     created_at_ms         INTEGER NOT NULL
 );
+CREATE INDEX idx_auth_tokens_created_by ON auth_tokens(created_by);
 CREATE INDEX idx_auth_tokens_principal ON auth_tokens(principal_id);
 CREATE INDEX idx_auth_tokens_expires ON auth_tokens(expires_at_ms) WHERE expires_at_ms IS NOT NULL;
 CREATE INDEX idx_auth_tokens_revoked ON auth_tokens(revoked_at_ms) WHERE revoked_at_ms IS NOT NULL;

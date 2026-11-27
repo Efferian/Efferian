@@ -117,7 +117,7 @@ pub struct OfflineTxOutcome<T> {
 }
 
 pub fn create_staged<T, E>(
-    lock: &LockedStateDir,
+    lock: &mut LockedStateDir,
     identity: NewHubIdentity,
     config: &StorageConfig,
     clock: &dyn StorageClock,
@@ -225,6 +225,10 @@ pub fn open_existing(
 
     let conn = Connection::open_with_flags(database, RW)?;
     let hub_id = validate_identity(&conn, mode, &expected, config, wal_existed)?;
+    // SQLite can satisfy a read-write open by falling back to read-only.
+    if conn.is_readonly("main")? {
+        return Err(StorageError::ReadOnlyDatabase);
+    }
     conn.pragma_update(None, "query_only", false)?;
     configure_writer(&conn, config)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;

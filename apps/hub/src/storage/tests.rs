@@ -57,9 +57,9 @@ impl Fixture {
             config,
             clock: Arc::new(TestClock::default()),
         };
-        let lock = acquire_state_lock(&fixture.dir)?;
+        let mut lock = acquire_state_lock(&fixture.dir)?;
         create_staged(
-            &lock,
+            &mut lock,
             NewHubIdentity {
                 hub_id,
                 active_key_id: 1,
@@ -774,6 +774,24 @@ async fn revoke_publishes_deduplicated_dependents_and_lag_is_terminal() -> TestR
         revocations.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
+    let mut events = handle.subscribe_events()?;
+    handle
+        .execute_work(0, move |tx| {
+            tx.principal_permissions_reduced(admin)?;
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+    let reduced = revocations.try_recv()?;
+    assert_eq!(
+        reduced.reason,
+        RevocationReason::PrincipalPermissionsReduced(admin)
+    );
+    assert_eq!(reduced.affected_principals, signal.affected_principals);
+    assert!(reduced.affected_nodes.is_empty());
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     handle
         .execute_work(0, move |tx| {
             for _ in 0..150 {
@@ -823,7 +841,7 @@ fn staging_subprocess() -> TestResult {
         ));
         return Ok(());
     }
-    let lock = acquire_state_lock(&dir)?;
+    let mut lock = acquire_state_lock(&dir)?;
     if std::env::var(STAGE_POINT_ENV).as_deref() == Ok("spill") {
         let conn = Connection::open(dir.join("hub.sqlite3"))?;
         conn.pragma_update(None, "cache_size", 2)?;
@@ -841,7 +859,7 @@ fn staging_subprocess() -> TestResult {
     }
     let hub_id = HubId::parse(&std::env::var(STAGE_ID_ENV)?)?;
     create_staged(
-        &lock,
+        &mut lock,
         NewHubIdentity {
             hub_id,
             active_key_id: 1,
@@ -879,9 +897,9 @@ fn staged_init_recovers_at_real_process_death_boundaries() -> TestResult {
         stop_subprocess_at(&mut subprocess, point)?;
         assert_eq!(f.path().exists(), point == "post-link");
         if !f.path().exists() {
-            let lock = acquire_state_lock(&f.dir)?;
+            let mut lock = acquire_state_lock(&f.dir)?;
             create_staged(
-                &lock,
+                &mut lock,
                 NewHubIdentity {
                     hub_id: f.hub_id,
                     active_key_id: 1,
@@ -938,19 +956,22 @@ async fn ro_pool_retains_a_cancelled_workers_slot_and_shutdown_waits_for_readers
     cancelled.abort();
     assert!(cancelled.await.is_err());
 
-    let mut next = Box::pin(handle.read_snapshot(|conn| {
-        conn.query_row("SELECT id FROM hub_meta", [], |row| row.get::<_, i64>(0))
-            .map_err(StorageError::from)
-    }));
+    let mut next = Box::pin(handle.status_snapshot());
     assert!(
         tokio::time::timeout(Duration::from_millis(20), &mut next)
             .await
             .is_err()
     );
+    handle.invoke(f.request(RequestId::new())).await?;
     cancelled_release
         .send(())
         .map_err(|_| "worker dropped its checkout")?;
-    assert_eq!(tokio::time::timeout(TIMEOUT, next).await??, 1);
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, next)
+            .await??
+            .active_waiters_count,
+        1
+    );
 
     let mut stopping = Box::pin(runtime.shutdown());
     assert!(poll!(&mut stopping).is_pending());

@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -67,7 +69,7 @@ fn pressure(percent: u32) -> StoragePressure {
 impl StorageHandle {
     pub async fn status_snapshot(&self) -> Result<StorageStatus, StorageError> {
         let cap = self.max_page_count();
-        let waiters = self.waiter_count();
+        let waiters = Arc::clone(&self.active_waiters);
         self.read_snapshot(move |conn| {
             let pages = Pages::read(conn)?;
             let (events_head_seq, events_pruned_through_seq) = conn.query_row(
@@ -84,7 +86,7 @@ impl StorageHandle {
                 storage_pressure: pressure(used_percent),
                 events_head_seq,
                 events_pruned_through_seq,
-                active_waiters_count: waiters,
+                active_waiters_count: waiters.load(Ordering::Acquire),
             })
         })
         .await
@@ -535,27 +537,31 @@ fn purging_principal(conn: &Connection) -> rusqlite::Result<Option<String>> {
     )
 }
 
+const CLAIM_AGENT: &str = "SELECT p.principal_id FROM principals p
+    WHERE p.kind = 'agent' AND p.managed_by_principal_id IS NOT NULL AND p.disabled_at_ms <= ?1
+      AND NOT EXISTS (SELECT 1 FROM executions e WHERE e.caller_principal_id = p.principal_id)
+      AND NOT EXISTS (SELECT 1 FROM auth_tokens t
+                      WHERE t.created_by = p.principal_id AND t.principal_id != p.principal_id)
+      AND p.principal_id NOT IN (
+         SELECT owner_principal_id FROM accounts
+         UNION SELECT created_by FROM grants WHERE created_by != principal_id
+         UNION SELECT created_by FROM node_enrollments
+         UNION SELECT managed_by_principal_id FROM node_enrollments WHERE managed_by_principal_id IS NOT NULL
+         UNION SELECT managed_by_principal_id FROM nodes WHERE managed_by_principal_id IS NOT NULL
+         UNION SELECT owner_principal_id FROM principals WHERE owner_principal_id IS NOT NULL
+         UNION SELECT managed_by_principal_id FROM principals WHERE managed_by_principal_id IS NOT NULL
+         UNION SELECT published_by FROM profile_editions
+         UNION SELECT created_by FROM tools
+      )
+    ORDER BY p.disabled_at_ms, p.principal_id LIMIT 1";
+
 fn claim_agent(conn: &Connection, cutoff: i64) -> rusqlite::Result<bool> {
-    let Some(principal) = conn.query_row(
-        "SELECT p.principal_id FROM principals p
-           WHERE p.kind = 'agent' AND p.managed_by_principal_id IS NOT NULL AND p.disabled_at_ms <= ?1
-             AND NOT EXISTS (SELECT 1 FROM executions e WHERE e.caller_principal_id = p.principal_id)
-             AND p.principal_id NOT IN (
-                SELECT owner_principal_id FROM accounts
-                UNION SELECT created_by FROM auth_tokens WHERE created_by != principal_id
-                UNION SELECT created_by FROM grants WHERE created_by != principal_id
-                UNION SELECT created_by FROM node_enrollments
-                UNION SELECT managed_by_principal_id FROM node_enrollments WHERE managed_by_principal_id IS NOT NULL
-                UNION SELECT managed_by_principal_id FROM nodes WHERE managed_by_principal_id IS NOT NULL
-                UNION SELECT owner_principal_id FROM principals WHERE owner_principal_id IS NOT NULL
-                UNION SELECT managed_by_principal_id FROM principals WHERE managed_by_principal_id IS NOT NULL
-                UNION SELECT published_by FROM profile_editions
-                UNION SELECT created_by FROM tools
-             )
-           ORDER BY p.disabled_at_ms, p.principal_id LIMIT 1",
-        [cutoff],
-        |row| row.get::<_, String>(0),
-    ).optional()? else { return Ok(false) };
+    let Some(principal) = conn
+        .query_row(CLAIM_AGENT, [cutoff], |row| row.get::<_, String>(0))
+        .optional()?
+    else {
+        return Ok(false);
+    };
     let claimed = conn.execute(
         "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1 AND gc_purging_principal_id IS NULL",
         [&principal],

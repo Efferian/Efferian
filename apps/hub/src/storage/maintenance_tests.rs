@@ -179,6 +179,17 @@ async fn agent_purge_checks_all_restrict_edges_and_resumes_after_reopen() -> Tes
     let db = f.open(OpenMode::OfflineExactVersion)?;
     let conn = &db.conn;
     let admin = f.principal.to_string();
+    let steps = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {CLAIM_AGENT}"))?
+        .query_map([0], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.contains("SEARCH t USING INDEX idx_auth_tokens_created_by")),
+        "{steps:?}"
+    );
+
     let agents: [PrincipalId; 12] = std::array::from_fn(|_| PrincipalId::new_agent());
     let [
         account,

@@ -38,7 +38,7 @@ type SubscribeReply = oneshot::Sender<Option<watch::Receiver<ExecutionSnapshot>>
 pub struct StorageHandle {
     hub_id: HubId,
     max_page_count: u32,
-    active_waiters: Arc<AtomicUsize>,
+    pub(super) active_waiters: Arc<AtomicUsize>,
     mailbox: Arc<Mailbox>,
     readers: Arc<ReadPool>,
     events: broadcast::WeakSender<Arc<StoredEvent>>,
@@ -96,10 +96,6 @@ impl StorageHandle {
 
     pub(super) fn max_page_count(&self) -> u32 {
         self.max_page_count
-    }
-
-    pub(super) fn waiter_count(&self) -> usize {
-        self.active_waiters.load(Ordering::Acquire)
     }
 
     pub fn subscribe_events(&self) -> Result<broadcast::Receiver<Arc<StoredEvent>>, StorageError> {

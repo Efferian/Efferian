@@ -155,6 +155,8 @@ pub enum StorageError {
     UnsupportedSchemaVersion { found: i64, supported: u32 },
     #[error("schema version {found} requires migration to {required}")]
     SchemaMigrationRequired { found: i64, required: u32 },
+    #[error("Hub database was opened read-only; the writer requires write access")]
+    ReadOnlyDatabase,
     #[error("Hub database already exists")]
     AlreadyInitialized,
     #[error("unexpected SQLite sidecar: {0}")]

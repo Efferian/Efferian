@@ -1,7 +1,7 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use support::{TestDb, TestResult};
 #[test]
 fn staging_refuses_all_final_names_and_preserves_a_domain_failure() -> TestResult {
     let db = TestDb::new(StorageConfig::default())?;
-    let lock = acquire_state_lock(&db.dir)?;
+    let mut lock = acquire_state_lock(&db.dir)?;
     for name in [
         "hub.sqlite3",
         "hub.sqlite3-wal",
@@ -25,9 +25,13 @@ fn staging_refuses_all_final_names_and_preserves_a_domain_failure() -> TestResul
     ] {
         let entry = db.dir.join(name);
         symlink("absent", &entry)?;
-        let result = create_staged(&lock, db.identity(), &db.config, db.clock.as_ref(), |_| {
-            Ok::<_, ()>(())
-        });
+        let result = create_staged(
+            &mut lock,
+            db.identity(),
+            &db.config,
+            db.clock.as_ref(),
+            |_| Ok::<_, ()>(()),
+        );
         if name == "hub.sqlite3" {
             assert!(matches!(
                 result,
@@ -42,9 +46,13 @@ fn staging_refuses_all_final_names_and_preserves_a_domain_failure() -> TestResul
         assert!(!db.dir.join(".staging-hub-init").exists());
         fs::remove_file(entry)?;
     }
-    let result = create_staged(&lock, db.identity(), &db.config, db.clock.as_ref(), |_| {
-        Err::<(), _>("seed rejected")
-    });
+    let result = create_staged(
+        &mut lock,
+        db.identity(),
+        &db.config,
+        db.clock.as_ref(),
+        |_| Err::<(), _>("seed rejected"),
+    );
     assert!(matches!(result, Err(WriteError::Domain("seed rejected"))));
     assert!(!db.path().exists());
     assert!(!db.dir.join(".staging-hub-init").exists());
@@ -107,6 +115,30 @@ fn invalid_identity_or_version_leaves_existing_wal_bytes_intact() -> TestResult 
                 );
             }
             assert_eq!((fs::read(db.path())?, fs::read(&wal)?), before);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn writer_open_rejects_sqlites_read_only_fallback() -> TestResult {
+    let db = TestDb::new(StorageConfig::default())?;
+    db.create(|_| Ok(()))?;
+    fs::set_permissions(db.path(), fs::Permissions::from_mode(0o400))?;
+    // A privileged process can still open this file for writing.
+    let writable = fs::OpenOptions::new().write(true).open(db.path()).is_ok();
+    for mode in [OpenMode::ServeAutoMigrate, OpenMode::OfflineExactVersion] {
+        let result = open_existing(
+            acquire_state_lock(&db.dir)?,
+            mode,
+            db.expected(),
+            &db.config,
+            Arc::clone(&db.clock),
+        );
+        if writable {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(StorageError::ReadOnlyDatabase)));
         }
     }
     Ok(())
