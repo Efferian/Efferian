@@ -3,7 +3,7 @@ use std::fs;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use efferian_protocol::{
@@ -2612,8 +2612,12 @@ async fn cancelled_stream_catchup_retains_sub_semaphore_permit_until_worker_exit
 
     // A 3rd stream catch-up read must stay blocked until the orphaned blocking
     // workers finish, while a normal general read still succeeds immediately.
-    let mut third_stream = Box::pin(handle.read_stream_snapshot(|_| Ok::<_, StorageError>(())));
-    assert!(poll!(&mut third_stream).is_pending());
+    let third_entered = Arc::new(AtomicBool::new(false));
+    let entered_flag = Arc::clone(&third_entered);
+    let mut third_stream = Box::pin(handle.read_stream_snapshot(move |_| {
+        entered_flag.store(true, Ordering::SeqCst);
+        Ok::<_, StorageError>(())
+    }));
     let head = tokio::time::timeout(
         TIMEOUT,
         handle.read_snapshot(|conn| {
@@ -2625,11 +2629,18 @@ async fn cancelled_stream_catchup_retains_sub_semaphore_permit_until_worker_exit
     )
     .await??;
     assert_eq!(head, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut third_stream)
+            .await
+            .is_err()
+    );
+    assert!(!third_entered.load(Ordering::SeqCst));
 
     for rtx in release_tx {
         let _ = rtx.send(());
     }
     tokio::time::timeout(TIMEOUT, third_stream).await??;
+    assert!(third_entered.load(Ordering::SeqCst));
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }
