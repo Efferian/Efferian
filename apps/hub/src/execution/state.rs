@@ -35,10 +35,15 @@ pub(crate) use control::{
     ExecutionControl, UpstreamCancellation, UpstreamReservation, finish_upstreams_for_shutdown,
     recover_upstreams, sweep_deadlines,
 };
-pub(crate) use records::{ExecutionDetail, ExecutionMetadata, execution_auth_target};
-use records::{
-    ExecutionQuery, ExecutionRow, ResultAccess, parse_cursor, read_execution, read_execution_page,
+#[allow(
+    unused_imports,
+    reason = "typed execution views for the in-process MCP gateway"
+)]
+pub(crate) use records::{
+    ExecutionDetail, ExecutionFields, ExecutionMetadata, ResultAccess, SafeExecutionSummary,
+    execution_auth_target,
 };
+use records::{ExecutionQuery, ExecutionRow, parse_cursor, read_execution, read_execution_page};
 
 pub(super) fn routes() -> RouteGroups {
     RouteGroups {
@@ -116,8 +121,7 @@ async fn get_execution(
     ApiPath(id): ApiPath<ExecutionId>,
     ApiQuery(query): ApiQuery<ExecutionReadQuery>,
 ) -> ApiResult<Response> {
-    let wait_ms = checked_wait_ms(query.wait_ms.unwrap_or_default())?;
-    let detail = read_execution_detail(&state, caller, id, wait_ms, query.sensitive).await?;
+    let detail = read_execution_detail(&state, caller, id, query.wait_ms, query.sensitive).await?;
     detail_json_response(detail).await
 }
 
@@ -126,9 +130,10 @@ pub(crate) async fn read_execution_detail(
     state: &AppState,
     caller: ApiCaller,
     id: ExecutionId,
-    wait_ms: u64,
+    wait_ms: Option<u32>,
     sensitive: bool,
 ) -> ApiResult<ExecutionDetail> {
+    let wait_ms = checked_wait_ms(wait_ms.unwrap_or_default())?;
     if wait_ms != 0 {
         let revocations = state.storage.subscribe_revocations()?;
         wait_if_active(state, &caller, id, None, wait_ms, revocations, None).await?;

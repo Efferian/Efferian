@@ -57,11 +57,7 @@ impl ExecutionControl {
     }
 
     pub(crate) fn stop(&self) {
-        let upstreams = lock(&self.upstreams);
         self.shutdown.send_replace(true);
-        for upstream in upstreams.executions.values() {
-            upstream.cancelled.send_replace(true);
-        }
     }
 
     pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<bool> {
@@ -167,6 +163,12 @@ pub(crate) struct UpstreamCancellation {
 impl UpstreamCancellation {
     pub(crate) fn is_cancelled(&self) -> bool {
         *self.shutdown.borrow() || *self.cancelled.borrow()
+    }
+
+    /// True only when this specific execution was settled by a committed cancel
+    /// or deadline sweep, distinct from a Hub-wide graceful shutdown signal.
+    pub(crate) fn is_execution_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
     }
 
     /// Resolves for committed cancellation, Hub stop, or a retired reservation.

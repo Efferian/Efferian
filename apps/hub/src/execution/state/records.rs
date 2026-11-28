@@ -13,45 +13,45 @@ use crate::http::{ApiError, ApiResult, Page};
 use crate::storage::{StorageError, id, json, opt_id, scalar, scalar_text};
 
 #[derive(Serialize, ToSchema)]
-pub(super) struct ExecutionFields {
-    pub(super) execution_id: ExecutionId,
+pub(crate) struct ExecutionFields {
+    pub(crate) execution_id: ExecutionId,
     #[schema(schema_with = RequestId::canonical_schema)]
-    request_id: RequestId,
-    invoke_kind: InvokeKind,
-    pub(super) state: ExecutionState,
-    pub(super) caller_principal_id: PrincipalId,
-    profile_id: Option<ProfileId>,
+    pub(crate) request_id: RequestId,
+    pub(crate) invoke_kind: InvokeKind,
+    pub(crate) state: ExecutionState,
+    pub(crate) caller_principal_id: PrincipalId,
+    pub(crate) profile_id: Option<ProfileId>,
     #[schema(minimum = 1)]
-    profile_version: Option<u64>,
-    tool_id: ToolId,
+    pub(crate) profile_version: Option<u64>,
+    pub(crate) tool_id: ToolId,
     #[schema(minimum = 1)]
-    tool_version: u64,
-    public_name: String,
-    pub(super) executor_kind: ExecutorKind,
-    pub(super) node_id: Option<NodeId>,
-    upstream_id: Option<UpstreamId>,
-    result_truncated: bool,
-    pub(super) result_expired: bool,
-    cancel_requested_at_ms: Option<i64>,
-    created_at_ms: i64,
-    started_at_ms: Option<i64>,
-    finished_at_ms: Option<i64>,
+    pub(crate) tool_version: u64,
+    pub(crate) public_name: String,
+    pub(crate) executor_kind: ExecutorKind,
+    pub(crate) node_id: Option<NodeId>,
+    pub(crate) upstream_id: Option<UpstreamId>,
+    pub(crate) result_truncated: bool,
+    pub(crate) result_expired: bool,
+    pub(crate) cancel_requested_at_ms: Option<i64>,
+    pub(crate) created_at_ms: i64,
+    pub(crate) started_at_ms: Option<i64>,
+    pub(crate) finished_at_ms: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
-struct SafeExecutionSummary {
+pub(crate) struct SafeExecutionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i32>,
+    pub(crate) exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    http_status: Option<u16>,
+    pub(crate) http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    duration_ms: Option<u64>,
+    pub(crate) duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
+    pub(crate) error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    effect_may_have_occurred: Option<bool>,
+    pub(crate) effect_may_have_occurred: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    output_discarded_reason: Option<OutputDiscardedReason>,
+    pub(crate) output_discarded_reason: Option<OutputDiscardedReason>,
 }
 
 impl From<ExecutionSummary> for SafeExecutionSummary {
@@ -70,13 +70,13 @@ impl From<ExecutionSummary> for SafeExecutionSummary {
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ExecutionMetadata {
     #[serde(flatten)]
-    fields: ExecutionFields,
-    summary: SafeExecutionSummary,
+    pub(crate) fields: ExecutionFields,
+    pub(crate) summary: SafeExecutionSummary,
 }
 
-#[derive(Clone, Copy, Serialize, ToSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ResultAccess {
+pub(crate) enum ResultAccess {
     NotRequested,
     Denied,
     Expired,
@@ -87,11 +87,11 @@ pub(super) enum ResultAccess {
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ExecutionDetail {
     #[serde(flatten)]
-    pub(super) fields: ExecutionFields,
-    pub(super) summary: ExecutionSummary,
-    pub(super) result_access: ResultAccess,
+    pub(crate) fields: ExecutionFields,
+    pub(crate) summary: ExecutionSummary,
+    pub(crate) result_access: ResultAccess,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) result: Option<StoredResult>,
+    pub(crate) result: Option<StoredResult>,
 }
 
 pub(super) struct ExecutionRow {

@@ -2339,6 +2339,32 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
     });
     entered.await?;
 
+    // Saturate AUTH_READERS (2) and queue a 3rd waiter on the auth semaphore so
+    // we prove ReadPool::stop closes self.auth immediately upon writer failure.
+    let mut auth_entered = Vec::new();
+    let mut auth_release = Vec::new();
+    let mut auth_holders = Vec::new();
+    for _ in 0..2 {
+        let (etx, erx) = oneshot::channel();
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let ah = handle.clone();
+        auth_holders.push(tokio::spawn(async move {
+            ah.read_auth_snapshot(move |_conn| {
+                let _ = etx.send(());
+                let _ = rrx.recv();
+                Ok::<_, StorageError>(())
+            })
+            .await
+        }));
+        auth_entered.push(erx);
+        auth_release.push(rtx);
+    }
+    for erx in auth_entered {
+        tokio::time::timeout(TIMEOUT, erx).await??;
+    }
+    let mut waiting_auth = Box::pin(handle.read_auth_snapshot(|_| Ok::<_, StorageError>(())));
+    assert!(poll!(&mut waiting_auth).is_pending());
+
     // Trigger an unexpected writer exit via a panicking post-commit hook.
     handle
         .execute_work(0, |tx| {
@@ -2348,6 +2374,19 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
         .await?;
 
     tokio::time::timeout(TIMEOUT, runtime.wait_stopped()).await?;
+
+    // Waiting auth semaphore acquirer must fail fast with ActorStopped before
+    // the 2 in-flight auth readers release and before runtime.shutdown() runs.
+    assert!(matches!(
+        tokio::time::timeout(TIMEOUT, waiting_auth).await?,
+        Err(StorageError::ActorStopped)
+    ));
+    for rtx in auth_release {
+        let _ = rtx.send(());
+    }
+    for holder in auth_holders {
+        holder.await??;
+    }
 
     // hub.lock must remain held until the runtime is explicitly shut down.
     assert!(matches!(
@@ -2366,6 +2405,24 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
     ));
     assert!(matches!(
         handle.read_snapshot(|_| Ok::<_, StorageError>(())).await,
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
+        handle
+            .read_auth_snapshot(|_| Ok::<_, StorageError>(()))
+            .await,
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
+        handle
+            .read_stream_snapshot(|_| Ok::<_, StorageError>(()))
+            .await,
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
+        handle
+            .read_control_snapshot(|_| Ok::<_, StorageError>(()))
+            .await,
         Err(StorageError::ActorStopped)
     ));
     assert!(matches!(
@@ -2514,6 +2571,65 @@ async fn work_queue_enforces_total_queued_byte_cap_before_slot_cap() -> TestResu
     for fut in queued {
         fut.await?;
     }
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_stream_catchup_retains_sub_semaphore_permit_until_worker_exits() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+
+    let mut entered_rx = Vec::new();
+    let mut release_tx = Vec::new();
+    let mut tasks = Vec::new();
+    // Saturate STREAM_CATCHUP_READERS = 2, then abort both async futures while
+    // their SQLite blocking workers are still active.
+    for _ in 0..2 {
+        let (etx, erx) = oneshot::channel();
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let h = handle.clone();
+        tasks.push(tokio::spawn(async move {
+            h.read_stream_snapshot(move |_conn| {
+                let _ = etx.send(());
+                let _ = rrx.recv();
+                Ok::<_, StorageError>(())
+            })
+            .await
+        }));
+        entered_rx.push(erx);
+        release_tx.push(rtx);
+    }
+    for erx in entered_rx {
+        tokio::time::timeout(TIMEOUT, erx).await??;
+    }
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        assert!(task.await.is_err());
+    }
+
+    // A 3rd stream catch-up read must stay blocked until the orphaned blocking
+    // workers finish, while a normal general read still succeeds immediately.
+    let mut third_stream = Box::pin(handle.read_stream_snapshot(|_| Ok::<_, StorageError>(())));
+    assert!(poll!(&mut third_stream).is_pending());
+    let head = tokio::time::timeout(
+        TIMEOUT,
+        handle.read_snapshot(|conn| {
+            conn.query_row("SELECT events_head_seq FROM hub_meta", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(StorageError::from)
+        }),
+    )
+    .await??;
+    assert_eq!(head, 0);
+
+    for rtx in release_tx {
+        let _ = rtx.send(());
+    }
+    tokio::time::timeout(TIMEOUT, third_stream).await??;
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }

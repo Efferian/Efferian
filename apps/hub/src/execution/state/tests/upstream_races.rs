@@ -455,3 +455,54 @@ async fn persistent_terminal_write_rollback_releases_slot_and_leaves_deadline_to
     hub.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn completed_upstream_reply_during_shutdown_commits_succeeded_before_sweep() -> TestResult {
+    let now = RequestId::new().timestamp_ms();
+    let (send, mut replies) = mpsc::unbounded_channel();
+    let hub = TestHub::start_with_dispatchers(
+        "shutdown-completed-reply",
+        Config::default(),
+        now,
+        None,
+        Arc::new(ControlledReplies(send)),
+    )
+    .await?;
+    add_upstream_tool(&hub).await?;
+    let admitted = post_upstream(&hub, StatusCode::ACCEPTED).await?;
+    let (id, reply) = tokio::time::timeout(TEST_TIMEOUT, replies.recv())
+        .await?
+        .ok_or("upstream caller not started")?;
+    assert_eq!(admitted["execution_id"], json!(id));
+
+    // Signal graceful shutdown before the in-flight upstream call resolves with Ok(bytes).
+    hub.state.execution.stop();
+    reply
+        .send(Bytes::from_static(
+            br#"{"structuredContent":{"saved":true}}"#,
+        ))
+        .map_err(|_| "upstream worker left early")?;
+
+    // Wait for the upstream worker to commit its terminal succeeded outcome, then run the
+    // shutdown sweep and verify the completed result was NOT overwritten with hub_shutting_down.
+    let detail = tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            let view = get(&hub, id, "?sensitive=true").await?;
+            if view["state"] != "running" {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(view);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    assert_eq!(detail["state"], "succeeded");
+    assert_eq!(detail["result_access"], "available");
+    assert_eq!(
+        detail["result"]["result"]["structuredContent"],
+        json!({"saved": true})
+    );
+    super::super::finish_upstreams_for_shutdown(&hub.state).await?;
+    assert_eq!(get(&hub, id, "?sensitive=true").await?, detail);
+    hub.shutdown().await;
+    Ok(())
+}

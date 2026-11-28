@@ -231,8 +231,10 @@ pub(crate) async fn run_upstream(
     if !state.execution.is_accepting() && !matches!(&result, Ok(Ok(_))) {
         return;
     }
-    // Skip expensive validation/sealing when user cancel or shutdown already settled the row.
-    if cancellation.is_cancelled() {
+    // Skip expensive validation/sealing when a committed user cancel or deadline
+    // sweep already settled the row. A completed reply arriving during graceful
+    // shutdown still commits before the shutdown sweep runs.
+    if cancellation.is_execution_cancelled() {
         return;
     }
     let outcome = match result {

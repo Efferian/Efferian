@@ -1660,22 +1660,72 @@ async fn openapi_live_responses_match_schemas_for_catalog_execution_and_events()
         .unwrap();
     assert_eq!(s, StatusCode::CREATED, "{ed}");
 
-    for (path, template) in [
-        ("/v1/upstreams", "/v1/upstreams"),
-        ("/v1/accounts", "/v1/accounts"),
-        ("/v1/account-bindings", "/v1/account-bindings"),
-        ("/v1/tools", "/v1/tools"),
-        ("/v1/profiles", "/v1/profiles"),
-        ("/v1/profiles/prof/tools", "/v1/profiles/{slug}/tools"),
+    let exec_id = efferian_protocol::ExecutionId::new();
+    let req_id = efferian_protocol::RequestId::new();
+    let prof_id: String = serde_json::from_value(prof["profile"]["profile_id"].clone()).unwrap();
+    let tool_id: String = serde_json::from_value(tool["tool"]["tool_id"].clone()).unwrap();
+    let admin_id = hub.admin_id;
+    hub.write(move |conn| {
+        conn.execute(
+            "INSERT INTO executions(
+                execution_id, invoke_kind, request_id, request_digest,
+                caller_principal_id, caller_token_id, profile_id, profile_version,
+                tool_id, tool_version, public_name, executor_kind, node_id,
+                state, summary_json, result_bytes, result_truncated, result_expired,
+                deadline_at_ms, created_at_ms, started_at_ms, finished_at_ms,
+                result_expires_at_ms, expires_at_ms
+             )
+             SELECT ?1, 'profile', ?2, 'digest',
+                    ?3, token_id, ?4, 1,
+                    ?5, 1, 'cmd', 'node', ?6,
+                    'succeeded', '{\"duration_ms\":12,\"exit_code\":0,\"effect_may_have_occurred\":true}',
+                    0, 0, 0,
+                    ?7, ?8, ?8, ?9,
+                    ?10, ?10
+             FROM auth_tokens WHERE principal_id = ?3 LIMIT 1",
+            params![
+                exec_id.to_string(),
+                req_id.to_string(),
+                admin_id.to_string(),
+                prof_id,
+                tool_id,
+                node_id.to_string(),
+                now + 60_000,
+                now,
+                now + 12,
+                now + 86_400_000,
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let exec_detail_path = format!("/v1/executions/{exec_id}?sensitive=true");
+    for (path, template, expect_non_empty_items) in [
+        ("/v1/upstreams", "/v1/upstreams", true),
+        ("/v1/accounts", "/v1/accounts", true),
+        ("/v1/account-bindings", "/v1/account-bindings", true),
+        ("/v1/tools", "/v1/tools", true),
+        ("/v1/profiles", "/v1/profiles", true),
+        ("/v1/profiles/prof/tools", "/v1/profiles/{slug}/tools", true),
         (
             "/v1/profiles/prof/tools/cmd",
             "/v1/profiles/{slug}/tools/{public_name}",
+            false,
         ),
-        ("/v1/executions", "/v1/executions"),
-        ("/v1/events", "/v1/events"),
+        ("/v1/executions", "/v1/executions", true),
+        (exec_detail_path.as_str(), "/v1/executions/{id}", false),
+        ("/v1/events", "/v1/events", true),
     ] {
         let (status, body) = hub.request_admin(Method::GET, path, None).await.unwrap();
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        if expect_non_empty_items {
+            assert!(
+                !body["items"].as_array().unwrap().is_empty(),
+                "expected non-empty items for {path}: {body}"
+            );
+        }
         let schema_ref =
             doc_value["paths"][template]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"]["$ref"]

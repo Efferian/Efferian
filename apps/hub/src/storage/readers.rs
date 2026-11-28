@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use rusqlite::{Connection, TransactionBehavior};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::StorageError;
 use super::lifecycle::open_reader;
@@ -71,7 +71,7 @@ impl ReadPool {
         T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
-        self.snapshot_on(&self.general, read).await
+        self.snapshot_on(&self.general, None, read).await
     }
 
     pub(super) async fn auth_snapshot<T, E>(
@@ -82,7 +82,7 @@ impl ReadPool {
         T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
-        self.snapshot_on(&self.auth, read).await
+        self.snapshot_on(&self.auth, None, read).await
     }
 
     pub(super) async fn stream_snapshot<T, E>(
@@ -93,11 +93,11 @@ impl ReadPool {
         T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
-        let _catchup = Arc::clone(&self.stream_catchup)
+        let catchup = Arc::clone(&self.stream_catchup)
             .acquire_owned()
             .await
             .map_err(|_| self.closed_error())?;
-        self.snapshot_on(&self.general, read).await
+        self.snapshot_on(&self.general, Some(catchup), read).await
     }
 
     pub(super) async fn control_snapshot<T, E>(
@@ -108,12 +108,13 @@ impl ReadPool {
         T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
-        self.snapshot_on(&self.control, read).await
+        self.snapshot_on(&self.control, None, read).await
     }
 
     async fn snapshot_on<T, E>(
         self: &Arc<Self>,
         lane: &Arc<Semaphore>,
+        extra_permit: Option<OwnedSemaphorePermit>,
         read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
     ) -> Result<T, E>
     where
@@ -126,7 +127,7 @@ impl ReadPool {
             .map_err(|_| self.closed_error())?;
         let pool = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let _permits = (permit, extra_permit);
             let mut reader = pool.checkout()?;
             let conn = reader.conn.as_mut().ok_or(StorageError::ActorStopped)?;
             let tx = conn
@@ -140,12 +141,16 @@ impl ReadPool {
         .map_err(StorageError::from)?
     }
 
-    pub(super) fn begin_close(&self) {
-        self.state().closing = true;
+    fn close_lanes(&self) {
         self.general.close();
         self.auth.close();
         self.control.close();
         self.stream_catchup.close();
+    }
+
+    pub(super) fn begin_close(&self) {
+        self.state().closing = true;
+        self.close_lanes();
     }
 
     pub(super) fn stop(&self, failed: bool) {
@@ -156,8 +161,7 @@ impl ReadPool {
             } else {
                 state.closing = true;
             }
-            self.general.close();
-            self.control.close();
+            self.close_lanes();
             std::mem::take(&mut state.idle)
         };
         drop(idle);

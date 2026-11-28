@@ -832,7 +832,8 @@ async fn binding_changes_owner_disable_and_inheritance_toggle_invalidate_child_a
         seen.clear();
     }
 
-    // Re-enable owner, then toggle inherit_owner_bindings: true -> false on child agent.
+    // Re-enable owner, verify DELETE binding cascades invalidation to child agent,
+    // then toggle inherit_owner_bindings: true -> false on child agent.
     let (status, _) = hub
         .request_admin(
             Method::POST,
@@ -841,6 +842,35 @@ async fn binding_changes_owner_disable_and_inheritance_toggle_invalidate_child_a
         )
         .await?;
     assert_eq!(status, StatusCode::NO_CONTENT);
+    invalidations
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    let (status, _) = hub
+        .request(
+            Method::DELETE,
+            "/v1/account-bindings/me/beta",
+            &owner_token,
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    {
+        let mut seen = invalidations
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(seen.contains(&UpstreamInvalidation::Binding {
+            principal_id: owner_id,
+            upstream_id: u1,
+        }));
+        assert!(seen.contains(&UpstreamInvalidation::Binding {
+            principal_id: agent_id,
+            upstream_id: u1,
+        }));
+        seen.clear();
+    }
     let (status, updated) = hub
         .request_admin(
             Method::PUT,

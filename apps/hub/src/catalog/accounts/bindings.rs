@@ -26,7 +26,7 @@ use crate::http::{
 use crate::principals::introspection::{
     caller_bound_profiles_for_upstream, caller_bound_upstreams,
 };
-use crate::storage::{id, inheriting_agents, json, opt_id, read_principal, scalar};
+use crate::storage::{StorageError, id, inheriting_agents, json, opt_id, read_principal, scalar};
 use crate::upstream_dispatch::UpstreamInvalidation;
 use crate::vault::auth::refresh_api;
 
@@ -166,11 +166,19 @@ fn list_visible_bindings(
                     .find(|entry| entry.upstream_id == binding.upstream_id)
                     .map_or(&[], |entry| entry.caller_bound_profiles.as_slice()),
             };
-            if authorize_binding_read(ctx, Some(upstream), &subject, &binding.view()).is_ok() {
-                result.push(binding);
-                if result.len() > limit {
-                    break;
+            match authorize_binding_read(ctx, Some(upstream), &subject, &binding.view()) {
+                Ok(()) => {
+                    result.push(binding);
+                    if result.len() > limit {
+                        break;
+                    }
                 }
+                Err(efferian_authz::AuthzError::InvalidAuthContext) => {
+                    return Err(
+                        StorageError::InvalidDatabase("invalid principal projection").into(),
+                    );
+                }
+                Err(_) => {}
             }
         }
         Ok(result)
@@ -300,18 +308,29 @@ fn list_visible_bindings(
     }
 }
 
-fn joined_principal_view(row: &Row<'_>) -> rusqlite::Result<PrincipalView> {
-    Ok(PrincipalView {
+fn joined_principal_view(row: &Row<'_>) -> Result<PrincipalView, StorageError> {
+    let raw_tags: Vec<String> = json(row, 11)?;
+    let count = raw_tags.len();
+    let allowed_node_tags: std::collections::BTreeSet<String> = raw_tags.into_iter().collect();
+    if allowed_node_tags.len() != count {
+        return Err(StorageError::InvalidDatabase(
+            "duplicate principal node tags",
+        ));
+    }
+    let view = PrincipalView {
         principal_id: id(row, 0)?,
         kind: scalar::<PrincipalKind>(row, 6)?,
         owner_principal_id: opt_id(row, 7)?,
         managed_by_principal_id: opt_id(row, 8)?,
         inherit_owner_bindings: row.get::<_, i64>(9)? != 0,
         is_orchestrator: row.get::<_, i64>(10)? != 0,
-        allowed_node_tags: json(row, 11)?,
+        allowed_node_tags,
         observe_executions: row.get::<_, i64>(12)? != 0,
         disabled_at_ms: row.get(13)?,
-    })
+    };
+    view.validate()
+        .map_err(|_| StorageError::InvalidDatabase("invalid principal projection"))?;
+    Ok(view)
 }
 
 #[utoipa::path(

@@ -333,8 +333,8 @@ mod tests {
             Some(Capability::Discover),
             Some(BTreeSet::from([allowed_node])),
         );
-        // Narrowed-out node yields ScopeNarrowedOut (404), NOT InsufficientCapability (403),
-        // even for a Discover-only token.
+        // Narrowed-out node yields ScopeNarrowedOut (mapped to 404 by discovery/selection),
+        // NOT InsufficientCapability (403), even for a Discover-only token.
         let other_target = NodeAuthTarget {
             node_id: other_node,
             managed_by_principal_id: None,
