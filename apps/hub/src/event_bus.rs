@@ -90,22 +90,18 @@ async fn list(
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> ApiResult<Json<EventsPage>> {
     let kinds = EventKinds::parse(query.kinds.as_deref())?;
-    let page = EventReader::new(&state, caller.credential)
+    let page = EventReader::new(&state, caller.credential, false)
         .read(
             query.after.unwrap_or(0),
             None,
             query.limit.unwrap_or(50),
             true,
+            &kinds,
         )
         .await?
         .events;
     Ok(Json(EventsPage {
-        items: page
-            .items
-            .into_iter()
-            .filter(|event| kinds.includes(event.auth.kind))
-            .map(|event| event.envelope)
-            .collect(),
+        items: page.items.into_iter().map(|event| event.envelope).collect(),
         next_seq: page.scanned_through,
         oldest_available_seq: page.oldest_available_seq,
         latest_seq: page.latest_seq,
@@ -143,8 +139,10 @@ async fn subscribe(
     // Subscribe to both channels before fixing the initial database snapshot.
     let revocations = state.storage.subscribe_revocations()?;
     let events = state.storage.subscribe_events()?;
-    let reader = EventReader::new(&state, caller.credential);
-    let page = reader.read(after, None, CATCH_UP_LIMIT, true).await?;
+    let reader = EventReader::new(&state, caller.credential, true);
+    let page = reader
+        .read(after, None, CATCH_UP_LIMIT, true, &kinds)
+        .await?;
     let body = stream::body(
         reader,
         state.execution.shutdown_receiver(),
@@ -170,6 +168,7 @@ struct EventReader {
     storage: StorageHandle,
     clock: Arc<dyn StorageClock>,
     credential: VerifiedCredential<TokenId>,
+    stream_lane: bool,
 }
 
 struct AuthorizedPage {
@@ -178,11 +177,12 @@ struct AuthorizedPage {
 }
 
 impl EventReader {
-    fn new(state: &AppState, credential: VerifiedCredential<TokenId>) -> Self {
+    fn new(state: &AppState, credential: VerifiedCredential<TokenId>, stream_lane: bool) -> Self {
         Self {
             storage: state.storage.clone(),
             clock: state.clock.clone(),
             credential,
+            stream_lane,
         }
     }
 
@@ -192,6 +192,7 @@ impl EventReader {
         through: Option<i64>,
         limit: u32,
         allow_bootstrap_zero: bool,
+        kinds: &EventKinds,
     ) -> Result<AuthorizedPage, PageError> {
         if after < 0 || !(1..=CATCH_UP_LIMIT).contains(&limit) {
             return Err(EventsReadError::InvalidCursor.into());
@@ -199,25 +200,28 @@ impl EventReader {
         let clock = self.clock.clone();
         let credential = self.credential.clone();
         let hub = *self.storage.hub_id();
-        self.storage
-            .read_snapshot(move |conn| {
-                let scope = refresh_api(conn, &credential, clock.wall_now_ms())?;
-                let mut events = StorageHandle::read_events_page(
-                    conn,
-                    hub,
-                    after,
-                    through,
-                    limit,
-                    allow_bootstrap_zero,
-                )?;
-                // A SQLite commit can precede its RevocationWatch notification.
-                // Filter with the permissions from the very snapshot that supplied the rows.
-                events
-                    .items
-                    .retain(|event| can_observe_event(&scope, &event.auth));
-                Ok(AuthorizedPage { scope, events })
-            })
-            .await
+        let kinds = kinds.clone();
+        let read_fn = move |conn: &rusqlite::Connection| {
+            let scope = refresh_api(conn, &credential, clock.wall_now_ms())?;
+            // A SQLite commit can precede its RevocationWatch notification.
+            // Filter with the permissions from the very snapshot that supplied
+            // the rows before decoding `payload_json`.
+            let events = StorageHandle::read_events_page_filtered(
+                conn,
+                hub,
+                after,
+                through,
+                limit,
+                allow_bootstrap_zero,
+                |kind, auth| kinds.includes(kind) && can_observe_event(&scope, auth),
+            )?;
+            Ok(AuthorizedPage { scope, events })
+        };
+        if self.stream_lane {
+            self.storage.read_stream_snapshot(read_fn).await
+        } else {
+            self.storage.read_snapshot(read_fn).await
+        }
     }
 }
 
@@ -251,7 +255,8 @@ impl From<PageError> for ApiError {
     }
 }
 
-struct EventKinds(Option<HashSet<EventKind>>);
+#[derive(Clone)]
+struct EventKinds(Option<Arc<HashSet<EventKind>>>);
 
 impl EventKinds {
     fn parse(raw: Option<&str>) -> ApiResult<Self> {
@@ -264,7 +269,8 @@ impl EventKinds {
                             kind,
                         ))
                     })
-                    .collect::<Result<_, _>>()
+                    .collect::<Result<HashSet<_>, _>>()
+                    .map(Arc::new)
             })
             .transpose()
             .map_err(|_| ApiError::bad_input())?;

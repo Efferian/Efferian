@@ -35,21 +35,7 @@ struct UpstreamReservations {
 struct ReservedUpstream {
     resource: UpstreamId,
     principal: PrincipalId,
-    phase: Arc<watch::Sender<UpstreamPhase>>,
-}
-
-#[derive(Clone, Copy)]
-enum UpstreamPhase {
-    Ready,
-    Started,
-    CancelStaged { was_started: bool },
-    Cancelled,
-}
-
-impl UpstreamPhase {
-    fn cancellation_staged(self) -> bool {
-        matches!(self, Self::CancelStaged { .. })
-    }
+    cancelled: Arc<watch::Sender<bool>>,
 }
 
 impl ExecutionControl {
@@ -74,7 +60,7 @@ impl ExecutionControl {
         let upstreams = lock(&self.upstreams);
         self.shutdown.send_replace(true);
         for upstream in upstreams.executions.values() {
-            upstream.phase.send_replace(UpstreamPhase::Cancelled);
+            upstream.cancelled.send_replace(true);
         }
     }
 
@@ -119,11 +105,11 @@ impl ExecutionControl {
         let Entry::Vacant(entry) = slots.executions.entry(execution_id) else {
             return None;
         };
-        let (phase, receiver) = watch::channel(UpstreamPhase::Ready);
+        let (cancelled, receiver) = watch::channel(false);
         entry.insert(ReservedUpstream {
             resource,
             principal,
-            phase: Arc::new(phase),
+            cancelled: Arc::new(cancelled),
         });
         *slots.resources.entry(resource).or_default() += 1;
         *slots.principals.entry(principal).or_default() += 1;
@@ -134,56 +120,11 @@ impl ExecutionControl {
         })
     }
 
-    /// Reserve the cancellation before its write can commit. Dropping the
-    /// guard rolls back the fence, including when the actor aborts a batch.
-    fn stage_cancel_upstream(
-        &self,
-        tx: &mut WriteTx<'_>,
-        execution_id: ExecutionId,
-    ) -> Option<StagedUpstreamCancel> {
+    pub(crate) fn mark_upstream_cancelled(&self, execution_id: ExecutionId) {
         let upstreams = lock(&self.upstreams);
-        let slot = upstreams.executions.get(&execution_id)?;
-        let staged = slot.phase.send_if_modified(|phase| {
-            let was_started = match *phase {
-                UpstreamPhase::Ready => false,
-                UpstreamPhase::Started => true,
-                UpstreamPhase::CancelStaged { .. } | UpstreamPhase::Cancelled => return false,
-            };
-            *phase = UpstreamPhase::CancelStaged { was_started };
-            true
-        });
-        if !staged {
-            return None;
+        if let Some(slot) = upstreams.executions.get(&execution_id) {
+            slot.cancelled.send_replace(true);
         }
-        let phase = Arc::clone(&slot.phase);
-        tx.on_indeterminate_commit(move || {
-            phase.send_replace(UpstreamPhase::Cancelled);
-        });
-        Some(StagedUpstreamCancel(Arc::clone(&slot.phase)))
-    }
-
-    fn claim_start(&self, execution_id: ExecutionId) -> StartDecision {
-        let slots = lock(&self.upstreams);
-        if !self.is_accepting() {
-            return StartDecision::Finished;
-        }
-        let Some(slot) = slots.executions.get(&execution_id) else {
-            return StartDecision::Finished;
-        };
-        let mut decision = StartDecision::Finished;
-        slot.phase.send_if_modified(|phase| match *phase {
-            UpstreamPhase::Ready => {
-                *phase = UpstreamPhase::Started;
-                decision = StartDecision::Claimed;
-                true
-            }
-            UpstreamPhase::CancelStaged { .. } => {
-                decision = StartDecision::Wait;
-                false
-            }
-            UpstreamPhase::Started | UpstreamPhase::Cancelled => false,
-        });
-        decision
     }
 }
 
@@ -202,89 +143,30 @@ impl Drop for WaiterPermit {
     }
 }
 
-enum StartDecision {
-    Claimed,
-    Wait,
-    Finished,
-}
-
-/// The guard is held by the writer or its after-commit hook. Its channel is
-/// tied to this reservation even after the worker frees its slot.
-struct StagedUpstreamCancel(Arc<watch::Sender<UpstreamPhase>>);
-
-impl StagedUpstreamCancel {
-    fn commit(self) {
-        self.0.send_replace(UpstreamPhase::Cancelled);
-    }
-}
-
-impl Drop for StagedUpstreamCancel {
-    fn drop(&mut self) {
-        self.0.send_if_modified(|phase| {
-            let UpstreamPhase::CancelStaged { was_started } = *phase else {
-                return false;
-            };
-            *phase = if was_started {
-                UpstreamPhase::Started
-            } else {
-                UpstreamPhase::Ready
-            };
-            true
-        });
-    }
-}
-
 pub(crate) struct UpstreamReservation {
     control: Arc<ExecutionControl>,
     execution_id: ExecutionId,
-    receiver: watch::Receiver<UpstreamPhase>,
+    receiver: watch::Receiver<bool>,
 }
 
 impl UpstreamReservation {
-    pub(crate) async fn claim_start(&mut self) -> Option<UpstreamCancellation> {
-        loop {
-            match self.control.claim_start(self.execution_id) {
-                StartDecision::Claimed => {
-                    return Some(UpstreamCancellation {
-                        phase: self.receiver.clone(),
-                        shutdown: self.control.shutdown_receiver(),
-                    });
-                }
-                StartDecision::Finished => return None,
-                StartDecision::Wait => {
-                    self.receiver
-                        .wait_for(|phase| !phase.cancellation_staged())
-                        .await
-                        .ok()?;
-                }
-            }
+    pub(crate) fn cancellation(&self) -> UpstreamCancellation {
+        UpstreamCancellation {
+            cancelled: self.receiver.clone(),
+            shutdown: self.control.shutdown_receiver(),
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct UpstreamCancellation {
-    phase: watch::Receiver<UpstreamPhase>,
+    cancelled: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
 }
 
 impl UpstreamCancellation {
-    /// Order a nonblocking transport handoff against the cancellation write.
-    /// Wait for any staged cancel before calling the handoff under the fence.
-    /// The handoff must return promptly and must not reenter cancellation.
-    pub(crate) async fn start_io<T>(&mut self, handoff: impl FnOnce() -> T) -> Option<T> {
-        let phase = self
-            .phase
-            .wait_for(|phase| !phase.cancellation_staged())
-            .await
-            .ok()?;
-        // Stop publishes the global signal before visiting each reservation.
-        // Hold both reads so either the handoff or the stop wins that order.
-        let shutdown = self.shutdown.borrow();
-        let result = (!*shutdown && matches!(*phase, UpstreamPhase::Started)).then(handoff);
-        drop(shutdown);
-        drop(phase);
-        result
+    pub(crate) fn is_cancelled(&self) -> bool {
+        *self.shutdown.borrow() || *self.cancelled.borrow()
     }
 
     /// Resolves for committed cancellation, Hub stop, or a retired reservation.
@@ -292,7 +174,7 @@ impl UpstreamCancellation {
     pub(crate) async fn cancelled(&mut self) {
         tokio::select! {
             _ = self.shutdown.wait_for(|&stopping| stopping) => {}
-            _ = self.phase.wait_for(|phase| matches!(phase, UpstreamPhase::Cancelled)) => {}
+            _ = self.cancelled.wait_for(|&cancelled| cancelled) => {}
         }
     }
 }
@@ -327,17 +209,15 @@ fn decrement<K: Eq + std::hash::Hash>(map: &mut HashMap<K, usize>, key: K) {
 
 pub(super) fn cancel_upstream(
     tx: &mut WriteTx<'_>,
-    control: &ExecutionControl,
+    control: &Arc<ExecutionControl>,
     dispatcher: Arc<dyn UpstreamDispatcher>,
     id: ExecutionId,
     caller: PrincipalId,
 ) -> Result<(), StorageError> {
-    let cancellation = control.stage_cancel_upstream(tx, id);
     if tx.cancel_upstream_execution(id, caller)? {
+        let control = Arc::clone(control);
         tx.on_commit(move || {
-            if let Some(cancellation) = cancellation {
-                cancellation.commit();
-            }
+            control.mark_upstream_cancelled(id);
             dispatcher.cancel(id);
         });
     }
@@ -376,20 +256,16 @@ async fn close_executions(
         let state = sweep_state.cloned();
         let completed = storage
             .execute_work(0, move |tx| {
-                let mut cancellations = Vec::new();
-                let completed = tx.close_executions(cause, |tx, id| {
-                    if let Some(state) = &state {
-                        cancellations.push((id, state.execution.stage_cancel_upstream(tx, id)));
-                    }
+                let mut cancelled_upstreams = Vec::new();
+                let completed = tx.close_executions(cause, |id| {
+                    cancelled_upstreams.push(id);
                 })?;
                 if let Some(state) = state
-                    && !cancellations.is_empty()
+                    && !cancelled_upstreams.is_empty()
                 {
                     tx.on_commit(move || {
-                        for (id, cancellation) in cancellations {
-                            if let Some(cancellation) = cancellation {
-                                cancellation.commit();
-                            }
+                        for id in cancelled_upstreams {
+                            state.execution.mark_upstream_cancelled(id);
                             state.upstream.cancel(id);
                         }
                     });
@@ -419,28 +295,20 @@ mod tests {
     use crate::test_support::TestResult;
 
     #[tokio::test]
-    async fn global_stop_fences_a_slot_before_its_local_cancel_signal() -> TestResult {
+    async fn global_stop_cancels_active_upstream_handles() -> TestResult {
         let control = Arc::new(ExecutionControl::new(&Config::default()));
-        let mut reservation = control
+        let reservation = control
             .reserve_upstream(
                 ExecutionId::new(),
                 UpstreamId::new(),
                 PrincipalId::new_user(),
             )
             .ok_or("upstream reservation missing")?;
-        let mut cancellation = reservation
-            .claim_start()
-            .await
-            .ok_or("start claim missing")?;
+        let mut cancellation = reservation.cancellation();
+        assert!(!cancellation.is_cancelled());
 
-        // Simulate the interval after stop publishes its global signal and
-        // before it reaches this reservation while walking the slots.
         control.shutdown.send_replace(true);
-        assert!(matches!(
-            *cancellation.phase.borrow(),
-            UpstreamPhase::Started
-        ));
-        assert!(cancellation.start_io(|| ()).await.is_none());
+        assert!(cancellation.is_cancelled());
         tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled()).await?;
         Ok(())
     }

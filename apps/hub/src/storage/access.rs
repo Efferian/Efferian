@@ -108,7 +108,9 @@ impl super::StorageHandle {
         principal: PrincipalId,
     ) -> Result<Option<Vec<(NodeId, u64)>>, super::WriteError<std::convert::Infallible>> {
         self.execute_priority(super::actor::PriorityKind::DisablePrincipal, move |tx| {
-            Ok(tx.disable_principal(actor, principal)?)
+            Ok(tx
+                .disable_principal(actor, principal)?
+                .map(|disabled| disabled.revoked_nodes))
         })
         .await
     }
@@ -185,13 +187,14 @@ impl WriteTx<'_> {
         Ok(false)
     }
 
-    /// Disable an active principal and return the revoked session fences. An
-    /// already disabled or absent principal has no new effects.
+    /// Disable an active principal and return the revoked session fences and
+    /// affected principals (self plus dependent agents). An already disabled or
+    /// absent principal has no new effects.
     pub(crate) fn disable_principal(
         &mut self,
         actor: ActorId,
         principal: PrincipalId,
-    ) -> Result<Option<Vec<(NodeId, u64)>>, StorageError> {
+    ) -> Result<Option<DisabledPrincipal>, StorageError> {
         let principal_id = principal.to_string();
         let kind: Option<String> = {
             let mut stmt = self.conn().prepare_cached(
@@ -212,7 +215,7 @@ impl WriteTx<'_> {
         self.append_event(actor, Event::PrincipalRevoked(principal))?;
 
         let nodes = managed_nodes(self.conn(), principal)?;
-        stage_cascade(
+        let affected_principals = stage_cascade(
             self,
             principal,
             RevocationReason::PrincipalDisabled(principal),
@@ -227,15 +230,18 @@ impl WriteTx<'_> {
             )?;
             stmt.execute(params![self.now_ms(), principal_id])?;
         }
-        let mut revoked = Vec::with_capacity(nodes.len());
+        let mut revoked_nodes = Vec::with_capacity(nodes.len());
         for node in nodes {
             if let Some(session) =
                 revoke_node_cascade(self, actor, node, Enrollments::AlreadyRevoked)?
             {
-                revoked.push(session);
+                revoked_nodes.push(session);
             }
         }
-        Ok(Some(revoked))
+        Ok(Some(DisabledPrincipal {
+            revoked_nodes,
+            affected_principals,
+        }))
     }
 
     pub(crate) fn revoke_grant(&mut self, grant: GrantId) -> Result<bool, StorageError> {
@@ -255,7 +261,7 @@ impl WriteTx<'_> {
                 require_global_admin(self.conn())?;
             }
             let nodes = managed_nodes(self.conn(), principal)?;
-            stage_cascade(
+            let _ = stage_cascade(
                 self,
                 principal,
                 RevocationReason::GrantRevoked(grant),
@@ -348,12 +354,13 @@ impl WriteTx<'_> {
         &mut self,
         principal: PrincipalId,
     ) -> Result<(), StorageError> {
-        stage_cascade(
+        let _ = stage_cascade(
             self,
             principal,
             RevocationReason::PrincipalPermissionsReduced(principal),
             Vec::new(),
-        )
+        )?;
+        Ok(())
     }
 
     pub(crate) fn principal_liveness(
@@ -514,15 +521,15 @@ fn stage_cascade(
     principal: PrincipalId,
     reason: RevocationReason,
     affected_nodes: Vec<NodeId>,
-) -> Result<(), StorageError> {
+) -> Result<Vec<PrincipalId>, StorageError> {
     let mut affected_principals = vec![principal];
     affected_principals.extend(related_agents(tx.conn(), principal)?);
     tx.stage_revocation(RevocationSignal {
         reason,
-        affected_principals,
+        affected_principals: affected_principals.clone(),
         affected_nodes,
     });
-    Ok(())
+    Ok(affected_principals)
 }
 
 fn related_agents(conn: &Connection, principal: PrincipalId) -> rusqlite::Result<Vec<PrincipalId>> {
@@ -533,5 +540,27 @@ fn related_agents(conn: &Connection, principal: PrincipalId) -> rusqlite::Result
     )?;
     agents
         .query_map([principal.to_string()], |row| id(row, 0))?
+        .collect()
+}
+
+pub(crate) struct DisabledPrincipal {
+    pub revoked_nodes: Vec<(NodeId, u64)>,
+    pub affected_principals: Vec<PrincipalId>,
+}
+
+/// Owned agents that currently inherit bindings from `owner`.
+pub(crate) fn inheriting_agents(
+    conn: &Connection,
+    owner: PrincipalId,
+) -> rusqlite::Result<Vec<PrincipalId>> {
+    let mut agents = conn.prepare_cached(
+        "SELECT p.principal_id FROM principals p JOIN hub_meta h ON h.id = 1
+         WHERE p.kind = 'agent' AND p.owner_principal_id = ?1
+           AND p.inherit_owner_bindings = 1
+           AND p.principal_id IS NOT h.gc_purging_principal_id
+         ORDER BY p.principal_id",
+    )?;
+    agents
+        .query_map([owner.to_string()], |row| id(row, 0))?
         .collect()
 }

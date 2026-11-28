@@ -23,17 +23,20 @@ async fn duplicate_admissions_in_one_work_batch_see_staged_execution_and_waiter(
     let (hub, bridge, _, tool) = managed_fixture(request_id.timestamp_ms()).await?;
     publish(&hub, tool, "echo", 1, "async", None).await?;
     let caller = admin_caller(&hub).await?.0;
-    let query = Arc::new(InvokeInput::new(
-        Resource::Profile {
-            slug: "demo".to_owned(),
-            edition: None,
-        },
-        "echo".to_owned(),
-        serde_json::from_value(json!({"text": "batched"}))?,
-        None,
-        Some(request_id),
-        Some(0),
-    )?);
+    let query = Arc::new(
+        InvokeInput::new(
+            Resource::Profile {
+                slug: "demo".to_owned(),
+                edition: None,
+            },
+            "echo".to_owned(),
+            serde_json::from_value(json!({"text": "batched"}))?,
+            None,
+            Some(request_id),
+            Some(0),
+        )
+        .await?,
+    );
     let first_preparation = preflight(&hub.state, &caller, Arc::clone(&query)).await?;
     let second_preparation = preflight(&hub.state, &caller, Arc::clone(&query)).await?;
     assert!(first_preparation.is_some() && second_preparation.is_some());
@@ -82,7 +85,7 @@ async fn duplicate_admissions_in_one_work_batch_see_staged_execution_and_waiter(
     let (anchor_result, first, second) =
         tokio::time::timeout(TIMEOUT, async { tokio::join!(anchor, first, second) }).await?;
     anchor_result?;
-    let (Admission::Execution(first, 0), Admission::Execution(second, 0)) = (first?, second?)
+    let (Admission::Execution(first, 0, _), Admission::Execution(second, 0, _)) = (first?, second?)
     else {
         return Err("the writer did not admit both requests".into());
     };

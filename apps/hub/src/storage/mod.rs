@@ -20,6 +20,7 @@ pub use lifecycle::{
 };
 pub use maintenance::{StoragePressure, StorageStatus};
 
+pub(crate) use access::inheriting_agents;
 pub(crate) use actor::{FollowUpWrite, MAX_WORK_BYTES, PriorityKind, WriteTx, WriteTxError};
 pub(crate) use events::{
     id, invalid_text_msg, json, opt_id, optional_json, optional_scalar, read_grant_scope, scalar,

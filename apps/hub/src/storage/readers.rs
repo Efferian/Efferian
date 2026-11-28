@@ -7,14 +7,18 @@ use tokio::sync::Semaphore;
 use super::StorageError;
 use super::lifecycle::open_reader;
 
-const READERS: usize = 8;
+const READERS: usize = 10;
 const CONTROL_READERS: usize = 2;
-const GENERAL_READERS: usize = READERS - CONTROL_READERS;
+const AUTH_READERS: usize = 2;
+const GENERAL_READERS: usize = READERS - CONTROL_READERS - AUTH_READERS;
+const STREAM_CATCHUP_READERS: usize = 2;
 
 pub(super) struct ReadPool {
     path: PathBuf,
     general: Arc<Semaphore>,
+    auth: Arc<Semaphore>,
     control: Arc<Semaphore>,
+    stream_catchup: Arc<Semaphore>,
     state: Mutex<PoolState>,
     closed: Condvar,
 }
@@ -34,7 +38,9 @@ impl ReadPool {
         Ok(Arc::new(Self {
             path,
             general: Arc::new(Semaphore::new(GENERAL_READERS)),
+            auth: Arc::new(Semaphore::new(AUTH_READERS)),
             control: Arc::new(Semaphore::new(CONTROL_READERS)),
+            stream_catchup: Arc::new(Semaphore::new(STREAM_CATCHUP_READERS)),
             state: Mutex::new(PoolState {
                 idle,
                 in_flight: 0,
@@ -65,6 +71,32 @@ impl ReadPool {
         T: Send + 'static,
         E: From<StorageError> + Send + 'static,
     {
+        self.snapshot_on(&self.general, read).await
+    }
+
+    pub(super) async fn auth_snapshot<T, E>(
+        self: &Arc<Self>,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        self.snapshot_on(&self.auth, read).await
+    }
+
+    pub(super) async fn stream_snapshot<T, E>(
+        self: &Arc<Self>,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        let _catchup = Arc::clone(&self.stream_catchup)
+            .acquire_owned()
+            .await
+            .map_err(|_| self.closed_error())?;
         self.snapshot_on(&self.general, read).await
     }
 
@@ -111,7 +143,9 @@ impl ReadPool {
     pub(super) fn begin_close(&self) {
         self.state().closing = true;
         self.general.close();
+        self.auth.close();
         self.control.close();
+        self.stream_catchup.close();
     }
 
     pub(super) fn stop(&self, failed: bool) {

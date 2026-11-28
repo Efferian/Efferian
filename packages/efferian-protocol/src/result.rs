@@ -73,27 +73,47 @@ pub fn validate_error_message(message: Option<&str>) -> Result<(), ValidationErr
     Ok(())
 }
 
+pub(crate) fn validate_terminal_fields(
+    state: TerminalExecutionState,
+    effect_may_have_occurred: bool,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+    output_discarded_reason: Option<OutputDiscardedReason>,
+    has_result: bool,
+    truncated: bool,
+) -> Result<(), ValidationError> {
+    use TerminalExecutionState::{Cancelled, TimedOut, Unknown};
+
+    if (matches!(state, Unknown | Cancelled | TimedOut) && !effect_may_have_occurred)
+        || (error_code == Some(error_codes::NODE_BUSY) && effect_may_have_occurred)
+    {
+        return Err(ValidationError::InvalidReceipt);
+    }
+    if output_discarded_reason.is_some() && (!truncated || has_result) {
+        return Err(ValidationError::InvalidReceipt);
+    }
+    validate_error_code(error_code)?;
+    validate_error_message(error_message)
+}
+
 pub fn validate_terminal_summary(
     state: TerminalExecutionState,
     summary: &ExecutionSummary,
     has_result: bool,
     truncated: bool,
 ) -> Result<(), ValidationError> {
-    use TerminalExecutionState::{Cancelled, TimedOut, Unknown};
-
     let Some(effect) = summary.effect_may_have_occurred else {
         return Err(ValidationError::InvalidReceipt);
     };
-    if (matches!(state, Unknown | Cancelled | TimedOut) && !effect)
-        || (summary.error_code.as_deref() == Some(error_codes::NODE_BUSY) && effect)
-    {
-        return Err(ValidationError::InvalidReceipt);
-    }
-    if summary.output_discarded_reason.is_some() && (!truncated || has_result) {
-        return Err(ValidationError::InvalidReceipt);
-    }
-    validate_error_code(summary.error_code.as_deref())?;
-    validate_error_message(summary.error_message.as_deref())
+    validate_terminal_fields(
+        state,
+        effect,
+        summary.error_code.as_deref(),
+        summary.error_message.as_deref(),
+        summary.output_discarded_reason,
+        has_result,
+        truncated,
+    )
 }
 
 strict_enum! {

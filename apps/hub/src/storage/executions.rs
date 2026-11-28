@@ -87,6 +87,9 @@ pub(crate) struct NewExecutionWrite {
     pub caller: PrincipalId,
     pub token: TokenId,
     pub resource: InvokeResource,
+    /// Binding already loaded from the same `WriteTx`, avoiding duplicate JSON
+    /// parsing when admitting a profile execution.
+    pub resolved_binding: Option<ProfileToolBinding>,
     pub public_name: String,
     pub requested_target: Option<String>,
     pub arguments: PreparedArgumentsDigest,
@@ -102,6 +105,7 @@ pub(crate) struct InvokeOutcome {
     pub snapshot: ExecutionSnapshot,
     pub replayed: bool,
     pub waiter: Option<watch::Receiver<ExecutionSnapshot>>,
+    pub replayed_binding: Option<ProfileToolBinding>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -218,6 +222,7 @@ impl super::StorageHandle {
             executor: request.executor,
             account_id: request.account_id,
             deadline_at_ms: request.deadline_at_ms,
+            resolved_binding: None,
         };
         self.execute_work(work_bytes, move |tx| {
             if tx.principal_liveness(write.caller)? != PrincipalLiveness::Enabled {
@@ -282,7 +287,7 @@ impl WriteTx<'_> {
         {
             return Err(conflict());
         }
-        let (fixed_node_id, requested_version) = match input.resource {
+        let (fixed_node_id, requested_version, replayed_binding) = match input.resource {
             InvokeResource::Profile { profile_id, .. } => {
                 if recorded.profile_id != Some(profile_id) {
                     return Err(conflict());
@@ -298,7 +303,7 @@ impl WriteTx<'_> {
                         .ok_or(WriteTxError::InvalidDatabase(
                             "missing recorded profile binding",
                         ))?;
-                (original.fixed_node_id, None)
+                (original.fixed_node_id, None, Some(original))
             }
             InvokeResource::ToolTest {
                 tool_id,
@@ -308,7 +313,7 @@ impl WriteTx<'_> {
                 if recorded.tool_id != tool_id {
                     return Err(conflict());
                 }
-                (None, requested_version)
+                (None, requested_version, None)
             }
         };
         let computed = finish_digest(
@@ -340,6 +345,7 @@ impl WriteTx<'_> {
             snapshot: recorded.snapshot,
             replayed: true,
             waiter,
+            replayed_binding,
         })
     }
 
@@ -363,9 +369,31 @@ impl WriteTx<'_> {
                 } => {
                     let version_i64 = i64::try_from(version.get())
                         .map_err(|_| WriteTxError::Domain(InvokeWriteError::BindingUnavailable))?;
-                    let binding =
+                    let binding = if let Some(binding) = request
+                        .resolved_binding
+                        .filter(|binding| binding.public_name == request.public_name)
+                    {
+                        let active: bool = self
+                            .conn()
+                            .prepare_cached(
+                                "SELECT EXISTS(
+                                     SELECT 1 FROM profile_editions pe
+                                     JOIN profiles p ON p.profile_id = pe.profile_id
+                                     WHERE pe.profile_id = ?1 AND pe.version = ?2
+                                       AND p.disabled_at_ms IS NULL AND pe.disabled_at_ms IS NULL
+                                 )",
+                            )?
+                            .query_row(params![profile_id.to_string(), version_i64], |row| {
+                                row.get(0)
+                            })?;
+                        if !active {
+                            return Err(WriteTxError::Domain(InvokeWriteError::BindingUnavailable));
+                        }
+                        binding
+                    } else {
                         load_binding(self, profile_id, version.get(), &request.public_name, true)?
-                            .ok_or(WriteTxError::Domain(InvokeWriteError::BindingUnavailable))?;
+                            .ok_or(WriteTxError::Domain(InvokeWriteError::BindingUnavailable))?
+                    };
                     let tool_version_i64 = i64::try_from(binding.tool_version)
                         .map_err(|_| WriteTxError::Domain(InvokeWriteError::IntegerOutOfRange))?;
                     (
@@ -494,6 +522,7 @@ impl WriteTx<'_> {
             execution_id,
             snapshot,
             replayed: false,
+            replayed_binding: None,
             waiter: Some(waiter),
         })
     }

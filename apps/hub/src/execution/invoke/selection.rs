@@ -9,9 +9,9 @@ use efferian_authz::{
     check_profile_invoke_metadata,
 };
 use efferian_protocol::{
-    AccountSecretPayload, ExecuteReqPayload, ExecutionId, ManagedAccount, NodeId, PrincipalId,
-    ProfileId, ProfileToolBinding, TargetSelector, ToolSpec, UpstreamAccountMode, UpstreamId,
-    error_codes as code, validate_http_headers_no_auth_collision,
+    AccountSecretPayload, EgressUrlMode, ExecuteReqPayload, ExecutionId, ManagedAccount, NodeId,
+    PrincipalId, ProfileId, ProfileToolBinding, TargetSelector, ToolSpec, UpstreamAccountMode,
+    UpstreamId, error_codes as code, validate_egress_url, validate_http_headers_no_auth_collision,
 };
 use http::StatusCode;
 use rusqlite::{Connection, OptionalExtension, Row};
@@ -105,6 +105,7 @@ fn visit_selector_nodes(
     ctx: &AuthContext,
     selector: &TargetSelector,
     fixed: Option<NodeId>,
+    ordered: bool,
     mut visit: impl FnMut(NodeCandidate) -> ApiResult<ControlFlow<()>>,
 ) -> ApiResult<()> {
     if let Some(node_id) = fixed {
@@ -136,7 +137,9 @@ fn visit_selector_nodes(
         sql.push_str(" AND managed_by_principal_id = ?2");
         parameters.push(manager.to_string());
     }
-    sql.push_str(" ORDER BY name COLLATE BINARY");
+    if ordered {
+        sql.push_str(" ORDER BY name COLLATE BINARY");
+    }
     let mut statement = conn.prepare_cached(&sql)?;
     let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
     while let Some(row) = rows.next()? {
@@ -164,7 +167,7 @@ pub(super) fn discovery_targets(
     first_only: bool,
 ) -> ApiResult<Vec<AvailableTarget>> {
     let mut visible = Vec::new();
-    visit_selector_nodes(conn, ctx, selector, fixed, |node| {
+    visit_selector_nodes(conn, ctx, selector, fixed, !first_only, |node| {
         if visible_node(ctx, profile_id, &node)? {
             visible.push(AvailableTarget {
                 node_id: node.auth.node_id,
@@ -310,10 +313,6 @@ impl Candidate {
                             upstream_id: account.upstream_id,
                             payload,
                         });
-                let policy = state
-                    .config
-                    .egress_policy()
-                    .map_err(|_| ApiError::internal())?;
                 let request = self
                     .revision
                     .definition
@@ -322,7 +321,7 @@ impl Candidate {
                         arguments,
                         account,
                         state.config.max_runtime_ms,
-                        &policy,
+                        state.egress.policy(),
                     )
                     .map_err(|_| invalid_arguments())?;
                 Dispatch::Node(Box::new(request))
@@ -337,6 +336,12 @@ impl Candidate {
                 else {
                     return Err(ApiError::internal());
                 };
+                validate_egress_url(
+                    &config.url,
+                    state.egress.policy(),
+                    EgressUrlMode::RequireHttpsByDefault,
+                )
+                .map_err(|_| invalid_arguments())?;
                 let auth = match (&self.account, secret) {
                     (Some(account), Some(AccountSecretPayload::HttpAuth { auth })) => {
                         Some(UpstreamCredential {
@@ -433,6 +438,7 @@ impl Candidate {
             caller: ctx.caller.principal_id,
             token: ctx.token.token_id,
             resource: self.resource,
+            resolved_binding: self.binding.clone(),
             public_name: input.public_name.clone(),
             requested_target: input.target.clone(),
             arguments: input.digest.clone(),
@@ -455,8 +461,8 @@ impl Candidate {
             let execution_id = request.execution_id;
             let code = match bridge.try_send_execute(node_id, ready.epoch, request) {
                 Ok(()) => return None,
-                Err(NodeSendError::Full) => "node_ws_backpressure",
-                Err(NodeSendError::Closed) => "node_disconnected_before_dispatch",
+                Err(NodeSendError::Full) => code::NODE_WS_BACKPRESSURE,
+                Err(NodeSendError::Closed) => code::NODE_DISCONNECTED_BEFORE_DISPATCH,
             };
             Some(FollowUpWrite::new(move |tx| {
                 tx.fail_node_dispatch(execution_id, code)
@@ -513,20 +519,26 @@ pub(super) fn resolve_candidate(
         if profile.is_none() {
             return Err(ApiError::not_found());
         }
-        let evidence = match fixed {
-            Some(node_id) => exact_node(conn, &node_id.to_string())?,
-            None => None,
+        let evidence = if let Some(node_id) = fixed {
+            let Some(node) = exact_node(conn, &node_id.to_string())? else {
+                check_profile_invoke_metadata(ctx, profile, None)?;
+                return Err(ApiError::not_found());
+            };
+            let target_matches = input.target.as_ref().is_none_or(|target| {
+                NodeId::parse(target)
+                    .map_or_else(|_| node.name == *target, |id| id == node.auth.node_id)
+            });
+            if !target_matches {
+                check_profile_invoke_metadata(ctx, profile, None)?;
+                return Err(ApiError::not_found());
+            }
+            Some(node)
+        } else {
+            None
         };
-        let evidence = evidence
-            .as_ref()
-            .filter(|node| {
-                input.target.as_ref().is_none_or(|target| {
-                    NodeId::parse(target)
-                        .map_or_else(|_| node.name == *target, |id| id == node.auth.node_id)
-                })
-            })
-            .map(NodeCandidate::target);
-        return Err(missing_tool(ctx, profile, evidence)?);
+        let error = missing_tool(ctx, profile, evidence.as_ref().map(NodeCandidate::target))?;
+        check_new_request(state, input, ctx.now_ms)?;
+        return Err(error);
     };
     let (selected, account) = match &revision.definition.spec {
         ToolSpec::UpstreamRef {
@@ -555,7 +567,9 @@ pub(super) fn resolve_candidate(
             }
             let config = read_upstream_config(conn, *upstream_id)?;
             let Some(config) = config else {
-                return Err(missing_tool(ctx, profile, Some(target))?);
+                let error = missing_tool(ctx, profile, Some(target))?;
+                check_new_request(state, input, ctx.now_ms)?;
+                return Err(error);
             };
             metadata_gate(ctx, profile, target_visible)
                 .map_err(|error| account_reason(error, &config.slug))?;
@@ -587,23 +601,48 @@ pub(super) fn resolve_candidate(
         }
         spec => {
             let selector = spec.target_selector().ok_or_else(ApiError::internal)?;
+            let mut out_of_selector_readable = false;
             let candidates = if let Some(requested) = &input.target {
                 let node = exact_node(conn, requested)?;
                 match node {
                     Some(node) if node.matches(selector, fixed) => vec![node],
                     Some(node) if authorize_node_read(ctx, &node.auth).is_ok() => {
-                        return Err(invalid_arguments());
+                        out_of_selector_readable = true;
+                        Vec::new()
                     }
                     _ => Vec::new(),
                 }
             } else {
                 let mut nodes = Vec::new();
-                visit_selector_nodes(conn, ctx, selector, fixed, |node| {
+                visit_selector_nodes(conn, ctx, selector, fixed, true, |node| {
                     nodes.push(node);
                     Ok(ControlFlow::Continue(()))
                 })?;
                 nodes
             };
+            if out_of_selector_readable {
+                // Verify that the tool itself is visible, invokable, and enabled
+                // before returning 400 so unreadable tools remain 404 and
+                // Discover-only callers receive 403 rather than a selector oracle.
+                if let Some(profile_id) = profile {
+                    let mut selector_nodes = Vec::new();
+                    visit_selector_nodes(conn, ctx, selector, fixed, false, |node| {
+                        selector_nodes.push(node);
+                        Ok(ControlFlow::Continue(()))
+                    })?;
+                    let visible = checked_candidates(ctx, profile_id, selector_nodes)?;
+                    let first_target = visible.first().map(NodeCandidate::target);
+                    metadata_gate(ctx, profile, first_target)?;
+                    if first_target.is_none() {
+                        return Err(ApiError::not_found());
+                    }
+                }
+                check_new_request(state, input, ctx.now_ms)?;
+                if revision.disabled_at_ms.is_some() {
+                    return Err(ApiError::conflict(code::TOOL_DISABLED));
+                }
+                return Err(invalid_arguments());
+            }
             let candidates = match profile {
                 Some(id) => checked_candidates(ctx, id, candidates)?,
                 None => candidates,

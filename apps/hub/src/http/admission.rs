@@ -11,7 +11,7 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use efferian_protocol::{EnrollmentId, PrincipalId, error_codes};
+use efferian_protocol::{EnrollmentId, PrincipalId, PrincipalKind, error_codes};
 use http::{Method, StatusCode};
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -31,6 +31,8 @@ pub(super) struct Admission {
     control_pre_auth: Arc<Semaphore>,
     application: Arc<Semaphore>,
     control: Arc<Semaphore>,
+    control_non_admin: Option<Arc<Semaphore>>,
+    control_per_principal: Arc<SlotMap<PrincipalId>>,
     per_principal: Arc<SlotMap<PrincipalId>>,
     per_enrollment: Arc<SlotMap<EnrollmentId>>,
     event_streams: Arc<Semaphore>,
@@ -40,11 +42,16 @@ pub(super) struct Admission {
 impl Admission {
     pub fn new(state: AppState) -> Arc<Self> {
         let config = &state.config;
+        let control_non_admin = (config.max_control_requests >= 2)
+            .then(|| Arc::new(Semaphore::new(config.max_control_requests / 2)));
+        let control_per_principal = (config.max_control_requests / 4).max(1);
         Arc::new(Self {
             pre_auth: Arc::new(Semaphore::new(config.max_pre_auth_in_flight)),
             control_pre_auth: Arc::new(Semaphore::new(config.max_control_requests)),
             application: Arc::new(Semaphore::new(config.max_app_requests)),
             control: Arc::new(Semaphore::new(config.max_control_requests)),
+            control_non_admin,
+            control_per_principal: Arc::new(SlotMap::new(control_per_principal)),
             per_principal: Arc::new(SlotMap::new(config.max_requests_per_principal)),
             per_enrollment: Arc::new(SlotMap::new(MAX_CONCURRENT_EXCHANGES_PER_ENROLLMENT)),
             event_streams: Arc::new(Semaphore::new(config.max_event_streams)),
@@ -95,18 +102,32 @@ pub(super) async fn api(
         admission
             .state
             .storage
-            .read_snapshot(move |conn| {
+            .read_auth_snapshot(move |conn| {
                 let _permit = pre_auth;
                 authenticate_api(&vault, conn, bearer, clock.wall_now_ms())
             })
             .await?
     };
     let principal_id = authenticated.principal_id;
+    let principal_kind = authenticated.principal_kind;
     request.extensions_mut().insert(ApiCaller(authenticated));
 
     if matches!(lane, ApiLane::Control) {
-        let permit = Admission::acquire(&admission.control)?;
-        return Ok(attach_permit(next.run(request).await, permit));
+        let principal = admission.control_per_principal.reserve(principal_id)?;
+        let non_admin = if principal_kind != PrincipalKind::Admin {
+            admission
+                .control_non_admin
+                .as_ref()
+                .map(Admission::acquire)
+                .transpose()?
+        } else {
+            None
+        };
+        let global = Admission::acquire(&admission.control)?;
+        return Ok(attach_permit(
+            next.run(request).await,
+            (global, non_admin, principal),
+        ));
     }
     if matches!(lane, ApiLane::EventStream) {
         let exhausted =
@@ -141,7 +162,7 @@ pub(super) async fn enrollment(
     let authenticated = admission
         .state
         .storage
-        .read_snapshot(move |conn| {
+        .read_auth_snapshot(move |conn| {
             let _permit = pre_auth;
             authenticate_enrollment(&vault, conn, bearer, clock.wall_now_ms())
         })
@@ -170,7 +191,7 @@ pub(super) async fn node(
     let authenticated = admission
         .state
         .storage
-        .read_snapshot(move |conn| {
+        .read_auth_snapshot(move |conn| {
             let _permit = pre_auth;
             authenticate_node(&vault, conn, bearer)
         })

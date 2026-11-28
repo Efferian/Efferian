@@ -18,9 +18,8 @@ use efferian_authz::{
 };
 use efferian_protocol::{
     DEFAULT_INLINE_WAIT_MS, DEFAULT_REQUEST_ID_MAX_AGE_MS, DEFAULT_REQUEST_ID_MAX_FUTURE_SKEW_MS,
-    ExecutionId, ExecutionMode, MAX_RESOLVED_ACTION_BYTES, MAX_WAIT_MS, PreparedArgumentsDigest,
-    ProblemDetails, ProfileToolBinding, RequestId, error_codes as code, validate_public_tool_name,
-    validate_slug,
+    ExecutionId, ExecutionMode, MAX_WAIT_MS, PreparedArgumentsDigest, ProblemDetails,
+    ProfileToolBinding, RequestId, error_codes as code, validate_public_tool_name, validate_slug,
 };
 use http::{StatusCode, request::Parts};
 use rusqlite::{Connection, OptionalExtension};
@@ -33,17 +32,19 @@ use super::state::{
     ExecutionDetail, ExecutionMetadata, execution_auth_target, invocation_response,
 };
 use crate::catalog::accounts::load_account_secret;
-use crate::catalog::profiles::read_edition;
 use crate::http::{
     ApiCaller, ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, AppState, RouteGroups,
 };
 use crate::storage::{
     InvokeOutcome, InvokeReplayInput, InvokeResource, InvokeWriteError, RecordedInvocation,
-    WriteTx, WriteTxError, id, lookup_invocation_replay,
+    RevocationWatch, StorageError, WriteTx, WriteTxError, id, lookup_invocation_replay,
 };
 use crate::vault::auth::{AuthenticatedApi, refresh_invoke};
 
 use selection::{Candidate, Dispatch, Prepared, resolve_candidate};
+
+const DIGEST_OFFLOAD_BYTES: usize = 64 * 1024;
+const EXECUTION_ROW_WORK_BYTES: usize = 512;
 
 pub(super) fn routes() -> RouteGroups {
     RouteGroups {
@@ -113,15 +114,32 @@ async fn profile_invoke(
     invoke_profile_edition(&state, caller, slug, None, request).await
 }
 
-/// Shared admission for the current REST edition and an edition selected by
-/// an in-process gateway. A retired edition is never eligible for new work.
-pub(crate) async fn invoke_profile_edition(
+/// Typed admission output for in-process callers (`#8` MCP gateway) that need
+/// direct access to the execution waiter and revocation watch without HTTP
+/// serialization.
+#[allow(
+    dead_code,
+    reason = "typed admission seam for the in-process MCP gateway"
+)]
+pub(crate) struct AdmittedExecution {
+    pub outcome: InvokeOutcome,
+    pub wait_ms: u64,
+    pub revocations: RevocationWatch,
+    pub caller_context: AuthContext,
+}
+
+/// Shared typed admission for the current REST edition and an edition selected
+/// by an in-process gateway. A retired edition is never eligible for new work.
+pub(crate) async fn admit_profile_edition(
     state: &AppState,
-    caller: ApiCaller,
+    caller: &AuthenticatedApi,
     slug: String,
     edition: Option<NonZeroU64>,
     request: ProfileInvokeRequest,
-) -> ApiResult<Response> {
+) -> ApiResult<AdmittedExecution> {
+    if !state.execution.is_accepting() {
+        return Err(ApiError::overloaded());
+    }
     validate_public_tool_name(&request.public_name).map_err(|_| ApiError::bad_input())?;
     let input = InvokeInput::new(
         Resource::Profile { slug, edition },
@@ -130,8 +148,30 @@ pub(crate) async fn invoke_profile_edition(
         request.target,
         request.request_id,
         request.wait_ms,
-    )?;
-    invoke(state, caller, input).await
+    )
+    .await?;
+    admit_input(state, caller, input).await
+}
+
+/// Shared HTTP response wrapper for the current REST edition and an edition
+/// selected by an in-process gateway.
+pub(crate) async fn invoke_profile_edition(
+    state: &AppState,
+    caller: ApiCaller,
+    slug: String,
+    edition: Option<NonZeroU64>,
+    request: ProfileInvokeRequest,
+) -> ApiResult<Response> {
+    let admitted = admit_profile_edition(state, &caller.0, slug, edition, request).await?;
+    invocation_response(
+        state,
+        caller,
+        admitted.outcome,
+        admitted.wait_ms,
+        admitted.revocations,
+        Some(admitted.caller_context),
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -179,8 +219,18 @@ async fn tool_test(
         request.target,
         request.request_id,
         request.wait_ms,
-    )?;
-    invoke(&state, caller, input).await
+    )
+    .await?;
+    let admitted = admit_input(&state, &caller.0, input).await?;
+    invocation_response(
+        &state,
+        caller,
+        admitted.outcome,
+        admitted.wait_ms,
+        admitted.revocations,
+        Some(admitted.caller_context),
+    )
+    .await
 }
 
 struct AcceptingExecutions;
@@ -219,8 +269,39 @@ struct InvokeInput {
     wait_ms: Option<u32>,
 }
 
+fn estimate_arguments_bytes(arguments: &Map<String, Value>) -> usize {
+    let mut bytes = 2usize;
+    let mut stack = Vec::new();
+    for (k, v) in arguments {
+        bytes = bytes.saturating_add(k.len() + 4);
+        stack.push(v);
+    }
+    while let Some(node) = stack.pop() {
+        if bytes >= DIGEST_OFFLOAD_BYTES {
+            return bytes;
+        }
+        match node {
+            Value::Null | Value::Bool(_) => bytes = bytes.saturating_add(5),
+            Value::Number(_) => bytes = bytes.saturating_add(16),
+            Value::String(s) => bytes = bytes.saturating_add(s.len() + 2),
+            Value::Array(items) => {
+                bytes = bytes.saturating_add(2);
+                stack.extend(items);
+            }
+            Value::Object(map) => {
+                bytes = bytes.saturating_add(2);
+                for (k, v) in map {
+                    bytes = bytes.saturating_add(k.len() + 4);
+                    stack.push(v);
+                }
+            }
+        }
+    }
+    bytes
+}
+
 impl InvokeInput {
-    fn new(
+    async fn new(
         resource: Resource,
         public_name: String,
         arguments: Map<String, Value>,
@@ -238,7 +319,19 @@ impl InvokeInput {
         if target.as_ref().is_some_and(String::is_empty) {
             return Err(invalid_arguments());
         }
-        let digest = PreparedArgumentsDigest::new(&arguments).map_err(|_| invalid_arguments())?;
+        let (arguments, digest) = if estimate_arguments_bytes(&arguments) >= DIGEST_OFFLOAD_BYTES {
+            tokio::task::spawn_blocking(move || {
+                let digest =
+                    PreparedArgumentsDigest::new(&arguments).map_err(|_| invalid_arguments())?;
+                Ok::<_, ApiError>((arguments, digest))
+            })
+            .await
+            .map_err(|_| ApiError::internal())??
+        } else {
+            let digest =
+                PreparedArgumentsDigest::new(&arguments).map_err(|_| invalid_arguments())?;
+            (arguments, digest)
+        };
         Ok(Self {
             resource,
             public_name,
@@ -276,25 +369,25 @@ impl InvokeInput {
     }
 }
 
-async fn invoke(state: &AppState, caller: ApiCaller, input: InvokeInput) -> ApiResult<Response> {
+async fn admit_input(
+    state: &AppState,
+    caller: &AuthenticatedApi,
+    input: InvokeInput,
+) -> ApiResult<AdmittedExecution> {
     let revocations = state.storage.subscribe_revocations()?;
     let input = Arc::new(input);
     // A concurrent catalog change can invalidate prepared credentials or the
     // selected session. Rebuild once in a fresh snapshot before asking the
     // client to retry. Every writer pass checks replay before using the plan.
     for _ in 0..2 {
-        let preparation = preflight(state, &caller.0, Arc::clone(&input)).await?;
+        let preparation = preflight(state, caller, Arc::clone(&input)).await?;
         let queued_bytes = input
-            .digest
-            .canonical_bytes()
+            .public_name
+            .len()
             .saturating_add(input.target.as_ref().map_or(0, String::len))
-            .saturating_add(if preparation.is_some() {
-                MAX_RESOLVED_ACTION_BYTES
-            } else {
-                0
-            });
+            .saturating_add(EXECUTION_ROW_WORK_BYTES);
         let writer = state.clone();
-        let proof = caller.0.clone();
+        let proof = caller.clone();
         let input = Arc::clone(&input);
         let runtime = tokio::runtime::Handle::current();
         let admitted = state
@@ -303,11 +396,48 @@ async fn invoke(state: &AppState, caller: ApiCaller, input: InvokeInput) -> ApiR
                 admit(tx, writer, &proof, &input, preparation, runtime)
             })
             .await?;
-        if let Admission::Execution(outcome, wait_ms) = admitted {
-            return invocation_response(state, caller, outcome, wait_ms, revocations).await;
+        if let Admission::Execution(outcome, wait_ms, caller_context) = admitted {
+            return Ok(AdmittedExecution {
+                outcome,
+                wait_ms,
+                revocations,
+                caller_context: *caller_context,
+            });
         }
     }
     Err(ApiError::overloaded())
+}
+
+enum PreflightError {
+    Storage(StorageError),
+    Domain(ApiError),
+}
+
+impl From<StorageError> for PreflightError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<ApiError> for PreflightError {
+    fn from(error: ApiError) -> Self {
+        Self::Domain(error)
+    }
+}
+
+impl From<crate::vault::auth::CredentialError> for PreflightError {
+    fn from(error: crate::vault::auth::CredentialError) -> Self {
+        match error {
+            crate::vault::auth::CredentialError::Storage(error) => Self::Storage(error),
+            other => Self::Domain(other.into()),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for PreflightError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(error.into())
+    }
 }
 
 async fn preflight(
@@ -321,16 +451,22 @@ async fn preflight(
     let query = Arc::clone(&input);
     let candidate = state
         .storage
-        .read_snapshot(move |conn| -> ApiResult<_> {
+        .read_snapshot(move |conn| -> Result<_, PreflightError> {
             let now = reader.clock.wall_now_ms();
             let ctx = refresh_invoke(conn, &proof, now)?;
             let resource = identify_resource(conn, &ctx, &query.resource)?;
-            if lookup_invocation_replay(conn, ctx.caller.principal_id, query.request_id)?.is_some()
+            if query.supplied_request_id
+                && lookup_invocation_replay(conn, ctx.caller.principal_id, query.request_id)?
+                    .is_some()
             {
                 return Ok(None);
             }
             if !reader.execution.is_accepting() {
-                return Ok(None);
+                return if query.supplied_request_id {
+                    Ok(None)
+                } else {
+                    Err(PreflightError::Domain(ApiError::overloaded()))
+                };
             }
             let candidate = resolve_candidate(conn, &ctx, &reader, resource, &query)?;
             let envelope = candidate
@@ -341,13 +477,22 @@ async fn preflight(
             Ok(Some((candidate, envelope)))
         })
         .await;
-    let Ok(Some((candidate, envelope))) = candidate else {
-        // A durable replay may have appeared since this read snapshot.
-        // Treat the writer as the authority on both replay and rejection.
-        return Ok(None);
+    let (candidate, envelope) = match candidate {
+        Ok(Some(found)) => found,
+        Ok(None) => return Ok(None),
+        Err(PreflightError::Storage(error)) => return Err(error.into()),
+        Err(PreflightError::Domain(error)) => {
+            if !input.supplied_request_id {
+                return Err(error);
+            }
+            // A durable replay may have appeared since this read snapshot.
+            // Treat the writer as the authority when the caller supplied a request_id.
+            return Ok(None);
+        }
     };
+    let supplied_request_id = input.supplied_request_id;
     let state = state.clone();
-    tokio::task::spawn_blocking(move || {
+    let (candidate, prepared) = tokio::task::spawn_blocking(move || {
         let id = ExecutionId::new();
         let prepared = envelope.and_then(|envelope| {
             candidate.prepare(
@@ -361,13 +506,17 @@ async fn preflight(
         (candidate, prepared)
     })
     .await
-    .map(Some)
-    .map_err(|_| ApiError::internal())
+    .map_err(|_| ApiError::internal())?;
+    if !supplied_request_id {
+        let prepared = prepared?;
+        return Ok(Some((candidate, Ok(prepared))));
+    }
+    Ok(Some((candidate, prepared)))
 }
 
 enum Admission {
     Reprepare,
-    Execution(InvokeOutcome, u64),
+    Execution(InvokeOutcome, u64, Box<AuthContext>),
 }
 
 fn admit(
@@ -383,7 +532,7 @@ fn admit(
     if let Some(recorded) =
         tx.lookup_invocation_replay(ctx.caller.principal_id, input.request_id)?
     {
-        return replay(tx, &ctx, resource, &recorded, input);
+        return replay(tx, ctx, resource, &recorded, input);
     }
     let current = resolve_candidate(tx.conn(), &ctx, &state, resource, input)?;
     let Some((previous, prepared)) = preparation else {
@@ -424,12 +573,12 @@ fn admit(
             });
         }
     }
-    Ok(Admission::Execution(outcome, wait_ms))
+    Ok(Admission::Execution(outcome, wait_ms, Box::new(ctx)))
 }
 
 fn replay(
     tx: &WriteTx<'_>,
-    ctx: &AuthContext,
+    ctx: AuthContext,
     resource: InvokeResource,
     recorded: &RecordedInvocation,
     input: &InvokeInput,
@@ -442,7 +591,7 @@ fn replay(
     )?;
     match resource {
         InvokeResource::Profile { profile_id, .. } => {
-            authorize_profile_invoke_replay(ctx, Some(profile_id), &target)?;
+            authorize_profile_invoke_replay(&ctx, Some(profile_id), &target)?;
             if let Resource::Profile {
                 edition: Some(requested),
                 ..
@@ -453,8 +602,8 @@ fn replay(
             }
         }
         InvokeResource::ToolTest { .. } => {
-            authorize_admin(ctx)?;
-            authorize_execution_access(ctx, Some(&target), ExecutionAccess::ReadMetadata)?;
+            authorize_admin(&ctx)?;
+            authorize_execution_access(&ctx, Some(&target), ExecutionAccess::ReadMetadata)?;
         }
     }
     let outcome = tx
@@ -468,21 +617,12 @@ fn replay(
             },
         )
         .map_err(write_error)?;
-    let wait_ms = if let (Some(profile), Some(version), None) =
-        (recorded.profile_id, recorded.profile_version, input.wait_ms)
-    {
-        let edition = read_edition(tx.conn(), profile, version)?;
-        let binding = edition.as_ref().and_then(|edition| {
-            edition
-                .bindings
-                .iter()
-                .find(|binding| binding.public_name == recorded.public_name)
-        });
-        input.wait_for(binding)
+    let wait_ms = if outcome.snapshot.state.is_terminal() {
+        0
     } else {
-        input.wait_for(None)
+        input.wait_for(outcome.replayed_binding.as_ref())
     };
-    Ok(Admission::Execution(outcome, wait_ms))
+    Ok(Admission::Execution(outcome, wait_ms, Box::new(ctx)))
 }
 
 fn identify_resource(

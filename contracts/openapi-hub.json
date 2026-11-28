@@ -1917,7 +1917,7 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "format": "int64",
+              "format": "int32",
               "maximum": 25000,
               "minimum": 0
             }
@@ -5189,6 +5189,15 @@
               "maximum": 200,
               "minimum": 1
             }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Last public tool name from the previous page",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -5197,7 +5206,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DiscoverTools"
+                  "$ref": "#/components/schemas/Page_DiscoveredProfileTool"
                 }
               }
             }
@@ -7794,7 +7803,7 @@
           "secret_version": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 1
           },
           "slug": {
             "type": "string"
@@ -8195,7 +8204,7 @@
           "config_version": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 1
           },
           "discovered_at_ms": {
             "type": "integer",
@@ -8228,20 +8237,6 @@
             "$ref": "#/components/schemas/DiscoverBound"
           }
         ]
-      },
-      "DiscoverTools": {
-        "type": "object",
-        "required": [
-          "items"
-        ],
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DiscoveredProfileTool"
-            }
-          }
-        }
       },
       "DiscoveredProfileTool": {
         "type": "object",
@@ -8486,70 +8481,7 @@
                 ]
               },
               "payload": {
-                "type": "object",
-                "required": [
-                  "execution_id",
-                  "state",
-                  "profile_id",
-                  "tool_id",
-                  "public_name"
-                ],
-                "properties": {
-                  "duration_ms": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "int64",
-                    "minimum": 0
-                  },
-                  "error_code": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "execution_id": {
-                    "$ref": "#/components/schemas/ExecutionId"
-                  },
-                  "exit_code": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "int32"
-                  },
-                  "node_id": {
-                    "oneOf": [
-                      {
-                        "type": "null"
-                      },
-                      {
-                        "$ref": "#/components/schemas/NodeId"
-                      }
-                    ]
-                  },
-                  "profile_id": {
-                    "oneOf": [
-                      {
-                        "type": "null"
-                      },
-                      {
-                        "$ref": "#/components/schemas/ProfileId"
-                      }
-                    ]
-                  },
-                  "public_name": {
-                    "type": "string"
-                  },
-                  "state": {
-                    "$ref": "#/components/schemas/ExecutionState"
-                  },
-                  "tool_id": {
-                    "$ref": "#/components/schemas/ToolId"
-                  }
-                },
-                "additionalProperties": false
+                "$ref": "#/components/schemas/ExecutionEventPayload"
               },
               "seq": {
                 "type": "integer",
@@ -8613,70 +8545,7 @@
                 ]
               },
               "payload": {
-                "type": "object",
-                "required": [
-                  "execution_id",
-                  "state",
-                  "profile_id",
-                  "tool_id",
-                  "public_name"
-                ],
-                "properties": {
-                  "duration_ms": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "int64",
-                    "minimum": 0
-                  },
-                  "error_code": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "execution_id": {
-                    "$ref": "#/components/schemas/ExecutionId"
-                  },
-                  "exit_code": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "int32"
-                  },
-                  "node_id": {
-                    "oneOf": [
-                      {
-                        "type": "null"
-                      },
-                      {
-                        "$ref": "#/components/schemas/NodeId"
-                      }
-                    ]
-                  },
-                  "profile_id": {
-                    "oneOf": [
-                      {
-                        "type": "null"
-                      },
-                      {
-                        "$ref": "#/components/schemas/ProfileId"
-                      }
-                    ]
-                  },
-                  "public_name": {
-                    "type": "string"
-                  },
-                  "state": {
-                    "$ref": "#/components/schemas/ExecutionState"
-                  },
-                  "tool_id": {
-                    "$ref": "#/components/schemas/ToolId"
-                  }
-                },
-                "additionalProperties": false
+                "$ref": "#/components/schemas/ExecutionEventPayload"
               },
               "seq": {
                 "type": "integer",
@@ -8740,70 +8609,7 @@
                 ]
               },
               "payload": {
-                "type": "object",
-                "required": [
-                  "execution_id",
-                  "state",
-                  "profile_id",
-                  "tool_id",
-                  "public_name"
-                ],
-                "properties": {
-                  "duration_ms": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "int64",
-                    "minimum": 0
-                  },
-                  "error_code": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "execution_id": {
-                    "$ref": "#/components/schemas/ExecutionId"
-                  },
-                  "exit_code": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "int32"
-                  },
-                  "node_id": {
-                    "oneOf": [
-                      {
-                        "type": "null"
-                      },
-                      {
-                        "$ref": "#/components/schemas/NodeId"
-                      }
-                    ]
-                  },
-                  "profile_id": {
-                    "oneOf": [
-                      {
-                        "type": "null"
-                      },
-                      {
-                        "$ref": "#/components/schemas/ProfileId"
-                      }
-                    ]
-                  },
-                  "public_name": {
-                    "type": "string"
-                  },
-                  "state": {
-                    "$ref": "#/components/schemas/ExecutionState"
-                  },
-                  "tool_id": {
-                    "$ref": "#/components/schemas/ToolId"
-                  }
-                },
-                "additionalProperties": false
+                "$ref": "#/components/schemas/ExecutionEventPayload"
               },
               "seq": {
                 "type": "integer",
@@ -8867,70 +8673,7 @@
                 ]
               },
               "payload": {
-                "type": "object",
-                "required": [
-                  "execution_id",
-                  "state",
-                  "profile_id",
-                  "tool_id",
-                  "public_name"
-                ],
-                "properties": {
-                  "duration_ms": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "int64",
-                    "minimum": 0
-                  },
-                  "error_code": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "execution_id": {
-                    "$ref": "#/components/schemas/ExecutionId"
-                  },
-                  "exit_code": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "format": "int32"
-                  },
-                  "node_id": {
-                    "oneOf": [
-                      {
-                        "type": "null"
-                      },
-                      {
-                        "$ref": "#/components/schemas/NodeId"
-                      }
-                    ]
-                  },
-                  "profile_id": {
-                    "oneOf": [
-                      {
-                        "type": "null"
-                      },
-                      {
-                        "$ref": "#/components/schemas/ProfileId"
-                      }
-                    ]
-                  },
-                  "public_name": {
-                    "type": "string"
-                  },
-                  "state": {
-                    "$ref": "#/components/schemas/ExecutionState"
-                  },
-                  "tool_id": {
-                    "$ref": "#/components/schemas/ToolId"
-                  }
-                },
-                "additionalProperties": false
+                "$ref": "#/components/schemas/ExecutionEventPayload"
               },
               "seq": {
                 "type": "integer",
@@ -9481,6 +9224,72 @@
           }
         ]
       },
+      "ExecutionEventPayload": {
+        "type": "object",
+        "required": [
+          "execution_id",
+          "state",
+          "profile_id",
+          "tool_id",
+          "public_name"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_id": {
+            "$ref": "#/components/schemas/ExecutionId"
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "node_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NodeId"
+              }
+            ]
+          },
+          "profile_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProfileId"
+              }
+            ]
+          },
+          "public_name": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ExecutionState"
+          },
+          "tool_id": {
+            "$ref": "#/components/schemas/ToolId"
+          }
+        },
+        "additionalProperties": false
+      },
       "ExecutionFields": {
         "type": "object",
         "required": [
@@ -9554,7 +9363,7 @@
               "null"
             ],
             "format": "int64",
-            "minimum": 0
+            "minimum": 1
           },
           "public_name": {
             "type": "string"
@@ -9585,7 +9394,7 @@
           "tool_version": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 1
           },
           "upstream_id": {
             "oneOf": [
@@ -10266,42 +10075,14 @@
       "Page_AccountBindingMetadata": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "principal_id",
-                "upstream_id",
-                "upstream_slug",
-                "account_id",
-                "account_slug",
-                "created_at_ms"
-              ],
-              "properties": {
-                "account_id": {
-                  "$ref": "#/components/schemas/AccountId"
-                },
-                "account_slug": {
-                  "type": "string"
-                },
-                "created_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "principal_id": {
-                  "$ref": "#/components/schemas/PrincipalId"
-                },
-                "upstream_id": {
-                  "$ref": "#/components/schemas/UpstreamId"
-                },
-                "upstream_slug": {
-                  "type": "string"
-                }
-              }
+              "$ref": "#/components/schemas/AccountBindingMetadata"
             }
           },
           "next_cursor": {
@@ -10315,63 +10096,35 @@
       "Page_AccountMetadata": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "account_id",
-                "slug",
-                "owner_principal_id",
-                "visibility",
-                "kind",
-                "secret_version",
-                "created_at_ms",
-                "updated_at_ms"
-              ],
-              "properties": {
-                "account_id": {
-                  "$ref": "#/components/schemas/AccountId"
-                },
-                "created_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "kind": {
-                  "$ref": "#/components/schemas/AccountKind"
-                },
-                "owner_principal_id": {
-                  "$ref": "#/components/schemas/PrincipalId"
-                },
-                "secret_version": {
-                  "type": "integer",
-                  "format": "int64",
-                  "minimum": 0
-                },
-                "slug": {
-                  "type": "string"
-                },
-                "updated_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "upstream_id": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/UpstreamId"
-                    }
-                  ]
-                },
-                "visibility": {
-                  "$ref": "#/components/schemas/AccountVisibility"
-                }
-              }
+              "$ref": "#/components/schemas/AccountMetadata"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_DiscoveredProfileTool": {
+        "type": "object",
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiscoveredProfileTool"
             }
           },
           "next_cursor": {
@@ -10385,28 +10138,14 @@
       "Page_ExecutionMetadata": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "allOf": [
-                {
-                  "$ref": "#/components/schemas/ExecutionFields"
-                },
-                {
-                  "type": "object",
-                  "required": [
-                    "summary"
-                  ],
-                  "properties": {
-                    "summary": {
-                      "$ref": "#/components/schemas/SafeExecutionSummary"
-                    }
-                  }
-                }
-              ]
+              "$ref": "#/components/schemas/ExecutionMetadata"
             }
           },
           "next_cursor": {
@@ -10420,33 +10159,14 @@
       "Page_GrantMetadata": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "grant_id",
-                "principal_id",
-                "scope",
-                "capability"
-              ],
-              "properties": {
-                "capability": {
-                  "$ref": "#/components/schemas/Capability"
-                },
-                "grant_id": {
-                  "$ref": "#/components/schemas/GrantId"
-                },
-                "principal_id": {
-                  "$ref": "#/components/schemas/PrincipalId"
-                },
-                "scope": {
-                  "$ref": "#/components/schemas/GrantScope"
-                }
-              }
+              "$ref": "#/components/schemas/GrantMetadata"
             }
           },
           "next_cursor": {
@@ -10460,108 +10180,14 @@
       "Page_NodeSummary": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "node_id",
-                "name",
-                "tags",
-                "allowed_cwd_roots",
-                "created_at_ms",
-                "updated_at_ms",
-                "live_status"
-              ],
-              "properties": {
-                "allowed_cwd_roots": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                },
-                "created_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "last_connected_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "last_disconnected_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "live_status": {
-                  "$ref": "#/components/schemas/NodeLiveStatus"
-                },
-                "managed_by_principal_id": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/PrincipalId"
-                    }
-                  ]
-                },
-                "max_concurrent_executions": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int32",
-                  "minimum": 0
-                },
-                "name": {
-                  "type": "string"
-                },
-                "node_id": {
-                  "$ref": "#/components/schemas/NodeId"
-                },
-                "platform_arch": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "platform_os": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/PlatformOs"
-                    }
-                  ]
-                },
-                "revoked_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "tags": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                },
-                "updated_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                }
-              }
+              "$ref": "#/components/schemas/NodeSummary"
             }
           },
           "next_cursor": {
@@ -10575,86 +10201,14 @@
       "Page_Principal": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "principal_id",
-                "name",
-                "kind",
-                "inherit_owner_bindings",
-                "is_orchestrator",
-                "allowed_node_tags",
-                "observe_executions",
-                "created_at_ms",
-                "updated_at_ms"
-              ],
-              "properties": {
-                "allowed_node_tags": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  },
-                  "uniqueItems": true
-                },
-                "created_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "disabled_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "inherit_owner_bindings": {
-                  "type": "boolean"
-                },
-                "is_orchestrator": {
-                  "type": "boolean"
-                },
-                "kind": {
-                  "$ref": "#/components/schemas/PrincipalKind"
-                },
-                "managed_by_principal_id": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/PrincipalId"
-                    }
-                  ]
-                },
-                "name": {
-                  "type": "string"
-                },
-                "observe_executions": {
-                  "type": "boolean"
-                },
-                "owner_principal_id": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/PrincipalId"
-                    }
-                  ]
-                },
-                "principal_id": {
-                  "$ref": "#/components/schemas/PrincipalId"
-                },
-                "updated_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                }
-              }
+              "$ref": "#/components/schemas/Principal"
             }
           },
           "next_cursor": {
@@ -10668,52 +10222,14 @@
       "Page_ProfileSummary": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "profile_id",
-                "slug",
-                "discovery_mode",
-                "published_version",
-                "created_at_ms",
-                "updated_at_ms"
-              ],
-              "properties": {
-                "created_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "disabled_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "discovery_mode": {
-                  "$ref": "#/components/schemas/DiscoveryMode"
-                },
-                "profile_id": {
-                  "$ref": "#/components/schemas/ProfileId"
-                },
-                "published_version": {
-                  "type": "integer",
-                  "format": "int64",
-                  "minimum": 0
-                },
-                "slug": {
-                  "type": "string"
-                },
-                "updated_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                }
-              }
+              "$ref": "#/components/schemas/ProfileSummary"
             }
           },
           "next_cursor": {
@@ -10727,82 +10243,14 @@
       "Page_TokenMetadata": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "token_id",
-                "principal_id",
-                "label",
-                "withhold_sensitive",
-                "created_at_ms"
-              ],
-              "properties": {
-                "allowed_nodes": {
-                  "type": [
-                    "array",
-                    "null"
-                  ],
-                  "items": {
-                    "$ref": "#/components/schemas/NodeId"
-                  },
-                  "uniqueItems": true
-                },
-                "allowed_profiles": {
-                  "type": [
-                    "array",
-                    "null"
-                  ],
-                  "items": {
-                    "$ref": "#/components/schemas/ProfileId"
-                  },
-                  "uniqueItems": true
-                },
-                "created_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "expires_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "label": {
-                  "type": "string"
-                },
-                "max_capability": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/Capability"
-                    }
-                  ]
-                },
-                "principal_id": {
-                  "$ref": "#/components/schemas/PrincipalId"
-                },
-                "revoked_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "token_id": {
-                  "$ref": "#/components/schemas/TokenId"
-                },
-                "withhold_sensitive": {
-                  "type": "boolean"
-                }
-              }
+              "$ref": "#/components/schemas/TokenMetadata"
             }
           },
           "next_cursor": {
@@ -10816,56 +10264,14 @@
       "Page_ToolSummary": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "tool_id",
-                "slug",
-                "kind",
-                "current_version",
-                "input_schema_sha256",
-                "created_at_ms",
-                "updated_at_ms"
-              ],
-              "properties": {
-                "created_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "current_version": {
-                  "type": "integer",
-                  "format": "int64",
-                  "minimum": 1
-                },
-                "disabled_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "input_schema_sha256": {
-                  "type": "string"
-                },
-                "kind": {
-                  "$ref": "#/components/schemas/ToolKind"
-                },
-                "slug": {
-                  "type": "string"
-                },
-                "tool_id": {
-                  "$ref": "#/components/schemas/ToolId"
-                },
-                "updated_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                }
-              }
+              "$ref": "#/components/schemas/ToolSummary"
             }
           },
           "next_cursor": {
@@ -10879,74 +10285,14 @@
       "Page_UpstreamSummary": {
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "type": "object",
-              "required": [
-                "upstream_id",
-                "slug",
-                "url",
-                "headers",
-                "config_version",
-                "discovered_tool_count",
-                "created_at_ms",
-                "updated_at_ms"
-              ],
-              "properties": {
-                "config_version": {
-                  "type": "integer",
-                  "format": "int64",
-                  "minimum": 0
-                },
-                "created_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "disabled_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "discovered_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
-                  "format": "int64"
-                },
-                "discovered_tool_count": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "headers": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "propertyNames": {
-                    "type": "string"
-                  }
-                },
-                "slug": {
-                  "type": "string"
-                },
-                "updated_at_ms": {
-                  "type": "integer",
-                  "format": "int64"
-                },
-                "upstream_id": {
-                  "$ref": "#/components/schemas/UpstreamId"
-                },
-                "url": {
-                  "type": "string"
-                }
-              }
+              "$ref": "#/components/schemas/UpstreamSummary"
             }
           },
           "next_cursor": {
@@ -11107,7 +10453,7 @@
         ],
         "properties": {
           "outcome": {
-            "$ref": "#/components/schemas/PutOutcome"
+            "$ref": "#/components/schemas/Outcome"
           },
           "principal": {
             "$ref": "#/components/schemas/Principal"
@@ -11465,14 +10811,6 @@
             "$ref": "#/components/schemas/GrantOutcome"
           }
         }
-      },
-      "PutOutcome": {
-        "type": "string",
-        "enum": [
-          "created",
-          "updated",
-          "unchanged"
-        ]
       },
       "PutUpstream": {
         "type": "object",
@@ -12468,7 +11806,7 @@
           "config_version": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 1
           },
           "created_at_ms": {
             "type": "integer",

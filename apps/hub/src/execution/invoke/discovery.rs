@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{Json, extract::State};
@@ -6,8 +7,9 @@ use efferian_authz::{
     authorize_profile_discover,
 };
 use efferian_protocol::{
-    ExecutionMode, NodeId, ProblemDetails, ProfileId, ProfileToolBinding, ToolAnnotations,
-    ToolDefinition, ToolSpec, validate_public_tool_name, validate_slug,
+    ExecutionMode, NodeId, ProblemDetails, ProfileId, ProfileToolBinding, TargetSelector,
+    ToolAnnotations, ToolDefinition, ToolSpec, UpstreamAccountMode, UpstreamId,
+    validate_public_tool_name, validate_slug,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -19,7 +21,7 @@ use crate::catalog::profiles::{ProfileEditionSummary, read_edition};
 use crate::catalog::tools::read_tool_revision;
 use crate::catalog::upstreams::read_upstream_config;
 use crate::http::{
-    ApiCaller, ApiError, ApiPath, ApiQuery, ApiResult, AppState, checked_page_limit,
+    ApiCaller, ApiError, ApiPath, ApiQuery, ApiResult, AppState, Page, checked_page_limit,
 };
 use crate::vault::auth::refresh_api;
 
@@ -37,11 +39,7 @@ pub(super) fn routes() -> OpenApiRouter<AppState> {
 struct DiscoverQuery {
     q: Option<String>,
     limit: Option<u16>,
-}
-
-#[derive(Serialize, ToSchema)]
-struct DiscoverTools {
-    items: Vec<DiscoveredProfileTool>,
+    cursor: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -73,16 +71,30 @@ enum Visibility {
     Nodes(Vec<AvailableTarget>),
 }
 
+#[derive(Hash, PartialEq, Eq)]
+enum VisibilityKey {
+    Upstream(UpstreamId, UpstreamAccountMode),
+    Fixed {
+        fixed: Option<NodeId>,
+        node_ids: Vec<NodeId>,
+    },
+    Tag {
+        fixed: Option<NodeId>,
+        tag: String,
+    },
+}
+
 #[utoipa::path(
     get, path = "/v1/profiles/{slug}/tools", tag = "Profiles",
     params(
         ("slug" = String, Path, description = "Profile slug"),
         ("q" = Option<String>, Query, description = "Case-insensitive name or description search"),
         ("limit" = Option<u16>, Query, minimum = 1, maximum = 200, description = "Maximum results, defaults to 50"),
+        ("cursor" = Option<String>, Query, description = "Last public tool name from the previous page"),
     ),
     security(("api_bearer" = [])),
     responses(
-        (status = 200, description = "Tools visible in the active edition", body = DiscoverTools),
+        (status = 200, description = "Tools visible in the active edition", body = Page<DiscoveredProfileTool>),
         (status = 404, description = "No active edition visible to this caller", body = ProblemDetails, content_type = "application/problem+json"),
     )
 )]
@@ -91,12 +103,16 @@ async fn list_tools(
     ApiCaller(caller): ApiCaller,
     ApiPath(slug): ApiPath<String>,
     ApiQuery(query): ApiQuery<DiscoverQuery>,
-) -> ApiResult<Json<DiscoverTools>> {
+) -> ApiResult<Json<Page<DiscoveredProfileTool>>> {
     validate_slug(&slug).map_err(|_| ApiError::bad_input())?;
     let limit = checked_page_limit(query.limit)?;
+    if let Some(cursor) = &query.cursor {
+        validate_public_tool_name(cursor).map_err(|_| ApiError::bad_input())?;
+    }
+    let cursor = query.cursor;
     let search = query.q.as_deref().map(str::to_lowercase);
     let clock = Arc::clone(&state.clock);
-    let items = state
+    let page = state
         .storage
         .read_snapshot(move |conn| -> ApiResult<_> {
             let ctx = refresh_api(conn, &caller.credential, clock.wall_now_ms())?;
@@ -105,7 +121,14 @@ async fn list_tools(
                 .bindings
                 .sort_unstable_by(|a, b| a.public_name.cmp(&b.public_name));
             let mut items = Vec::new();
+            let mut visibility_cache = HashMap::<VisibilityKey, bool>::new();
             for binding in edition.bindings {
+                if cursor
+                    .as_deref()
+                    .is_some_and(|after| binding.public_name.as_str() <= after)
+                {
+                    continue;
+                }
                 let Some(revision) =
                     read_tool_revision(conn, binding.tool_id, binding.tool_version)?
                 else {
@@ -124,28 +147,27 @@ async fn list_tools(
                 {
                     continue;
                 }
-                if matches!(
-                    tool_visibility(
-                        conn,
-                        &ctx,
-                        edition.profile_id,
-                        &binding,
-                        &revision.definition,
-                        true,
-                    )?,
-                    Visibility::Hidden,
-                ) {
+                if !cached_visible(
+                    conn,
+                    &ctx,
+                    edition.profile_id,
+                    &binding,
+                    &revision.definition,
+                    &mut visibility_cache,
+                )? {
                     continue;
                 }
                 items.push(summary);
-                if items.len() == limit {
+                if items.len() > limit {
                     break;
                 }
             }
-            Ok(items)
+            Ok(Page::from_rows(items, limit, |item| {
+                item.public_name.clone()
+            }))
         })
         .await?;
-    Ok(Json(DiscoverTools { items }))
+    Ok(Json(page))
 }
 
 #[utoipa::path(
@@ -219,6 +241,46 @@ fn active_edition(
     read_edition(conn, id, version.get())?
         .filter(|edition| edition.disabled_at_ms.is_none())
         .ok_or_else(ApiError::not_found)
+}
+
+fn cached_visible(
+    conn: &Connection,
+    ctx: &AuthContext,
+    profile_id: ProfileId,
+    binding: &ProfileToolBinding,
+    definition: &ToolDefinition,
+    cache: &mut HashMap<VisibilityKey, bool>,
+) -> ApiResult<bool> {
+    let key = match &definition.spec {
+        ToolSpec::UpstreamRef {
+            upstream_id,
+            account_mode,
+            ..
+        } => VisibilityKey::Upstream(*upstream_id, *account_mode),
+        spec => match spec.target_selector().ok_or_else(ApiError::internal)? {
+            TargetSelector::Fixed { node_ids } => {
+                let mut sorted = node_ids.clone();
+                sorted.sort_unstable();
+                VisibilityKey::Fixed {
+                    fixed: binding.fixed_node_id,
+                    node_ids: sorted,
+                }
+            }
+            TargetSelector::Tag { tag } => VisibilityKey::Tag {
+                fixed: binding.fixed_node_id,
+                tag: tag.clone(),
+            },
+        },
+    };
+    if let Some(&visible) = cache.get(&key) {
+        return Ok(visible);
+    }
+    let visible = !matches!(
+        tool_visibility(conn, ctx, profile_id, binding, definition, true)?,
+        Visibility::Hidden,
+    );
+    cache.insert(key, visible);
+    Ok(visible)
 }
 
 fn tool_visibility(

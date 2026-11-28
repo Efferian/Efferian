@@ -457,12 +457,13 @@ async fn pings_ignore_filtered_traffic_and_a_quiet_expired_stream_ends() -> Test
     let ping = timeout(Duration::from_millis(10), body.frame()).await?;
     assert_eq!(decode_frame(ping)?, Some(json!({"type": "ping"})));
 
+    let mut end = Box::pin(body.frame());
+    assert!(futures_util::poll!(end.as_mut()).is_pending());
     hub.clock.set(30_000);
     advance(Duration::from_secs(5)).await;
-    let frame = body
-        .frame()
-        .now_or_never()
-        .ok_or("expired stream stayed open")?;
+    let frame = timeout(Duration::from_millis(10), end)
+        .await
+        .map_err(|_| "expired stream stayed open")?;
     assert_eq!(decode_frame(frame)?, None);
     hub.shutdown().await;
     Ok(())

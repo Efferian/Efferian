@@ -68,6 +68,7 @@ async fn prepare_worker(hub: &TestHub, deadline: i64) -> TestResult<PendingUpstr
                 executor: ExecutionTarget::Upstream(upstream_id),
                 account_id: None,
                 deadline_at_ms: deadline,
+                resolved_binding: None,
             })?;
             Ok((inserted, reservation))
         })
@@ -91,8 +92,7 @@ async fn prepare_worker(hub: &TestHub, deadline: i64) -> TestResult<PendingUpstr
 }
 
 #[tokio::test]
-async fn pending_cancel_fences_first_io_across_commit_and_releases_it_after_rollback() -> TestResult
-{
+async fn upstream_cancel_signals_after_commit_and_stays_clear_after_rollback() -> TestResult {
     for rollback in [false, true] {
         let now = RequestId::new().timestamp_ms();
         let upstream = Arc::new(CountingUpstream::default());
@@ -113,55 +113,40 @@ async fn pending_cancel_fences_first_io_across_commit_and_releases_it_after_roll
         let id = request.execution_id;
         let caller = hub.admin_id;
         let app = hub.state.clone();
+        let cancellation_handle = reservation.cancellation();
 
-        let (entered_tx, entered_rx) = oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let cancellation = tokio::spawn(async move {
-            app.storage
-                .execute_priority(PriorityKind::CancelExecution, move |tx| {
-                    let idle = move || {
-                        let _ = entered_tx.send(());
-                        let _ = release_rx.recv();
-                    };
-                    if rollback {
-                        control::cancel_upstream(tx, &app.execution, app.upstream, id, caller)?;
-                        idle();
-                        tx.conn().execute_batch("ROLLBACK")?;
-                    } else {
-                        // Stop after the actual commit but before the cancellation hook.
-                        tx.on_commit(idle);
-                        control::cancel_upstream(tx, &app.execution, app.upstream, id, caller)?;
-                    }
-                    Ok::<_, WriteTxError<Infallible>>(())
-                })
-                .await
-        });
-        tokio::time::timeout(TEST_TIMEOUT, entered_rx).await??;
-        assert_eq!(
-            get(&hub, id, "").await?["state"],
-            if rollback { "running" } else { "cancelled" }
-        );
-
-        let mut worker = Box::pin(run_upstream(
-            hub.state.clone(),
-            request,
-            reservation,
-            caller,
-            TEST_TIMEOUT,
-            deadline,
-        ));
-        assert!(futures_util::poll!(worker.as_mut()).is_pending());
-        assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(upstream.cancellations.load(Ordering::SeqCst), 0);
-
-        release_tx.send(())?;
-        let result = tokio::time::timeout(TEST_TIMEOUT, cancellation).await??;
+        let result = app
+            .storage
+            .execute_priority(PriorityKind::CancelExecution, move |tx| {
+                control::cancel_upstream(tx, &app.execution, app.upstream, id, caller)?;
+                if rollback {
+                    tx.conn().execute_batch("ROLLBACK")?;
+                }
+                Ok::<_, WriteTxError<Infallible>>(())
+            })
+            .await;
         if rollback {
             assert!(matches!(result, Err(WriteError::PreCommitAborted)));
+            assert!(!cancellation_handle.is_cancelled());
+            assert_eq!(get(&hub, id, "").await?["state"], "running");
         } else {
             result?;
+            assert!(cancellation_handle.is_cancelled());
+            assert_eq!(get(&hub, id, "").await?["state"], "cancelled");
         }
-        tokio::time::timeout(TEST_TIMEOUT, worker).await?;
+
+        tokio::time::timeout(
+            TEST_TIMEOUT,
+            run_upstream(
+                hub.state.clone(),
+                request,
+                reservation,
+                caller,
+                TEST_TIMEOUT,
+                deadline,
+            ),
+        )
+        .await?;
         let expected_state = if rollback {
             ExecutionState::Succeeded
         } else {
@@ -191,14 +176,15 @@ impl UpstreamDispatcher for ControlledReplies {
     fn invoke(
         &self,
         request: InvokeUpstream,
-        mut cancellation: UpstreamCancellation,
+        cancellation: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(UpstreamDispatchError::Unavailable);
+            }
             let (send, receive) = oneshot::channel();
-            cancellation
-                .start_io(|| self.0.send((request.execution_id, send)))
-                .await
-                .ok_or(UpstreamDispatchError::Unavailable)?
+            self.0
+                .send((request.execution_id, send))
                 .map_err(|_| UpstreamDispatchError::Disconnected)?;
             receive
                 .await
@@ -234,7 +220,7 @@ impl UpstreamDispatcher for PreparingTransport {
     fn invoke(
         &self,
         request: InvokeUpstream,
-        mut cancellation: UpstreamCancellation,
+        cancellation: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async move {
             let (resume, preparation) = oneshot::channel();
@@ -245,7 +231,7 @@ impl UpstreamDispatcher for PreparingTransport {
             preparation
                 .await
                 .map_err(|_| UpstreamDispatchError::Disconnected)?;
-            let submitted = cancellation.start_io(|| ()).await.is_some();
+            let submitted = !cancellation.is_cancelled();
             let _ = report.send(submitted);
             Err(UpstreamDispatchError::Unavailable)
         })

@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use efferian_protocol::{
     ActorId, Event, ExecuteAckPayload, ExecutionEventPayload, ExecutionId, ExecutionState,
     ExecutionSummary, ExecutorKind, NodeId, PrincipalId, ProfileId, TerminalExecutionState, ToolId,
-    validate_terminal_summary,
+    error_codes as code, validate_terminal_summary,
 };
 use rusqlite::{OptionalExtension, Row, params};
 
@@ -67,9 +67,9 @@ pub(crate) enum CloseExecutions {
 impl CloseExecutions {
     fn reason(self) -> &'static str {
         match self {
-            Self::Deadline => "deadline_exceeded",
-            Self::Restart => "hub_restarted",
-            Self::Shutdown => "hub_shutting_down",
+            Self::Deadline => code::DEADLINE_EXCEEDED,
+            Self::Restart => code::HUB_RESTARTED,
+            Self::Shutdown => code::HUB_SHUTTING_DOWN,
         }
     }
 }
@@ -329,12 +329,12 @@ impl WriteTx<'_> {
         )
     }
 
-    /// Close one batch. The caller can stage a dispatch fence before each
-    /// upstream transition and confirm it after the enclosing commit.
+    /// Close one batch and notify the caller of each closed upstream execution
+    /// so it can schedule post-commit cancellation signals.
     pub(crate) fn close_executions(
         &mut self,
         cause: CloseExecutions,
-        mut stage_upstream_cancel: impl FnMut(&mut Self, ExecutionId),
+        mut on_upstream: impl FnMut(ExecutionId),
     ) -> Result<usize, StorageError> {
         let suffix = match cause {
             CloseExecutions::Deadline => {
@@ -357,7 +357,7 @@ impl WriteTx<'_> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for row in &rows {
             if row.executor == ExecutorKind::Upstream {
-                stage_upstream_cancel(self, row.id);
+                on_upstream(row.id);
             }
             self.finish_active(
                 row,

@@ -21,8 +21,10 @@ pub(super) struct ExecutionFields {
     pub(super) state: ExecutionState,
     pub(super) caller_principal_id: PrincipalId,
     profile_id: Option<ProfileId>,
+    #[schema(minimum = 1)]
     profile_version: Option<u64>,
     tool_id: ToolId,
+    #[schema(minimum = 1)]
     tool_version: u64,
     public_name: String,
     pub(super) executor_kind: ExecutorKind,

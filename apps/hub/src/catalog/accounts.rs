@@ -51,6 +51,7 @@ pub(crate) struct AccountMetadata {
     pub(crate) visibility: AccountVisibility,
     pub(crate) kind: AccountKind,
     pub(crate) upstream_id: Option<UpstreamId>,
+    #[schema(minimum = 1)]
     pub(crate) secret_version: u64,
     pub(crate) created_at_ms: i64,
     pub(crate) updated_at_ms: i64,
@@ -150,30 +151,41 @@ async fn list(
                     Some(ctx.caller.principal_id),
                 )
             };
-            let mut stmt = conn.prepare_cached(
-                "SELECT a.account_id, a.slug, a.owner_principal_id, a.visibility, a.kind,
-                        a.upstream_id, a.secret_version, a.created_at_ms, a.updated_at_ms
-                 FROM accounts a JOIN hub_meta h ON h.id = 1
-                 WHERE a.owner_principal_id IS NOT h.gc_purging_principal_id
-                   AND a.account_id > ?1
-                   AND (?2 IS NULL OR a.visibility = ?2)
-                   AND (?3 IS NULL OR a.owner_principal_id = ?3)
-                 ORDER BY a.account_id COLLATE BINARY LIMIT ?4",
-            )?;
             let visibility = visibility.map(scalar_text).transpose()?;
-            let rows = stmt.query_map(
-                params![
-                    query
-                        .cursor
-                        .map(|value| value.to_string())
-                        .unwrap_or_default(),
-                    visibility,
-                    owner.map(|value| value.to_string()),
-                    limit + 1,
-                ],
-                account_row,
-            )?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            let cursor = query
+                .cursor
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let rows = if let Some(owner) = owner {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT a.account_id, a.slug, a.owner_principal_id, a.visibility, a.kind,
+                            a.upstream_id, a.secret_version, a.created_at_ms, a.updated_at_ms
+                     FROM accounts a JOIN hub_meta h ON h.id = 1
+                     WHERE a.owner_principal_id = ?1
+                       AND a.owner_principal_id IS NOT h.gc_purging_principal_id
+                       AND a.account_id > ?2
+                       AND (?3 IS NULL OR a.visibility = ?3)
+                     ORDER BY a.account_id COLLATE BINARY LIMIT ?4",
+                )?;
+                let mapped = stmt.query_map(
+                    params![owner.to_string(), cursor, visibility, limit + 1],
+                    account_row,
+                )?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT a.account_id, a.slug, a.owner_principal_id, a.visibility, a.kind,
+                            a.upstream_id, a.secret_version, a.created_at_ms, a.updated_at_ms
+                     FROM accounts a JOIN hub_meta h ON h.id = 1
+                     WHERE a.owner_principal_id IS NOT h.gc_purging_principal_id
+                       AND a.account_id > ?1
+                       AND (?2 IS NULL OR a.visibility = ?2)
+                     ORDER BY a.account_id COLLATE BINARY LIMIT ?3",
+                )?;
+                let mapped = stmt.query_map(params![cursor, visibility, limit + 1], account_row)?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok(rows)
         })
         .await?;
     Ok(Json(Page::from_rows(rows, limit, |row| row.account_id)))
@@ -238,9 +250,16 @@ async fn put(
 ) -> ApiResult<(StatusCode, Json<AccountPutResponse>)> {
     check_slug(&slug)?;
     let request = Arc::new(request);
-    for _ in 0..PUT_ATTEMPTS {
-        let (scope, current) =
-            read_for_put(&state, &caller, &slug, query, Arc::clone(&request)).await?;
+    for attempt in 0..PUT_ATTEMPTS {
+        let (scope, current) = read_for_put(
+            &state,
+            &caller,
+            &slug,
+            query,
+            Arc::clone(&request),
+            attempt == 0,
+        )
+        .await?;
         let (before, sealed) = {
             let vault = Arc::clone(&state.vault);
             let request = Arc::clone(&request);
@@ -332,6 +351,7 @@ async fn read_for_put(
     slug: &str,
     query: AccountQuery,
     request: Arc<AccountPut>,
+    validate_input: bool,
 ) -> ApiResult<(AccountScope, CheckedAccount)> {
     let slug = slug.to_owned();
     let caller = caller.clone();
@@ -340,17 +360,35 @@ async fn read_for_put(
         .storage
         .read_snapshot(move |conn| {
             let ctx = refresh_api(conn, &caller.credential, clock.wall_now_ms())?;
-            let (admin, scope) = account_scope(conn, &ctx, query, AccountAccess::Mutate)?;
-            let current = scoped_account(conn, &slug, scope)?;
+            let admin = account_operator(&ctx, AccountAccess::Mutate)?;
+            authorize_scope_selectors(admin, query.visibility, query.owner)?;
+            if query.visibility == Some(AccountVisibility::Shared) && query.owner.is_some() {
+                return Err(ApiError::bad_input());
+            }
             let kind = request.secret.kind();
+            if request.upstream_id.is_some() && kind != AccountKind::HttpAuth {
+                return Err(ApiError::bad_input());
+            }
+            if validate_input {
+                request
+                    .secret
+                    .validate()
+                    .map_err(|_| ApiError::bad_input())?;
+            }
+            check_owner(conn, query.owner)?;
+            let visibility = query.visibility.unwrap_or(AccountVisibility::Private);
+            let owner = if visibility == AccountVisibility::Shared {
+                ctx.caller.principal_id
+            } else {
+                query.owner.unwrap_or(ctx.caller.principal_id)
+            };
+            let scope = AccountScope { visibility, owner };
+            let current = scoped_account(conn, &slug, scope)?;
             if let Some(account) = &current {
                 authorize_account_access(&ctx, &account.view(), AccountAccess::Mutate)?;
                 if account.kind != kind || account.upstream_id != request.upstream_id {
                     return Err(ApiError::conflict(code::RESOURCE_IN_USE));
                 }
-            }
-            if request.upstream_id.is_some() && kind != AccountKind::HttpAuth {
-                return Err(ApiError::bad_input());
             }
             ensure_visible_upstream(conn, &ctx, admin, request.upstream_id)?;
             let current = current
@@ -371,10 +409,6 @@ fn prepare_secret(
     current: CheckedAccount,
     request: &AccountPut,
 ) -> ApiResult<(Option<AccountMetadata>, SealedSecret)> {
-    request
-        .secret
-        .validate()
-        .map_err(|_| ApiError::bad_input())?;
     let (before, aad) = match current {
         Some((account, blob)) => {
             let previous = open_account(vault, &account, &blob)?;
@@ -427,17 +461,40 @@ async fn delete(
     _: EmptyBody,
 ) -> ApiResult<StatusCode> {
     check_slug(&slug)?;
+    let work_bytes = {
+        let slug = slug.clone();
+        let clock = Arc::clone(&state.clock);
+        let credential = caller.credential.clone();
+        state
+            .storage
+            .read_snapshot(move |conn| -> ApiResult<usize> {
+                let ctx = refresh_api(conn, &credential, clock.wall_now_ms())?;
+                let (_, scope) = account_scope(conn, &ctx, query, AccountAccess::Mutate)?;
+                let account =
+                    scoped_account(conn, &slug, scope)?.ok_or_else(ApiError::not_found)?;
+                authorize_account_access(&ctx, &account.view(), AccountAccess::Mutate)?;
+                if account_in_use(conn, account.account_id, account.visibility)? {
+                    return Err(ApiError::conflict(code::RESOURCE_IN_USE));
+                }
+                Ok(if account.visibility == AccountVisibility::Shared {
+                    super::references::DELETE_REFERENCE_WORK_BYTES
+                } else {
+                    slug.len()
+                })
+            })
+            .await?
+    };
     let dispatcher = state.upstream;
     state
         .storage
-        .execute_work::<_, ApiError, _>(slug.len(), move |tx| {
+        .execute_work::<_, ApiError, _>(work_bytes, move |tx| {
             let conn = tx.conn();
             let ctx = refresh_api(conn, &caller.credential, tx.now_ms())?;
             let (_, scope) = account_scope(conn, &ctx, query, AccountAccess::Mutate)?;
             let account = scoped_account(conn, &slug, scope)?.ok_or_else(ApiError::not_found)?;
             authorize_account_access(&ctx, &account.view(), AccountAccess::Mutate)?;
             let account_id = account.account_id;
-            if account_in_use(conn, account_id)? {
+            if account_in_use(conn, account_id, account.visibility)? {
                 return Err(ApiError::conflict(code::RESOURCE_IN_USE).into());
             }
             conn.execute(

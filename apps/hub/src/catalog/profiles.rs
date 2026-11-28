@@ -26,7 +26,9 @@ use crate::vault::auth::{AuthenticatedApi, refresh_api};
 
 use super::Outcome;
 use super::references::profile_in_use;
-use super::tools::{read_tool_revision, validate_binding_node, validate_dependencies};
+use super::tools::{
+    DependencyCache, read_tool_revision, validate_binding_node_cached, validate_dependencies_cached,
+};
 
 type WriteResult<T> = Result<T, WriteTxError<ApiError>>;
 
@@ -473,13 +475,14 @@ fn validate_dependencies_for_bindings(
             .or_default()
             .push(binding);
     }
+    let mut cache = DependencyCache::default();
     for ((tool_id, version), bindings) in revisions {
         let revision =
             read_tool_revision(conn, tool_id, version)?.ok_or_else(ApiError::not_found)?;
-        validate_dependencies(conn, &revision.definition)?;
+        validate_dependencies_cached(conn, &revision.definition, &mut cache)?;
         for binding in bindings {
             if let Some(node) = binding.fixed_node_id {
-                validate_binding_node(conn, &revision.definition, node)?;
+                validate_binding_node_cached(conn, &revision.definition, node, &mut cache)?;
             }
         }
     }

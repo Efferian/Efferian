@@ -99,7 +99,10 @@ pub fn egress_url_origin_eq(left: &str, right: &str) -> Result<bool, SsrfError> 
         if !matches!(url.scheme(), "http" | "https") {
             return Err(SsrfError::InvalidScheme);
         }
-        let port = url.port_or_known_default().ok_or(SsrfError::InvalidUrl)?;
+        let port = url
+            .port_or_known_default()
+            .filter(|&port| port != 0)
+            .ok_or(SsrfError::InvalidUrl)?;
         Ok((url.scheme(), host, port))
     }
 
@@ -231,6 +234,9 @@ pub fn validate_egress_url(
     if url.fragment().is_some() {
         return Err(SsrfError::FragmentForbidden);
     }
+    if url.port() == Some(0) {
+        return Err(SsrfError::InvalidUrl);
+    }
 
     let literal = match url.host().ok_or(SsrfError::MissingHost)? {
         Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
@@ -285,6 +291,18 @@ mod tests {
                 Ok(false)
             );
         }
+        assert_eq!(
+            egress_url_origin_eq("https://example.com:0/", "https://example.com:0/"),
+            Err(SsrfError::InvalidUrl)
+        );
+        assert_eq!(
+            validate_egress_url(
+                "https://example.com:0/mcp",
+                &EgressPolicy::default(),
+                EgressUrlMode::RequireHttpsByDefault,
+            ),
+            Err(SsrfError::InvalidUrl)
+        );
     }
 
     #[test]

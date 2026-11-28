@@ -57,7 +57,7 @@ fn openapi_covers_the_complete_v1_surface() -> TestResult {
                     && path != "/v1/enrollment/exchange"
                 {
                     assert!(
-                        closed_input(schema, &doc),
+                        closed_input(schema, &doc, &mut BTreeSet::new()),
                         "open input schema for {method} {path}"
                     );
                 }
@@ -163,6 +163,7 @@ fn openapi_preserves_page_items_and_execution_response_types() -> TestResult {
         ("account-bindings", "AccountBindingMetadata"),
         ("executions", "ExecutionMetadata"),
         ("profiles", "ProfileSummary"),
+        ("profiles/{slug}/tools", "DiscoveredProfileTool"),
         ("tools", "ToolSummary"),
         ("upstreams", "UpstreamSummary"),
     ] {
@@ -176,17 +177,60 @@ fn openapi_preserves_page_items_and_execution_response_types() -> TestResult {
         let properties = &schemas[page.as_str()]["properties"];
         assert_eq!(properties["items"]["type"], "array");
         assert!(schemas[item].is_object());
-        assert_eq!(properties["items"]["items"], schemas[item]);
+        assert_eq!(
+            properties["items"]["items"]["$ref"],
+            format!("#/components/schemas/{item}")
+        );
         assert_eq!(
             properties["next_cursor"]["type"],
             serde_json::json!(["string", "null"])
         );
-        let limit = op["parameters"]
-            .as_array()
-            .and_then(|params| params.iter().find(|param| param["name"] == "limit"))
+        let params = op["parameters"].as_array().ok_or("parameters missing")?;
+        let limit = params
+            .iter()
+            .find(|param| param["name"] == "limit")
             .ok_or("page limit is missing")?;
         assert_eq!(limit["schema"]["minimum"], 1);
         assert_eq!(limit["schema"]["maximum"], 200);
+        assert!(
+            params.iter().any(|param| param["name"] == "cursor"),
+            "page cursor is missing for {path}"
+        );
+    }
+
+    assert!(schemas["ExecutionEventPayload"].is_object());
+    let envelope_variants = schemas["EventEnvelope"]["oneOf"]
+        .as_array()
+        .ok_or("EventEnvelope.oneOf missing")?;
+    for variant in &envelope_variants[..4] {
+        assert_eq!(
+            variant["properties"]["payload"]["$ref"],
+            "#/components/schemas/ExecutionEventPayload"
+        );
+    }
+    for (name, schema) in schemas.as_object().ok_or("components.schemas missing")? {
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (field, field_schema) in properties {
+                if field == "version" || field.ends_with("_version") {
+                    let is_integer = field_schema["type"] == "integer"
+                        || field_schema["type"]
+                            .as_array()
+                            .is_some_and(|types| types.iter().any(|t| t == "integer"));
+                    if is_integer {
+                        let expected_min =
+                            if name == "ProfileSummary" && field == "published_version" {
+                                0
+                            } else {
+                                1
+                            };
+                        assert_eq!(
+                            field_schema["minimum"], expected_min,
+                            "unexpected minimum on {name}.{field}: {field_schema}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     for (path, method, status, schema) in [
@@ -226,17 +270,61 @@ fn openapi_preserves_page_items_and_execution_response_types() -> TestResult {
     Ok(())
 }
 
-fn closed_input(schema: &Value, doc: &Value) -> bool {
+fn is_object_schema(schema: &Value) -> bool {
+    schema["type"] == "object"
+        || schema["type"]
+            .as_array()
+            .is_some_and(|types| types.iter().any(|t| t == "object"))
+}
+
+fn closed_input(schema: &Value, doc: &Value, visited: &mut BTreeSet<String>) -> bool {
     if let Some(reference) = schema["$ref"].as_str() {
-        return reference
+        if !visited.insert(reference.to_owned()) {
+            return true;
+        }
+        let ok = reference
             .strip_prefix('#')
             .and_then(|path| doc.pointer(path))
-            .is_some_and(|resolved| closed_input(resolved, doc));
+            .is_some_and(|resolved| closed_input(resolved, doc, visited));
+        visited.remove(reference);
+        return ok;
     }
-    if let Some(variants) = schema["oneOf"].as_array() {
-        return !variants.is_empty() && variants.iter().all(|variant| closed_input(variant, doc));
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        if let Some(variants) = schema[combinator].as_array()
+            && (variants.is_empty()
+                || !variants
+                    .iter()
+                    .all(|variant| closed_input(variant, doc, visited)))
+        {
+            return false;
+        }
     }
-    schema["additionalProperties"] == false
+    if let Some(items) = schema.get("items")
+        && !closed_input(items, doc, visited)
+    {
+        return false;
+    }
+    if is_object_schema(schema) {
+        let is_closed = schema["additionalProperties"] == false;
+        let is_typed_map = schema["additionalProperties"].is_object();
+        if !is_closed && !is_typed_map {
+            return false;
+        }
+        if is_typed_map && !closed_input(&schema["additionalProperties"], doc, visited) {
+            return false;
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, prop) in properties {
+                if matches!(name.as_str(), "arguments" | "input_schema") {
+                    continue;
+                }
+                if !closed_input(prop, doc, visited) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn assert_schema_references(value: &Value, doc: &Value) {

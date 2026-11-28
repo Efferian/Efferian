@@ -304,6 +304,7 @@ fn check_transport_features(name: &str, active: &BTreeSet<String>) -> Result {
             "transport-streamable-http-server",
             "schemars",
         ],
+        "jsonschema" => &[],
         _ => return Ok(()),
     };
     for feature in required {
@@ -322,6 +323,10 @@ fn check_transport_features(name: &str, active: &BTreeSet<String>) -> Result {
                     | "deflate"
                     | "zstd"
                     | "__rustls-ring"
+            ),
+            "jsonschema" => matches!(
+                feature.as_str(),
+                "default" | "resolve-http" | "resolve-file"
             ),
             _ => {
                 matches!(feature.as_str(), "default" | "transport-child-process")
@@ -348,7 +353,7 @@ fn gate_banned_crates() -> Result {
         .iter()
         .map(|n| (&n.id, &n.features))
         .collect();
-    for name in ["reqwest", "rmcp"] {
+    for name in ["reqwest", "rmcp", "jsonschema"] {
         let mut packages = metadata
             .packages
             .iter()

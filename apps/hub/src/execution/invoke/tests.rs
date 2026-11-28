@@ -994,3 +994,158 @@ async fn owner_disable_after_http_auth_preserves_caller_bound_error_scope() -> T
     hub.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn owned_agent_inherits_owner_bindings_upstream_hides_under_allowed_nodes_and_egress_rechecks()
+-> TestResult {
+    let (hub, remote, upstream_id) = caller_bound_fixture().await?;
+    let (owner_id, owner_token) = member(&hub, "owner-bind", None).await?;
+    let agent_id = create_owned_agent(&hub, owner_id).await?;
+    let narrowed_node_token = mint(&hub, agent_id, Some(vec![NodeId::new()])).await?;
+    let agent_token = mint(&hub, agent_id, None).await?;
+
+    let (status, acct) = hub
+        .request(
+            Method::PUT,
+            "/v1/accounts/owner-cred",
+            &owner_token,
+            Some(json!({
+                "upstream_id": upstream_id,
+                "secret": {"kind": "http_auth", "auth": {"kind": "bearer", "token": "inherited-secret"}},
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{acct}");
+    let (status, bind) = hub
+        .request(
+            Method::PUT,
+            "/v1/account-bindings/me/example",
+            &owner_token,
+            Some(json!({"account_slug": "owner-cred"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{bind}");
+
+    // A token narrowed to allowed_nodes cannot see or invoke UpstreamRef targets (404).
+    let (status, hidden) = hub
+        .request(
+            Method::POST,
+            "/v1/profiles/demo/invoke",
+            &narrowed_node_token,
+            Some(json!({"public_name": "remote", "wait_ms": 5000})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+
+    // Owned agent has inherit_owner_bindings=false by default -> 403 inherit_disabled.
+    let (status, disabled_default) = hub
+        .request(
+            Method::POST,
+            "/v1/profiles/demo/invoke",
+            &agent_token,
+            Some(json!({"public_name": "remote", "wait_ms": 5000})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{disabled_default}");
+    assert_eq!(disabled_default["code"], "account_not_bound");
+    assert_eq!(disabled_default["extensions"]["reason"], "inherit_disabled");
+
+    // Enabling inherit_owner_bindings lets the owned agent invoke with the owner's binding.
+    let (status, enabled) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/principals/owned-agent",
+            Some(json!({
+                "kind": "agent",
+                "owner_principal_id": owner_id,
+                "managed_by_principal_id": owner_id,
+                "inherit_owner_bindings": true,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{enabled}");
+    let (status, ok) = hub
+        .request(
+            Method::POST,
+            "/v1/profiles/demo/invoke",
+            &agent_token,
+            Some(json!({"public_name": "remote", "wait_ms": 5000})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{ok}");
+    assert_eq!(ok["state"], "succeeded");
+    assert_eq!(remote.auths.lock().unwrap().len(), 1);
+
+    // Turning off inherit_owner_bindings blocks the agent with account_not_bound.
+    let (status, updated) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/principals/owned-agent",
+            Some(json!({
+                "kind": "agent",
+                "owner_principal_id": owner_id,
+                "managed_by_principal_id": owner_id,
+                "inherit_owner_bindings": false,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    let (status, blocked) = hub
+        .request(
+            Method::POST,
+            "/v1/profiles/demo/invoke",
+            &agent_token,
+            Some(json!({"public_name": "remote", "wait_ms": 5000})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{blocked}");
+    assert_eq!(blocked["code"], "account_not_bound");
+
+    // Re-checking upstream URL against current egress policy rejects a disallowed stored URL
+    // BEFORE reserving an upstream slot or writing an execution row.
+    let uid_str: String = serde_json::from_value(upstream_id)?;
+    hub.write(move |conn| {
+        conn.execute(
+            "UPDATE upstreams SET url = 'http://127.0.0.1:9/mcp' WHERE upstream_id = ?1",
+            [uid_str],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let before: i64 = hub
+        .state
+        .storage
+        .read_snapshot(|conn| {
+            Ok::<_, crate::storage::StorageError>(conn.query_row(
+                "SELECT count(*) FROM executions",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+    let (status, rejected) = hub
+        .request(
+            Method::POST,
+            "/v1/profiles/demo/invoke",
+            &owner_token,
+            Some(json!({"public_name": "remote", "wait_ms": 0})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+    let after: i64 = hub
+        .state
+        .storage
+        .read_snapshot(|conn| {
+            Ok::<_, crate::storage::StorageError>(conn.query_row(
+                "SELECT count(*) FROM executions",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(before, after);
+    assert_eq!(remote.auths.lock().unwrap().len(), 1);
+
+    hub.shutdown().await;
+    Ok(())
+}

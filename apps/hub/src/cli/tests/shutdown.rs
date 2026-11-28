@@ -103,13 +103,10 @@ impl UpstreamDispatcher for UpstreamFixture {
         mut cancellation: UpstreamCancellation,
     ) -> DispatchFuture<'_, Result<Bytes, UpstreamDispatchError>> {
         Box::pin(async move {
-            if cancellation
-                .start_io(|| eprintln!("fixture upstream started {}", request.execution_id))
-                .await
-                .is_none()
-            {
+            if cancellation.is_cancelled() {
                 return Err(UpstreamDispatchError::Disconnected);
             }
+            eprintln!("fixture upstream started {}", request.execution_id);
             cancellation.cancelled().await;
             eprintln!("fixture upstream cancelled {}", request.execution_id);
             Err(UpstreamDispatchError::Disconnected)
@@ -642,7 +639,49 @@ async fn exercise_supervisor(signal: Option<&str>) -> TestResult {
             1
         );
     }
-    check_durable_shutdown(&directory, ids, fatal)
+    check_durable_shutdown(&directory, ids, fatal)?;
+    if fatal {
+        // Restarting after a fatal writer failure must settle orphaned running
+        // upstream executions as unknown/hub_restarted while leaving node work accepted.
+        let config = Config::default();
+        let clock: Arc<dyn StorageClock> = Arc::new(SystemStorageClock::new()?);
+        let (opened, _) = operations::open_existing(
+            &directory,
+            OpenMode::ServeAutoMigrate,
+            &config.storage_config(),
+            Arc::clone(&clock),
+        )?;
+        let (storage, runtime) = opened.migrate_and_start_runtime()?;
+        crate::execution::state::recover_upstreams(&storage).await?;
+        let (managed_state, upstream_row) = storage
+            .read_snapshot(move |conn| {
+                let managed: String = conn.query_row(
+                    "SELECT state FROM executions WHERE execution_id = ?1",
+                    [ids[0].to_string()],
+                    |row| row.get(0),
+                )?;
+                let upstream: (String, Option<String>, Option<bool>) = conn.query_row(
+                    "SELECT state, json_extract(summary_json, '$.error_code'),
+                            json_extract(summary_json, '$.effect_may_have_occurred')
+                     FROM executions WHERE execution_id = ?1",
+                    [ids[1].to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                Ok::<_, StorageError>((managed, upstream))
+            })
+            .await?;
+        assert_eq!(managed_state, "accepted");
+        assert_eq!(
+            upstream_row,
+            (
+                "unknown".to_owned(),
+                Some("hub_restarted".to_owned()),
+                Some(true)
+            )
+        );
+        assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    }
+    Ok(())
 }
 
 #[tokio::test]

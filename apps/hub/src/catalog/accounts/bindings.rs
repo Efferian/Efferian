@@ -7,7 +7,7 @@ use efferian_authz::{
     authorize_binding_read, authorize_subject_metadata_read,
 };
 use efferian_protocol::{
-    AccountId, AccountVisibility, PrincipalId, ProblemDetails, ProfileId, UpstreamId,
+    AccountId, AccountVisibility, PrincipalId, PrincipalKind, ProblemDetails, ProfileId, UpstreamId,
 };
 use http::StatusCode;
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -23,8 +23,10 @@ use crate::http::{
     ApiCaller, ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, AppState, EmptyBody, Page,
     checked_page_limit,
 };
-use crate::principals::introspection::caller_bound_upstreams;
-use crate::storage::{id, read_principal};
+use crate::principals::introspection::{
+    caller_bound_profiles_for_upstream, caller_bound_upstreams,
+};
+use crate::storage::{id, inheriting_agents, json, opt_id, read_principal, scalar};
 use crate::upstream_dispatch::UpstreamInvalidation;
 use crate::vault::auth::refresh_api;
 
@@ -142,65 +144,174 @@ fn list_visible_bindings(
     let visible = if admin {
         Vec::new()
     } else {
-        caller_bound_upstreams(conn, ctx)?
+        let visible = caller_bound_upstreams(conn, ctx)?;
+        if visible.is_empty() {
+            return Ok(Vec::new());
+        }
+        visible
     };
-    let upstream_ids = visible
-        .iter()
-        .map(|value| value.upstream_id)
-        .collect::<Vec<_>>();
-    let upstreams = serde_json::to_string(&upstream_ids).map_err(|_| ApiError::internal())?;
     let (after_principal, after_upstream) = cursor.map_or_else(
         || (String::new(), String::new()),
         |(principal, upstream)| (principal.to_string(), upstream.to_string()),
     );
-    let mut stmt = conn.prepare_cached(
-        "SELECT b.principal_id, b.upstream_id, u.slug, b.account_id, a.slug, b.created_at_ms
-         FROM account_bindings b
-         JOIN principals p ON p.principal_id = b.principal_id
-         JOIN upstreams u ON u.upstream_id = b.upstream_id
-         JOIN accounts a ON a.account_id = b.account_id
-         JOIN hub_meta h ON h.id = 1
-         WHERE b.principal_id IS NOT h.gc_purging_principal_id
-           AND a.owner_principal_id IS NOT h.gc_purging_principal_id
-           AND (b.principal_id, b.upstream_id) > (?1, ?2)
-           AND (?3 IS NULL OR b.principal_id = ?3)
-           AND (?4 IS NULL OR b.upstream_id = ?4)
-           AND (?5 OR (
-                 b.upstream_id IN (SELECT value FROM json_each(?6))
-                 AND (b.principal_id = ?7 OR (p.kind = 'agent' AND p.owner_principal_id = ?7))
-               ))
-         ORDER BY b.principal_id COLLATE BINARY, b.upstream_id COLLATE BINARY",
-    )?;
-    let mut rows = stmt.query(params![
-        after_principal,
-        after_upstream,
-        query.principal_id.map(|value| value.to_string()),
-        query.upstream_id.map(|value| value.to_string()),
-        admin,
-        upstreams,
-        ctx.caller.principal_id.to_string(),
-    ])?;
-    let mut result = Vec::with_capacity(limit + 1);
-    while let Some(row) = rows.next()? {
-        let binding = binding_row(row)?;
-        let Some(subject) = read_principal(conn, binding.principal_id)? else {
-            continue;
-        };
-        let upstream = BindingUpstream {
-            upstream_id: binding.upstream_id,
-            caller_bound_profiles: visible
-                .iter()
-                .find(|entry| entry.upstream_id == binding.upstream_id)
-                .map_or(&[], |entry| entry.caller_bound_profiles.as_slice()),
-        };
-        if authorize_binding_read(ctx, Some(upstream), &subject, &binding.view()).is_ok() {
-            result.push(binding);
-            if result.len() > limit {
-                break;
+    let collect_rows = |rows: &mut rusqlite::Rows<'_>| -> ApiResult<Vec<AccountBindingMetadata>> {
+        let mut result = Vec::with_capacity(limit + 1);
+        while let Some(row) = rows.next()? {
+            let binding = binding_row(row)?;
+            let subject = joined_principal_view(row)?;
+            let upstream = BindingUpstream {
+                upstream_id: binding.upstream_id,
+                caller_bound_profiles: visible
+                    .iter()
+                    .find(|entry| entry.upstream_id == binding.upstream_id)
+                    .map_or(&[], |entry| entry.caller_bound_profiles.as_slice()),
+            };
+            if authorize_binding_read(ctx, Some(upstream), &subject, &binding.view()).is_ok() {
+                result.push(binding);
+                if result.len() > limit {
+                    break;
+                }
             }
         }
+        Ok(result)
+    };
+    const SELECT_FIELDS: &str = "b.principal_id, b.upstream_id, u.slug, b.account_id, a.slug, b.created_at_ms, \
+         p.kind, p.owner_principal_id, p.managed_by_principal_id, p.inherit_owner_bindings, \
+         p.is_orchestrator, p.allowed_node_tags_json, p.observe_executions, p.disabled_at_ms";
+    if !admin {
+        let upstream_ids = visible
+            .iter()
+            .map(|value| value.upstream_id)
+            .collect::<Vec<_>>();
+        let upstreams = serde_json::to_string(&upstream_ids).map_err(|_| ApiError::internal())?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "WITH subjects(id) AS (
+                 SELECT ?5 WHERE ?3 IS NULL OR ?3 = ?5
+                 UNION ALL
+                 SELECT principal_id FROM principals
+                 WHERE kind = 'agent' AND owner_principal_id = ?5
+                   AND (?3 IS NULL OR principal_id = ?3)
+             )
+             SELECT {SELECT_FIELDS}
+             FROM subjects s
+             JOIN account_bindings b ON b.principal_id = s.id
+             JOIN principals p ON p.principal_id = b.principal_id
+             JOIN upstreams u ON u.upstream_id = b.upstream_id
+             JOIN accounts a ON a.account_id = b.account_id
+             JOIN hub_meta h ON h.id = 1
+             WHERE b.principal_id IS NOT h.gc_purging_principal_id
+               AND a.owner_principal_id IS NOT h.gc_purging_principal_id
+               AND (b.principal_id, b.upstream_id) > (?1, ?2)
+               AND (?4 IS NULL OR b.upstream_id = ?4)
+               AND b.upstream_id IN (SELECT value FROM json_each(?6))
+             ORDER BY b.principal_id COLLATE BINARY, b.upstream_id COLLATE BINARY"
+        ))?;
+        let mut rows = stmt.query(params![
+            after_principal,
+            after_upstream,
+            query.principal_id.map(|value| value.to_string()),
+            query.upstream_id.map(|value| value.to_string()),
+            ctx.caller.principal_id.to_string(),
+            upstreams,
+        ])?;
+        return collect_rows(&mut rows);
     }
-    Ok(result)
+    match (query.principal_id, query.upstream_id) {
+        (Some(principal), Some(upstream)) => {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {SELECT_FIELDS}
+                 FROM account_bindings b
+                 JOIN principals p ON p.principal_id = b.principal_id
+                 JOIN upstreams u ON u.upstream_id = b.upstream_id
+                 JOIN accounts a ON a.account_id = b.account_id
+                 JOIN hub_meta h ON h.id = 1
+                 WHERE b.principal_id = ?3 AND b.upstream_id = ?4
+                   AND b.principal_id IS NOT h.gc_purging_principal_id
+                   AND a.owner_principal_id IS NOT h.gc_purging_principal_id
+                   AND (b.principal_id, b.upstream_id) > (?1, ?2)
+                 ORDER BY b.principal_id COLLATE BINARY, b.upstream_id COLLATE BINARY"
+            ))?;
+            let mut rows = stmt.query(params![
+                after_principal,
+                after_upstream,
+                principal.to_string(),
+                upstream.to_string(),
+            ])?;
+            collect_rows(&mut rows)
+        }
+        (Some(principal), None) => {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {SELECT_FIELDS}
+                 FROM account_bindings b
+                 JOIN principals p ON p.principal_id = b.principal_id
+                 JOIN upstreams u ON u.upstream_id = b.upstream_id
+                 JOIN accounts a ON a.account_id = b.account_id
+                 JOIN hub_meta h ON h.id = 1
+                 WHERE b.principal_id = ?3
+                   AND b.principal_id IS NOT h.gc_purging_principal_id
+                   AND a.owner_principal_id IS NOT h.gc_purging_principal_id
+                   AND (b.principal_id, b.upstream_id) > (?1, ?2)
+                 ORDER BY b.principal_id COLLATE BINARY, b.upstream_id COLLATE BINARY"
+            ))?;
+            let mut rows = stmt.query(params![
+                after_principal,
+                after_upstream,
+                principal.to_string(),
+            ])?;
+            collect_rows(&mut rows)
+        }
+        (None, Some(upstream)) => {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {SELECT_FIELDS}
+                 FROM account_bindings b
+                 JOIN principals p ON p.principal_id = b.principal_id
+                 JOIN upstreams u ON u.upstream_id = b.upstream_id
+                 JOIN accounts a ON a.account_id = b.account_id
+                 JOIN hub_meta h ON h.id = 1
+                 WHERE b.upstream_id = ?3
+                   AND b.principal_id IS NOT h.gc_purging_principal_id
+                   AND a.owner_principal_id IS NOT h.gc_purging_principal_id
+                   AND (b.principal_id, b.upstream_id) > (?1, ?2)
+                 ORDER BY b.principal_id COLLATE BINARY, b.upstream_id COLLATE BINARY"
+            ))?;
+            let mut rows = stmt.query(params![
+                after_principal,
+                after_upstream,
+                upstream.to_string(),
+            ])?;
+            collect_rows(&mut rows)
+        }
+        (None, None) => {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {SELECT_FIELDS}
+                 FROM account_bindings b
+                 JOIN principals p ON p.principal_id = b.principal_id
+                 JOIN upstreams u ON u.upstream_id = b.upstream_id
+                 JOIN accounts a ON a.account_id = b.account_id
+                 JOIN hub_meta h ON h.id = 1
+                 WHERE b.principal_id IS NOT h.gc_purging_principal_id
+                   AND a.owner_principal_id IS NOT h.gc_purging_principal_id
+                   AND (b.principal_id, b.upstream_id) > (?1, ?2)
+                 ORDER BY b.principal_id COLLATE BINARY, b.upstream_id COLLATE BINARY"
+            ))?;
+            let mut rows = stmt.query(params![after_principal, after_upstream])?;
+            collect_rows(&mut rows)
+        }
+    }
+}
+
+fn joined_principal_view(row: &Row<'_>) -> rusqlite::Result<PrincipalView> {
+    Ok(PrincipalView {
+        principal_id: id(row, 0)?,
+        kind: scalar::<PrincipalKind>(row, 6)?,
+        owner_principal_id: opt_id(row, 7)?,
+        managed_by_principal_id: opt_id(row, 8)?,
+        inherit_owner_bindings: row.get::<_, i64>(9)? != 0,
+        is_orchestrator: row.get::<_, i64>(10)? != 0,
+        allowed_node_tags: json(row, 11)?,
+        observe_executions: row.get::<_, i64>(12)? != 0,
+        disabled_at_ms: row.get(13)?,
+    })
 }
 
 #[utoipa::path(
@@ -224,6 +335,9 @@ async fn put(
     ApiJson(request): ApiJson<AccountBindingPut>,
 ) -> ApiResult<(StatusCode, Json<AccountBindingPutResponse>)> {
     check_slug(&upstream_slug)?;
+    if let AccountBindingPut::Slug(query) = &request {
+        check_slug(&query.account_slug)?;
+    }
     let principal_id = parse_subject(&principal, caller.principal_id)?;
     let dispatcher = state.upstream;
     let response = state
@@ -260,7 +374,19 @@ async fn put(
                  ON CONFLICT(principal_id, upstream_id) DO UPDATE SET account_id = excluded.account_id",
                 params![principal_id.to_string(), upstream_id.to_string(), account.account_id.to_string(), now],
             )?;
-            tx.on_commit(move || dispatcher.invalidate(UpstreamInvalidation::Binding { principal_id, upstream_id }));
+            let affected_children = inheriting_agents(conn, principal_id)?;
+            tx.on_commit(move || {
+                dispatcher.invalidate(UpstreamInvalidation::Binding {
+                    principal_id,
+                    upstream_id,
+                });
+                for child in affected_children {
+                    dispatcher.invalidate(UpstreamInvalidation::Binding {
+                        principal_id: child,
+                        upstream_id,
+                    });
+                }
+            });
             Ok(AccountBindingPutResponse {
                 outcome,
                 binding: AccountBindingMetadata {
@@ -317,11 +443,18 @@ async fn delete(
                 "DELETE FROM account_bindings WHERE principal_id = ?1 AND upstream_id = ?2",
                 params![principal_id.to_string(), upstream_id.to_string()],
             )?;
+            let affected_children = inheriting_agents(conn, principal_id)?;
             tx.on_commit(move || {
                 dispatcher.invalidate(UpstreamInvalidation::Binding {
                     principal_id,
                     upstream_id,
-                })
+                });
+                for child in affected_children {
+                    dispatcher.invalidate(UpstreamInvalidation::Binding {
+                        principal_id: child,
+                        upstream_id,
+                    });
+                }
             });
             Ok(())
         })
@@ -379,10 +512,10 @@ fn request_account(
     admin: bool,
     request: AccountBindingPut,
 ) -> ApiResult<AccountMetadata> {
+    let is_slug = matches!(request, AccountBindingPut::Slug(_));
     let account = match request {
         AccountBindingPut::Id(query) => account_by_id(conn, query.account_id)?,
         AccountBindingPut::Slug(query) => {
-            check_slug(&query.account_slug)?;
             let (_, scope) = account_scope(
                 conn,
                 ctx,
@@ -396,7 +529,7 @@ fn request_account(
         }
     };
     let account = account.ok_or_else(|| {
-        if admin {
+        if admin || is_slug {
             ApiError::not_found()
         } else {
             ApiError::forbidden()
@@ -420,8 +553,8 @@ pub(super) fn ensure_visible_upstream(
             .query_row([upstream.to_string()], |row| row.get::<_, i64>(0))
             .optional()?
             .ok_or_else(ApiError::not_found)?;
-    } else {
-        caller_bound_evidence(conn, ctx, upstream)?;
+    } else if caller_bound_profiles_for_upstream(conn, ctx, upstream, true)?.is_empty() {
+        return Err(ApiError::not_found());
     }
     Ok(())
 }
@@ -440,21 +573,13 @@ fn binding_upstream(
     let profiles = if admin {
         Vec::new()
     } else {
-        caller_bound_evidence(conn, ctx, upstream)?
+        let profiles = caller_bound_profiles_for_upstream(conn, ctx, upstream, false)?;
+        if profiles.is_empty() {
+            return Err(ApiError::not_found());
+        }
+        profiles
     };
     Ok((upstream, profiles))
-}
-
-fn caller_bound_evidence(
-    conn: &Connection,
-    ctx: &AuthContext,
-    upstream_id: UpstreamId,
-) -> ApiResult<Vec<ProfileId>> {
-    caller_bound_upstreams(conn, ctx)?
-        .into_iter()
-        .find(|entry| entry.upstream_id == upstream_id)
-        .map(|entry| entry.caller_bound_profiles)
-        .ok_or_else(ApiError::not_found)
 }
 
 fn binding_at(

@@ -11,8 +11,9 @@ use efferian_authz::{
     AuthContext, ExecutionAccess, authorize_execution_access, can_read_sensitive_result,
 };
 use efferian_protocol::{
-    CancelReqPayload, ExecutionId, ExecutionSummary, ExecutorKind, ProblemDetails,
+    CancelReqPayload, ExecutionId, ExecutionSummary, ExecutorKind, MAX_WAIT_MS, ProblemDetails,
 };
+use http::header::CONTENT_TYPE;
 use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -49,19 +50,17 @@ pub(super) fn routes() -> RouteGroups {
     }
 }
 
-const MAX_WAIT_MS: u64 = 25_000;
-
-pub(crate) fn checked_wait_ms(wait_ms: u64) -> ApiResult<u64> {
+pub(crate) fn checked_wait_ms(wait_ms: u32) -> ApiResult<u64> {
     if wait_ms > MAX_WAIT_MS {
         return Err(ApiError::bad_input());
     }
-    Ok(wait_ms)
+    Ok(u64::from(wait_ms))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionReadQuery {
-    wait_ms: Option<u64>,
+    wait_ms: Option<u32>,
     #[serde(default)]
     sensitive: bool,
 }
@@ -102,7 +101,7 @@ async fn list_executions(
     get, path = "/v1/executions/{id}", tag = "Executions",
     params(
         ("id" = ExecutionId, Path, description = "Execution ID"),
-        ("wait_ms" = Option<u64>, Query, minimum = 0, maximum = 25000, description = "Maximum wait for terminal state, defaults to zero"),
+        ("wait_ms" = Option<u32>, Query, minimum = 0, maximum = 25000, description = "Maximum wait for terminal state, defaults to zero"),
         ("sensitive" = Option<bool>, Query, description = "Request authorized execution output, defaults to false"),
     ),
     security(("api_bearer" = [])),
@@ -116,14 +115,26 @@ async fn get_execution(
     caller: ApiCaller,
     ApiPath(id): ApiPath<ExecutionId>,
     ApiQuery(query): ApiQuery<ExecutionReadQuery>,
-) -> ApiResult<Json<ExecutionDetail>> {
+) -> ApiResult<Response> {
     let wait_ms = checked_wait_ms(query.wait_ms.unwrap_or_default())?;
+    let detail = read_execution_detail(&state, caller, id, wait_ms, query.sensitive).await?;
+    detail_json_response(detail).await
+}
+
+/// Typed read seam for REST and in-process gateways (`#8`).
+pub(crate) async fn read_execution_detail(
+    state: &AppState,
+    caller: ApiCaller,
+    id: ExecutionId,
+    wait_ms: u64,
+    sensitive: bool,
+) -> ApiResult<ExecutionDetail> {
     if wait_ms != 0 {
         let revocations = state.storage.subscribe_revocations()?;
-        wait_if_active(&state, &caller, id, None, wait_ms, revocations).await?;
+        wait_if_active(state, &caller, id, None, wait_ms, revocations, None).await?;
     }
-    let (_, view) = read_view(&state, caller, id, Sensitive::Requested(query.sensitive)).await?;
-    Ok(Json(render_detail(&state, view).await?))
+    let (_, view) = read_view(state, caller, id, Sensitive::Requested(sensitive)).await?;
+    render_detail(state, view).await
 }
 
 #[utoipa::path(
@@ -142,6 +153,21 @@ async fn cancel_execution(
     ApiPath(id): ApiPath<ExecutionId>,
     _: EmptyBody,
 ) -> ApiResult<Response> {
+    let (terminal, metadata) = cancel_execution_row(&state, caller, id).await?;
+    let status = if terminal {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(metadata)).into_response())
+}
+
+/// Typed cancel seam for REST and in-process gateways (`#8`).
+pub(crate) async fn cancel_execution_row(
+    state: &AppState,
+    caller: ApiCaller,
+    id: ExecutionId,
+) -> ApiResult<(bool, ExecutionMetadata)> {
     let bridge = Arc::clone(&state.bridge);
     let upstream = Arc::clone(&state.upstream);
     let execution = Arc::clone(&state.execution);
@@ -185,12 +211,7 @@ async fn cancel_execution(
             ))
         })
         .await?;
-    let status = if row.fields.state.is_terminal() {
-        StatusCode::OK
-    } else {
-        StatusCode::ACCEPTED
-    };
-    Ok((status, Json(row.metadata())).into_response())
+    Ok((row.fields.state.is_terminal(), row.metadata()))
 }
 
 pub(crate) async fn invocation_response(
@@ -199,6 +220,7 @@ pub(crate) async fn invocation_response(
     outcome: InvokeOutcome,
     wait_ms: u64,
     revocations: RevocationWatch,
+    preloaded_context: Option<AuthContext>,
 ) -> ApiResult<Response> {
     let id = outcome.execution_id;
     let current = outcome
@@ -206,13 +228,34 @@ pub(crate) async fn invocation_response(
         .as_ref()
         .map_or(outcome.snapshot, |rx| *rx.borrow());
     if wait_ms != 0 && !current.state.is_terminal() {
-        wait_if_active(state, &caller, id, outcome.waiter, wait_ms, revocations).await?;
+        wait_if_active(
+            state,
+            &caller,
+            id,
+            outcome.waiter,
+            wait_ms,
+            revocations,
+            preloaded_context,
+        )
+        .await?;
     }
     let (_, view) = read_view(state, caller, id, Sensitive::IfTerminal).await?;
     if view.row.fields.state.is_terminal() {
-        Ok(Json(render_detail(state, view).await?).into_response())
+        detail_json_response(render_detail(state, view).await?).await
     } else {
         Ok((StatusCode::ACCEPTED, Json(view.row.metadata())).into_response())
+    }
+}
+
+async fn detail_json_response(detail: ExecutionDetail) -> ApiResult<Response> {
+    if detail.result.is_some() {
+        let bytes = tokio::task::spawn_blocking(move || serde_json::to_vec(&detail))
+            .await
+            .map_err(|_| ApiError::internal())?
+            .map_err(|_| ApiError::internal())?;
+        Ok((StatusCode::OK, [(CONTENT_TYPE, "application/json")], bytes).into_response())
+    } else {
+        Ok(Json(detail).into_response())
     }
 }
 
@@ -223,14 +266,22 @@ async fn wait_if_active(
     receiver: Option<watch::Receiver<ExecutionSnapshot>>,
     wait_ms: u64,
     mut revocations: RevocationWatch,
+    preloaded_context: Option<AuthContext>,
 ) -> ApiResult<()> {
     let Some(_permit) = state.execution.reserve_waiter(caller.0.principal_id) else {
         return Ok(());
     };
-    let (ctx, view) = read_view(state, caller.clone(), id, Sensitive::Requested(false)).await?;
-    if view.row.fields.state.is_terminal() {
-        return Ok(());
-    }
+    let ctx = match preloaded_context {
+        Some(ctx) if receiver.is_some() => ctx,
+        _ => {
+            let (ctx, view) =
+                read_view(state, caller.clone(), id, Sensitive::Requested(false)).await?;
+            if view.row.fields.state.is_terminal() {
+                return Ok(());
+            }
+            ctx
+        }
+    };
     let mut shutdown = state.execution.shutdown_receiver();
     let until = ctx.token.expires_at_ms.map_or(wait_ms, |expiry| {
         wait_ms.min(expiry.saturating_sub(state.clock.wall_now_ms()).max(0) as u64)

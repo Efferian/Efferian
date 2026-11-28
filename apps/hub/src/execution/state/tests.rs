@@ -12,7 +12,7 @@ use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::execution::results::apply_node_result;
+use crate::execution::results::{NodeReceiptError, apply_node_result};
 use crate::node_bridge::{
     BridgeCloseReason, NodeDispatcher, NodeLiveStatus, NodeSendError, ReadyNode,
 };
@@ -259,7 +259,14 @@ async fn managed_receipts_use_current_epoch_and_hub_clock_and_keep_full_output_u
     })
     .await?;
     assert_eq!(
-        apply_node_result(&hub.state, node.id, 1, receipt(nul)).await?,
+        apply_node_result(
+            &hub.state.storage,
+            &hub.state.vault,
+            node.id,
+            1,
+            receipt(nul)
+        )
+        .await?,
         ReceiptOutcome::NotOwnedOrNotFound,
     );
     assert_eq!(get(&hub, nul, "").await?["state"], "running");
@@ -270,7 +277,7 @@ async fn managed_receipts_use_current_epoch_and_hub_clock_and_keep_full_output_u
     big.error_message = Some("sensitive diagnostic".to_owned());
     hub.clock.set(now + 20);
     assert_eq!(
-        apply_node_result(&hub.state, node.id, 2, big).await?,
+        apply_node_result(&hub.state.storage, &hub.state.vault, node.id, 2, big).await?,
         ReceiptOutcome::AppliedTerminal
     );
     let no_result = get(&hub, nul, "").await?;
@@ -302,14 +309,13 @@ async fn managed_receipts_use_current_epoch_and_hub_clock_and_keep_full_output_u
     invalid.truncated = true;
     let mut oversized = invalid.clone();
     oversized.stderr_b64 = Some("rP8A".to_owned());
-    assert!(
-        apply_node_result(&hub.state, node.id, 2, oversized)
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        apply_node_result(&hub.state.storage, &hub.state.vault, node.id, 2, oversized).await,
+        Err(NodeReceiptError::InvalidPayload)
+    ));
     assert_eq!(blob_lengths(&hub, invalid_utf8).await?, (0, None));
     assert_eq!(
-        apply_node_result(&hub.state, node.id, 2, invalid).await?,
+        apply_node_result(&hub.state.storage, &hub.state.vault, node.id, 2, invalid).await?,
         ReceiptOutcome::AppliedTerminal
     );
     let view = get(&hub, invalid_utf8, "?sensitive=true").await?;
@@ -335,7 +341,7 @@ async fn managed_receipts_use_current_epoch_and_hub_clock_and_keep_full_output_u
                 Some(efferian_protocol::OutputDiscardedReason::RamCap);
         }
         assert_eq!(
-            apply_node_result(&hub.state, node.id, 2, payload).await?,
+            apply_node_result(&hub.state.storage, &hub.state.vault, node.id, 2, payload).await?,
             ReceiptOutcome::AppliedTerminal
         );
         let view = get(&hub, empty, "?sensitive=true").await?;
@@ -584,7 +590,7 @@ async fn node_cancel_uses_current_epoch_and_waiter_cap_returns_immediate_metadat
     let mut result = receipt(execution);
     result.state = TerminalExecutionState::Cancelled;
     assert_eq!(
-        apply_node_result(&hub.state, node.id, 2, result).await?,
+        apply_node_result(&hub.state.storage, &hub.state.vault, node.id, 2, result).await?,
         ReceiptOutcome::AppliedTerminal
     );
     let (status, view) = tokio::time::timeout(Duration::from_secs(3), first).await???;
@@ -616,15 +622,29 @@ async fn deadline_is_irreversible_and_current_epoch_records_only_one_late_receip
     let mut late = receipt(execution);
     late.stdout_b64 = Some("YQ==".to_owned());
     assert_eq!(
-        apply_node_result(&hub.state, node.id, 0, late.clone()).await?,
+        apply_node_result(
+            &hub.state.storage,
+            &hub.state.vault,
+            node.id,
+            0,
+            late.clone()
+        )
+        .await?,
         ReceiptOutcome::NotOwnedOrNotFound
     );
     assert_eq!(
-        apply_node_result(&hub.state, node.id, 1, late.clone()).await?,
+        apply_node_result(
+            &hub.state.storage,
+            &hub.state.vault,
+            node.id,
+            1,
+            late.clone()
+        )
+        .await?,
         ReceiptOutcome::LateReceiptRecorded
     );
     assert_eq!(
-        apply_node_result(&hub.state, node.id, 1, late).await?,
+        apply_node_result(&hub.state.storage, &hub.state.vault, node.id, 1, late).await?,
         ReceiptOutcome::AlreadyTerminalOwned
     );
     let event = events.recv().await?;
@@ -721,6 +741,7 @@ async fn upstream_completion_retries_writes_and_cannot_replace_a_committed_cance
                     executor: ExecutionTarget::Upstream(upstream_id),
                     account_id: None,
                     deadline_at_ms: now + 90_000,
+                    resolved_binding: None,
                 })?;
                 Ok((inserted, reservation))
             })
@@ -1022,7 +1043,7 @@ async fn execution_list_scopes_before_limit_and_withheld_reads_skip_vault() -> T
     terminal.stdout_b64 = Some("YQ==".to_owned());
     terminal.error_message = Some("sensitive fixture".to_owned());
     assert_eq!(
-        apply_node_result(&hub.state, node.id, 1, terminal).await?,
+        apply_node_result(&hub.state.storage, &hub.state.vault, node.id, 1, terminal).await?,
         ReceiptOutcome::AppliedTerminal
     );
     let execution = own[0];
@@ -1041,6 +1062,77 @@ async fn execution_list_scopes_before_limit_and_withheld_reads_skip_vault() -> T
     assert!(visible["summary"].get("error_message").is_none());
     let (status, _) = hub.request_admin(Method::GET, &read, None).await?;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn waiter_wakes_immediately_on_token_revocation_and_expiry() -> TestResult {
+    let (hub, _, now) = start_managed().await?;
+    let execution = start_node_execution(&hub, "small").await?;
+
+    // 1. Revoking the waiting caller's token wakes the long-poll and returns 401.
+    let (status, minted) = hub
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({"principal_id": hub.admin_id, "label": "revocable-waiter"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{minted}");
+    let token_id = minted["token_id"].as_str().ok_or("missing token_id")?;
+    let token = minted["token"].as_str().ok_or("missing token")?.to_owned();
+    let router = hub.router.clone();
+    let waiting = tokio::spawn(async move {
+        crate::test_support::send_json(
+            &router,
+            Method::GET,
+            &format!("/v1/executions/{execution}?wait_ms=25000"),
+            &token,
+            None,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while hub.state.execution.active_waiter_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let (status, _) = hub
+        .request_admin(Method::POST, &format!("/v1/tokens/{token_id}/revoke"), None)
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, problem) = tokio::time::timeout(Duration::from_secs(3), waiting).await???;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{problem}");
+
+    // 2. Expiring token caps wait_ms and wakes promptly without waiting the full 25s.
+    let (status, short_lived) = hub
+        .request_admin(
+            Method::POST,
+            "/v1/tokens",
+            Some(json!({
+                "principal_id": hub.admin_id,
+                "label": "expiring-waiter",
+                "expires_at_ms": now + 60,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{short_lived}");
+    let short_token = short_lived["token"].as_str().ok_or("missing token")?;
+    let (status, response) = tokio::time::timeout(
+        Duration::from_secs(3),
+        hub.request(
+            Method::GET,
+            &format!("/v1/executions/{execution}?wait_ms=25000"),
+            short_token,
+            None,
+        ),
+    )
+    .await??;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["state"], "accepted");
+
     hub.shutdown().await;
     Ok(())
 }

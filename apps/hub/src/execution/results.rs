@@ -14,8 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::http::{ApiError, ApiResult, AppState};
 use crate::storage::{
-    PreparedOutcome, ReceiptOutcome, ReceiptWrite, StorageError, WriteError, id, optional_json,
-    scalar,
+    PreparedOutcome, ReceiptOutcome, ReceiptWrite, StorageError, StorageHandle, WriteError, id,
+    optional_json, scalar,
 };
 use crate::upstream_dispatch::{InvokeUpstream, UpstreamDispatchError};
 use crate::vault::{ExecutionAad, Vault};
@@ -29,27 +29,57 @@ const MAX_MANAGED_TEXT_BYTES: usize = 3 * MAX_OUTPUT_BYTES as usize;
 const MAX_UPSTREAM_BYTES: usize = 2 * 1024 * 1024;
 const OFFLOAD_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_COMMIT_RETRIES: u8 = 4;
-const TERMINAL_RETRY_DELAY: Duration = Duration::from_millis(25);
+const TERMINAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const TERMINAL_RETRY_MAX_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, thiserror::Error)]
 #[error("invalid stored execution result")]
 struct InvalidResult;
 
+/// Typed errors for the in-process node bridge receipt seam (`#7`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[allow(dead_code, reason = "classified receipt errors for the node bridge")]
+pub(crate) enum NodeReceiptError {
+    #[error("node receipt payload violates protocol limits or invariants")]
+    InvalidPayload,
+    #[error("storage queue is overloaded")]
+    Overloaded,
+    #[error("receipt commit aborted or outcome unknown; caller may retry")]
+    RetryableCommit,
+    #[error("hub storage is shutting down")]
+    ShuttingDown,
+    #[error("hub storage actor has stopped")]
+    ActorStopped,
+    #[error("internal storage or vault failure")]
+    Internal,
+}
+
+impl From<StorageError> for NodeReceiptError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::Overloaded => Self::Overloaded,
+            StorageError::ShuttingDown => Self::ShuttingDown,
+            StorageError::ActorStopped => Self::ActorStopped,
+            _ => Self::Internal,
+        }
+    }
+}
+
 /// Seal a managed result using its original revision and the writer's
 /// current-session fence.
 #[allow(dead_code, reason = "managed result seam for the node bridge")]
 pub(crate) async fn apply_node_result(
-    state: &AppState,
+    storage: &StorageHandle,
+    vault: &Arc<Vault>,
     node_id: NodeId,
     frame_epoch: u64,
     payload: ExecuteResPayload,
-) -> ApiResult<ReceiptOutcome> {
+) -> Result<ReceiptOutcome, NodeReceiptError> {
     let execution_id = payload.execution_id;
     let Ok(sql_epoch) = i64::try_from(frame_epoch) else {
         return Ok(ReceiptOutcome::NotOwnedOrNotFound);
     };
-    let target = state
-        .storage
+    let target = storage
         .read_snapshot(move |conn| {
             let record = conn
                 .prepare_cached(
@@ -80,15 +110,17 @@ pub(crate) async fn apply_node_result(
         definition
             .spec
             .max_output_bytes()
-            .ok_or_else(ApiError::internal)?
+            .ok_or(NodeReceiptError::Internal)?
     } else if state_before.is_terminal() {
         // Terminal rows do not pin revisions. A late receipt can record metadata
         // but can never replace the settled terminal payload.
         MAX_OUTPUT_BYTES
     } else {
-        return Err(ApiError::internal());
+        return Err(NodeReceiptError::Internal);
     };
-    let summary = payload.summary(None).map_err(|_| ApiError::bad_input())?;
+    let summary = payload
+        .summary(None)
+        .map_err(|_| NodeReceiptError::InvalidPayload)?;
     let terminal_state = payload.state;
     let result_truncated = payload.truncated;
     let prepared_result =
@@ -98,12 +130,16 @@ pub(crate) async fn apply_node_result(
             execution_id,
             caller_principal_id,
         };
-        Some(state.vault.seal_execution_async(aad, plaintext).await?)
+        Some(
+            vault
+                .seal_execution_async(aad, plaintext)
+                .await
+                .map_err(|_| NodeReceiptError::Internal)?,
+        )
     } else {
         None
     };
-    state
-        .storage
+    storage
         .apply_receipt(ReceiptWrite {
             execution_id,
             node_id,
@@ -115,9 +151,11 @@ pub(crate) async fn apply_node_result(
         })
         .await
         .map_err(|error| match error {
-            WriteError::Domain(_) => ApiError::bad_input(),
+            WriteError::Domain(_) => NodeReceiptError::InvalidPayload,
             WriteError::Storage(error) => error.into(),
-            WriteError::PreCommitAborted | WriteError::CommitOutcomeUnknown => ApiError::internal(),
+            WriteError::PreCommitAborted | WriteError::CommitOutcomeUnknown => {
+                NodeReceiptError::RetryableCommit
+            }
         })
 }
 
@@ -125,42 +163,47 @@ async fn prepare_managed_result(
     mut payload: ExecuteResPayload,
     max_output: u32,
     store_output: bool,
-) -> ApiResult<Option<Zeroizing<Vec<u8>>>> {
+) -> Result<Option<Zeroizing<Vec<u8>>>, NodeReceiptError> {
     // The payload crosses this function by value so encoded output can be
-    // zeroized on both the successful and failed decode paths.
+    // zeroized and freed before allocating the normalized UTF-8 plaintext.
     let encoded_bytes = payload
         .stdout_b64
         .as_ref()
         .map_or(0, String::len)
         .saturating_add(payload.stderr_b64.as_ref().map_or(0, String::len));
-    let mut prepare = move || {
+    let prepare = move || {
         let decoded = payload.decode_and_validate_output(max_output);
         let has_output = payload.stdout_b64.is_some()
             || payload.stderr_b64.is_some()
             || payload.exit_code.is_some()
             || payload.http_status.is_some();
+        let exit_code = payload.exit_code;
+        let http_status = payload.http_status;
+        let discarded = payload.output_discarded_reason.is_some();
         payload.stdout_b64.zeroize();
         payload.stderr_b64.zeroize();
-        let decoded = decoded.map_err(|_| ApiError::bad_input())?;
-        if !store_output || payload.output_discarded_reason.is_some() || !has_output {
+        drop(payload);
+        let decoded = decoded.map_err(|_| NodeReceiptError::InvalidPayload)?;
+        if !store_output || discarded || !has_output {
             return Ok(None);
         }
         let stored = StoredResult::managed_from_bytes(
             &decoded.stdout,
             &decoded.stderr,
-            payload.exit_code,
-            payload.http_status,
+            exit_code,
+            http_status,
             max_output,
         )
-        .map_err(|_| ApiError::bad_input())?;
+        .map_err(|_| NodeReceiptError::InvalidPayload)?;
+        drop(decoded);
         encode_managed(stored)
             .map(Some)
-            .map_err(|_| ApiError::internal())
+            .map_err(|_| NodeReceiptError::Internal)
     };
     if encoded_bytes >= OFFLOAD_BYTES {
         tokio::task::spawn_blocking(prepare)
             .await
-            .map_err(|_| ApiError::internal())?
+            .map_err(|_| NodeReceiptError::Internal)?
     } else {
         prepare()
     }
@@ -171,30 +214,25 @@ async fn prepare_managed_result(
 pub(crate) async fn run_upstream(
     state: AppState,
     request: InvokeUpstream,
-    mut reservation: UpstreamReservation,
+    reservation: UpstreamReservation,
     caller_principal_id: PrincipalId,
     timeout: Duration,
     deadline_at_ms: i64,
 ) {
     let execution_id = request.execution_id;
-    let Some(mut cancellation) = reservation.claim_start().await else {
+    let cancellation = reservation.cancellation();
+    if cancellation.is_cancelled() || state.clock.wall_now_ms() >= deadline_at_ms {
         return;
-    };
-    let transport_cancellation = cancellation.clone();
-    let Some(invoke) = cancellation
-        .start_io(|| {
-            (state.clock.wall_now_ms() < deadline_at_ms)
-                .then(|| state.upstream.invoke(request, transport_cancellation))
-        })
-        .await
-        .flatten()
-    else {
-        return;
-    };
+    }
+    let invoke = state.upstream.invoke(request, cancellation.clone());
     let result = tokio::time::timeout(timeout, invoke).await;
     // Shutdown cancels transport I/O before its writer sweep. The sweep
     // supplies the durable cause for work interrupted by that signal.
     if !state.execution.is_accepting() && !matches!(&result, Ok(Ok(_))) {
+        return;
+    }
+    // Skip expensive validation/sealing when user cancel or shutdown already settled the row.
+    if cancellation.is_cancelled() {
         return;
     }
     let outcome = match result {
@@ -223,7 +261,14 @@ async fn finish_upstream(
     deadline_at_ms: i64,
 ) {
     let mut commit_retries = 0;
-    while state.clock.wall_now_ms() < deadline_at_ms {
+    let mut delay = TERMINAL_RETRY_INITIAL_DELAY;
+    let mut attempted = false;
+    loop {
+        if attempted && state.clock.wall_now_ms() >= deadline_at_ms {
+            tracing::warn!(%execution_id, "execution outcome delivery reached deadline");
+            return;
+        }
+        attempted = true;
         let prepared = Arc::clone(&outcome);
         let written = state
             .storage
@@ -249,7 +294,8 @@ async fn finish_upstream(
                 return;
             }
         }
-        tokio::time::sleep(TERMINAL_RETRY_DELAY).await;
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2).min(TERMINAL_RETRY_MAX_DELAY);
     }
 }
 
@@ -289,7 +335,7 @@ async fn prepare_upstream(
     let Ok(blob) = vault.seal_execution_async(aad, plaintext).await else {
         return failure(
             TerminalExecutionState::Failed,
-            "result_storage_failed",
+            error_codes::RESULT_STORAGE_FAILED,
             true,
         );
     };
@@ -309,7 +355,7 @@ fn upstream_failure(
     let (state, code, possible_effect) = match error {
         UpstreamDispatchError::Unavailable => (
             TerminalExecutionState::Failed,
-            "upstream_unavailable",
+            error_codes::UPSTREAM_UNAVAILABLE,
             false,
         ),
         UpstreamDispatchError::AuthFailed => (
@@ -317,17 +363,19 @@ fn upstream_failure(
             error_codes::UPSTREAM_AUTH_FAILED,
             false,
         ),
-        UpstreamDispatchError::TimedOut => {
-            (TerminalExecutionState::TimedOut, "upstream_timeout", true)
-        }
+        UpstreamDispatchError::TimedOut => (
+            TerminalExecutionState::TimedOut,
+            error_codes::UPSTREAM_TIMEOUT,
+            true,
+        ),
         UpstreamDispatchError::InvalidResponse => (
             TerminalExecutionState::Failed,
-            "upstream_invalid_response",
+            error_codes::UPSTREAM_INVALID_RESPONSE,
             true,
         ),
         UpstreamDispatchError::Disconnected => (
             TerminalExecutionState::Unknown,
-            "upstream_disconnected",
+            error_codes::UPSTREAM_DISCONNECTED,
             true,
         ),
     };
@@ -463,4 +511,67 @@ fn project_mcp(raw: &[u8]) -> Result<UpstreamMcpResult, InvalidResult> {
         is_error: parsed.is_error,
         meta: parsed.meta.map(|object| object.0.into_iter().collect()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "fixtures must encode and decode")]
+
+    use super::*;
+
+    #[test]
+    fn result_envelope_decode_rejects_malformed_frames() {
+        let valid = StoredResult::Managed {
+            stdout: "out".to_owned(),
+            stderr: "err".to_owned(),
+            exit_code: Some(42),
+            http_status: Some(200),
+        };
+        let encoded = encode_managed(valid.clone()).unwrap();
+        assert_eq!(decode_result(&encoded).unwrap(), valid);
+
+        // Trailing bytes, bad format version, unknown kind, and reserved flag bits.
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(decode_result(&trailing).is_err());
+
+        let mut bad_version = encoded.to_vec();
+        bad_version[0] = 2;
+        assert!(decode_result(&bad_version).is_err());
+
+        let mut bad_kind = encoded.to_vec();
+        bad_kind[1] = 9;
+        assert!(decode_result(&bad_kind).is_err());
+
+        let mut bad_flags = encoded.to_vec();
+        bad_flags[2] |= 0b100;
+        assert!(decode_result(&bad_flags).is_err());
+
+        // Truncation at every prefix length must fail cleanly.
+        for len in 0..encoded.len() {
+            assert!(decode_result(&encoded[..len]).is_err(), "len={len}");
+        }
+
+        // Invalid UTF-8 in stdout.
+        let mut bad_utf8 = vec![FORMAT_V1, MANAGED, 0];
+        bad_utf8.extend_from_slice(&2u32.to_be_bytes());
+        bad_utf8.extend_from_slice(&[0xff, 0xfe]);
+        bad_utf8.extend_from_slice(&0u32.to_be_bytes());
+        assert!(decode_result(&bad_utf8).is_err());
+
+        // Combined managed text exceeding MAX_MANAGED_TEXT_BYTES.
+        let half = (MAX_MANAGED_TEXT_BYTES / 2) + 1;
+        let mut oversized_managed = vec![FORMAT_V1, MANAGED, 0];
+        oversized_managed.extend_from_slice(&(half as u32).to_be_bytes());
+        oversized_managed.resize(oversized_managed.len() + half, b'a');
+        oversized_managed.extend_from_slice(&(half as u32).to_be_bytes());
+        oversized_managed.resize(oversized_managed.len() + half, b'b');
+        assert!(decode_result(&oversized_managed).is_err());
+
+        // Oversized and malformed upstream payloads.
+        let mut oversized_upstream = vec![FORMAT_V1, UPSTREAM_MCP];
+        oversized_upstream.resize(2 + MAX_UPSTREAM_BYTES + 1, b' ');
+        assert!(decode_result(&oversized_upstream).is_err());
+        assert!(decode_result(&[FORMAT_V1, UPSTREAM_MCP, b'{']).is_err());
+    }
 }

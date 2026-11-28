@@ -80,6 +80,7 @@ struct DiscoverBound {}
 #[derive(Serialize, ToSchema)]
 struct DiscoverResponse {
     upstream_id: UpstreamId,
+    #[schema(minimum = 1)]
     config_version: u64,
     discovered_at_ms: i64,
     discovered_tool_count: usize,
@@ -321,16 +322,16 @@ fn discovery_conflict() -> ApiError {
 fn dispatch_error(error: UpstreamDispatchError) -> ApiError {
     match error {
         UpstreamDispatchError::TimedOut => {
-            ApiError::new(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout").retryable()
+            ApiError::new(StatusCode::GATEWAY_TIMEOUT, code::UPSTREAM_TIMEOUT).retryable()
         }
         UpstreamDispatchError::AuthFailed => {
             ApiError::new(StatusCode::BAD_GATEWAY, code::UPSTREAM_AUTH_FAILED)
         }
         UpstreamDispatchError::InvalidResponse => {
-            ApiError::new(StatusCode::BAD_GATEWAY, "upstream_invalid_response")
+            ApiError::new(StatusCode::BAD_GATEWAY, code::UPSTREAM_INVALID_RESPONSE)
         }
         UpstreamDispatchError::Unavailable | UpstreamDispatchError::Disconnected => {
-            ApiError::new(StatusCode::BAD_GATEWAY, "upstream_unavailable").retryable()
+            ApiError::new(StatusCode::BAD_GATEWAY, code::UPSTREAM_UNAVAILABLE).retryable()
         }
     }
 }

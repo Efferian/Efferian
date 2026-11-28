@@ -1,5 +1,7 @@
 //! Authoring and immutable revisions for individual tools.
 
+use std::sync::Arc;
+
 use axum::{Json, extract::State};
 use efferian_authz::authorize_admin;
 use efferian_protocol::{
@@ -22,7 +24,7 @@ use crate::vault::auth::{AuthenticatedApi, refresh_api};
 
 use super::Outcome;
 use super::accounts::{AccountMetadata, account_by_id};
-use super::references::tool_in_use;
+use super::references::{DELETE_REFERENCE_WORK_BYTES, tool_in_use};
 use super::schema;
 use super::upstreams::{read_upstream_by_id, upstream_discovery_matches};
 
@@ -191,7 +193,7 @@ async fn put(
             .await?
     };
     let config = state.config;
-    let policy = config.egress_policy().map_err(|_| ApiError::internal())?;
+    let policy = state.egress.policy().clone();
     let (revision, definition_json, discovery) = tokio::task::spawn_blocking(move || {
         let discovered = discovery.as_ref().map(|entry| &entry.tool);
         let revision = request
@@ -263,9 +265,25 @@ async fn delete(
     _: EmptyBody,
 ) -> ApiResult<StatusCode> {
     validate_slug(&slug).map_err(|_| ApiError::bad_input())?;
+    {
+        let slug = slug.clone();
+        let clock = Arc::clone(&state.clock);
+        let credential = caller.credential.clone();
+        state
+            .storage
+            .read_snapshot(move |conn| -> ApiResult<()> {
+                authorize_admin(&refresh_api(conn, &credential, clock.wall_now_ms())?)?;
+                let (tool, _) = tool_status(conn, &slug)?;
+                if tool_in_use(conn, tool)? {
+                    return Err(ApiError::conflict(code::RESOURCE_IN_USE));
+                }
+                Ok(())
+            })
+            .await?;
+    }
     state
         .storage
-        .execute_work(slug.len(), move |tx| {
+        .execute_work(DELETE_REFERENCE_WORK_BYTES, move |tx| {
             authorize_admin(&refresh_api(tx.conn(), &caller.credential, tx.now_ms())?)?;
             let (tool, _) = tool_status(tx.conn(), &slug)?;
             if tool_in_use(tx.conn(), tool)? {
@@ -483,22 +501,46 @@ pub(crate) fn static_account(definition: &ToolDefinition) -> Option<StaticAccoun
     })
 }
 
+#[derive(Default)]
+pub(super) struct DependencyCache {
+    upstreams: std::collections::HashSet<UpstreamId>,
+    accounts: std::collections::HashSet<(AccountId, AccountKind, Option<UpstreamId>)>,
+    active_nodes: std::collections::HashSet<NodeId>,
+    node_tags: std::collections::HashMap<NodeId, Vec<String>>,
+}
+
 pub(super) fn validate_dependencies(
     conn: &Connection,
     definition: &ToolDefinition,
 ) -> WriteResult<()> {
-    if let ToolSpec::UpstreamRef { upstream_id, .. } = definition.spec {
+    validate_dependencies_cached(conn, definition, &mut DependencyCache::default())
+}
+
+pub(super) fn validate_dependencies_cached(
+    conn: &Connection,
+    definition: &ToolDefinition,
+    cache: &mut DependencyCache,
+) -> WriteResult<()> {
+    if let ToolSpec::UpstreamRef { upstream_id, .. } = definition.spec
+        && !cache.upstreams.contains(&upstream_id)
+    {
         let exists: bool = conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM upstreams WHERE upstream_id = ?1)")?
             .query_row([upstream_id.to_string()], |row| row.get(0))?;
         if !exists {
             return Err(ApiError::not_found().into());
         }
+        cache.upstreams.insert(upstream_id);
     }
     if let Some(expected) = static_account(definition) {
-        let account = account_by_id(conn, expected.account_id)?.ok_or_else(ApiError::not_found)?;
-        if !expected.matches(&account) {
-            return Err(ApiError::bad_input().into());
+        let key = (expected.account_id, expected.kind, expected.upstream_id);
+        if !cache.accounts.contains(&key) {
+            let account =
+                account_by_id(conn, expected.account_id)?.ok_or_else(ApiError::not_found)?;
+            if !expected.matches(&account) {
+                return Err(ApiError::bad_input().into());
+            }
+            cache.accounts.insert(key);
         }
     }
     if let Some(TargetSelector::Fixed { node_ids }) = definition.spec.target_selector() {
@@ -506,30 +548,41 @@ pub(super) fn validate_dependencies(
             "SELECT EXISTS(SELECT 1 FROM nodes WHERE node_id = ?1 AND revoked_at_ms IS NULL)",
         )?;
         for &node_id in node_ids {
+            if cache.active_nodes.contains(&node_id) {
+                continue;
+            }
             if !node.query_row([node_id.to_string()], |row| row.get::<_, bool>(0))? {
                 return Err(ApiError::not_found().into());
             }
+            cache.active_nodes.insert(node_id);
         }
     }
     Ok(())
 }
 
-pub(super) fn validate_binding_node(
+pub(super) fn validate_binding_node_cached(
     conn: &Connection,
     definition: &ToolDefinition,
     node_id: NodeId,
+    cache: &mut DependencyCache,
 ) -> WriteResult<()> {
     let matches = match definition.spec.target_selector() {
         Some(TargetSelector::Fixed { node_ids }) => node_ids.contains(&node_id),
         Some(TargetSelector::Tag { tag }) => {
-            let tags = conn
-                .prepare_cached(
-                    "SELECT tags_json FROM nodes WHERE node_id = ?1 AND revoked_at_ms IS NULL",
-                )?
-                .query_row([node_id.to_string()], |row| json::<Vec<String>>(row, 0))
-                .optional()?
-                .ok_or_else(ApiError::not_found)?;
-            tags.contains(tag)
+            if let Some(tags) = cache.node_tags.get(&node_id) {
+                tags.contains(tag)
+            } else {
+                let tags = conn
+                    .prepare_cached(
+                        "SELECT tags_json FROM nodes WHERE node_id = ?1 AND revoked_at_ms IS NULL",
+                    )?
+                    .query_row([node_id.to_string()], |row| json::<Vec<String>>(row, 0))
+                    .optional()?
+                    .ok_or_else(ApiError::not_found)?;
+                let found = tags.contains(tag);
+                cache.node_tags.insert(node_id, tags);
+                found
+            }
         }
         None => false,
     };

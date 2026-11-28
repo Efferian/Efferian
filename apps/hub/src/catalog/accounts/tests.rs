@@ -484,3 +484,384 @@ async fn bindings_use_pinned_visibility_and_hide_foreign_accounts() -> TestResul
     hub.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn account_put_validates_payload_and_upstream_kind_before_conflicts_and_filters_queries()
+-> TestResult {
+    let hub = TestHub::start("account-validation", Config::default(), 10_000).await?;
+    let (status, upstream) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/upstreams/primary",
+            Some(json!({"url": "https://example.com/mcp"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{upstream}");
+    let upstream_id: UpstreamId =
+        serde_json::from_value(upstream["upstream"]["upstream_id"].clone())?;
+
+    // upstream_id with non-http_auth fails 400 on create.
+    let (status, problem) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/accounts/bad-bind",
+            Some(json!({
+                "upstream_id": upstream_id,
+                "secret": {"kind": "secret_kv", "entries": {"K": "v"}}
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+
+    // NUL byte inside SecretKv value fails 400.
+    let (status, problem) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/accounts/nul-secret",
+            Some(json!({
+                "secret": {"kind": "secret_kv", "entries": {"K": "bad\0value"}}
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+
+    // Create a valid secret_kv account, then verify invalid inputs return 400 before 409/404.
+    let (status, created) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/accounts/existing",
+            Some(secret_kv("initial")),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let (status, problem) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/accounts/existing",
+            Some(json!({
+                "upstream_id": UpstreamId::new(),
+                "secret": {"kind": "secret_kv", "entries": {"K": "v"}}
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    let (status, problem) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/accounts/existing",
+            Some(json!({
+                "secret": {"kind": "http_auth", "auth": {"kind": "bearer", "token": ""}}
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+
+    // visibility=shared combined with owner is always rejected with 400.
+    for (method, body) in [
+        (Method::GET, None),
+        (Method::PUT, Some(secret_kv("x"))),
+        (Method::DELETE, None),
+    ] {
+        let (status, problem) = hub
+            .request_admin(
+                method,
+                &format!(
+                    "/v1/accounts/existing?visibility=shared&owner={}",
+                    hub.admin_id
+                ),
+                body,
+            )
+            .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    }
+
+    // Owner matching gc_purging_principal_id is hidden (404).
+    let purging = PrincipalId::new_agent();
+    let admin = hub.admin_id;
+    hub.write(move |conn| {
+        conn.execute(
+            "INSERT INTO principals(principal_id, kind, name, managed_by_principal_id, disabled_at_ms, created_at_ms, updated_at_ms)
+             VALUES (?1, 'agent', '~purging:acct', ?2, -1, 10000, 10000)",
+            params![purging.to_string(), admin.to_string()],
+        )?;
+        conn.execute(
+            "UPDATE hub_meta SET gc_purging_principal_id = ?1 WHERE id = 1",
+            [purging.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+    let (status, _) = hub
+        .request_admin(Method::GET, &format!("/v1/accounts?owner={purging}"), None)
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Second admin rotating a shared account preserves original owner_principal_id.
+    let (delegate_id, delegate) = add_human(&hub, "rotator", PrincipalKind::Admin).await?;
+    let (status, grant) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/grants",
+            Some(json!({
+                "principal_id": delegate_id,
+                "scope": {"scope_kind": "global"},
+                "capability": "admin",
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{grant}");
+    let shared_uri = "/v1/accounts/shared-rot?visibility=shared";
+    let (status, _) = hub
+        .request_admin(Method::PUT, shared_uri, Some(secret_kv("v1")))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, rotated) = hub
+        .request(Method::PUT, shared_uri, &delegate, Some(secret_kv("v2")))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{rotated}");
+    assert_eq!(rotated["outcome"], "updated");
+    assert_eq!(rotated["account"]["secret_version"], 2);
+    assert_eq!(
+        rotated["account"]["owner_principal_id"],
+        json!(hub.admin_id)
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn binding_changes_owner_disable_and_inheritance_toggle_invalidate_child_agents() -> TestResult
+{
+    let invalidations = Arc::new(Invalidations::default());
+    let hub = TestHub::start_with_dispatchers(
+        "binding-invalidations",
+        Config::default(),
+        10_000,
+        None,
+        invalidations.clone(),
+    )
+    .await?;
+    let (owner_id, owner_token) = add_member(&hub, "owner").await?;
+    let (status, agent_res) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/principals/child-agent",
+            Some(json!({
+                "kind": "agent",
+                "owner_principal_id": owner_id,
+                "managed_by_principal_id": owner_id,
+                "inherit_owner_bindings": true,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{agent_res}");
+    let agent_id: PrincipalId =
+        serde_json::from_value(agent_res["principal"]["principal_id"].clone())?;
+
+    let mut upstream_ids = Vec::new();
+    for slug in ["alpha", "beta"] {
+        let (status, upstream) = hub
+            .request_admin(
+                Method::PUT,
+                &format!("/v1/upstreams/{slug}"),
+                Some(json!({"url": "https://example.com/mcp"})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{upstream}");
+        let id: UpstreamId = serde_json::from_value(upstream["upstream"]["upstream_id"].clone())?;
+        upstream_ids.push(id);
+    }
+    let profile_id = ProfileId::new();
+    let admin = hub.admin_id;
+    let u0 = upstream_ids[0];
+    let u1 = upstream_ids[1];
+    hub.write(move |conn| {
+        let mut bindings = Vec::new();
+        for (idx, uid) in [u0, u1].into_iter().enumerate() {
+            let tid = ToolId::new();
+            conn.execute(
+                "INSERT INTO tools (tool_id, slug, kind, created_by, current_version, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'upstream_ref', ?3, 1, 10000, 10000)",
+                params![tid.to_string(), format!("t{idx}"), admin.to_string()],
+            )?;
+            let def = json!({
+                "input_schema": {"type": "object"},
+                "spec": {
+                    "kind": "upstream_ref", "upstream_id": uid,
+                    "upstream_tool_name": "echo", "account_mode": "caller_bound", "runtime_ms": 1000
+                }
+            });
+            conn.execute(
+                "INSERT INTO tool_revisions (tool_id, version, input_schema_sha256, created_at_ms, definition_json)
+                 VALUES (?1, 1, 'fixture', 10000, ?2)",
+                params![tid.to_string(), def.to_string()],
+            )?;
+            bindings.push(json!({"tool_id": tid, "tool_version": 1, "public_name": format!("tool_{idx}")}));
+        }
+        conn.execute(
+            "INSERT INTO profiles (profile_id, slug, discovery_mode, published_version, created_at_ms, updated_at_ms)
+             VALUES (?1, 'p', 'full', 1, 10000, 10000)",
+            [profile_id.to_string()],
+        )?;
+        conn.execute(
+            "INSERT INTO profile_editions (profile_id, version, discovery_mode, published_by, published_at_ms, bindings_json)
+             VALUES (?1, 1, 'full', ?2, 10000, ?3)",
+            params![profile_id.to_string(), admin.to_string(), Value::Array(bindings).to_string()],
+        )?;
+        conn.execute(
+            "INSERT INTO grants (grant_id, principal_id, scope_kind, scope_id, capability, created_by, created_at_ms)
+             VALUES (?1, ?2, 'profile', ?3, 'discover', ?4, 10000)",
+            params![GrantId::new().to_string(), owner_id.to_string(), profile_id.to_string(), admin.to_string()],
+        )?;
+        Ok(())
+    })
+    .await?;
+
+    // Missing own account_slug returns 404 (and invalid slug returns 400).
+    let (status, _) = hub
+        .request(
+            Method::PUT,
+            "/v1/account-bindings/me/alpha",
+            &owner_token,
+            Some(json!({"account_slug": "missing-own"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = hub
+        .request(
+            Method::PUT,
+            "/v1/account-bindings/me/alpha",
+            &owner_token,
+            Some(json!({"account_slug": "INVALID SLUG"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    for (slug, uid) in [("acct-a", u0), ("acct-b", u1)] {
+        let (status, acct) = hub
+            .request(
+                Method::PUT,
+                &format!("/v1/accounts/{slug}"),
+                &owner_token,
+                Some(http_auth(uid)),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{acct}");
+    }
+    invalidations
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    for (upstream, acct) in [("alpha", "acct-a"), ("beta", "acct-b")] {
+        let (status, res) = hub
+            .request(
+                Method::PUT,
+                &format!("/v1/account-bindings/me/{upstream}"),
+                &owner_token,
+                Some(json!({"account_slug": acct})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{res}");
+    }
+    // Multi-page cursor pagination across the owner's 2 bindings.
+    let (status, page1) = hub
+        .request(
+            Method::GET,
+            "/v1/account-bindings?limit=1",
+            &owner_token,
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{page1}");
+    assert_eq!(page1["items"].as_array().map(Vec::len), Some(1));
+    let cursor = page1["next_cursor"]
+        .as_str()
+        .ok_or("expected binding cursor")?;
+    let (status, page2) = hub
+        .request(
+            Method::GET,
+            &format!("/v1/account-bindings?limit=1&cursor={cursor}"),
+            &owner_token,
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{page2}");
+    assert_eq!(page2["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(page2["next_cursor"], Value::Null);
+    assert_ne!(
+        page1["items"][0]["upstream_id"],
+        page2["items"][0]["upstream_id"]
+    );
+
+    // Verify owner binding PUT invalidated both owner and inheriting child agent.
+    {
+        let mut seen = invalidations
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(seen.contains(&UpstreamInvalidation::Binding {
+            principal_id: owner_id,
+            upstream_id: u0,
+        }));
+        assert!(seen.contains(&UpstreamInvalidation::Binding {
+            principal_id: agent_id,
+            upstream_id: u0,
+        }));
+        seen.clear();
+    }
+
+    // Disabling owner must invalidate both owner and child agent.
+    let (status, _) = hub
+        .request_admin(
+            Method::POST,
+            &format!("/v1/principals/{owner_id}/disable"),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    {
+        let mut seen = invalidations
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(seen.contains(&UpstreamInvalidation::Principal(owner_id)));
+        assert!(seen.contains(&UpstreamInvalidation::Principal(agent_id)));
+        seen.clear();
+    }
+
+    // Re-enable owner, then toggle inherit_owner_bindings: true -> false on child agent.
+    let (status, _) = hub
+        .request_admin(
+            Method::POST,
+            &format!("/v1/principals/{owner_id}/enable"),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, updated) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/principals/child-agent",
+            Some(json!({
+                "kind": "agent",
+                "owner_principal_id": owner_id,
+                "managed_by_principal_id": owner_id,
+                "inherit_owner_bindings": false,
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    {
+        let seen = invalidations
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(seen.contains(&UpstreamInvalidation::Principal(agent_id)));
+    }
+
+    hub.shutdown().await;
+    Ok(())
+}

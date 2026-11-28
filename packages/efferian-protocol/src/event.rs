@@ -254,7 +254,7 @@ mod openapi {
     use utoipa::{
         PartialSchema, ToSchema,
         openapi::{
-            RefOr,
+            Ref, RefOr,
             schema::{ObjectBuilder, OneOfBuilder, Schema},
         },
     };
@@ -305,7 +305,7 @@ mod openapi {
                         kind,
                         "execution",
                         ExecutionId::schema(),
-                        ExecutionEventPayload::schema(),
+                        Ref::from_schema_name(ExecutionEventPayload::name()).into(),
                     )
                     .description(Some("The payload's execution_id must equal aggregate_id.")),
                 );
@@ -347,6 +347,10 @@ mod openapi {
 
     impl ToSchema for EventEnvelope {
         fn schemas(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+            schemas.push((
+                ExecutionEventPayload::name().into(),
+                ExecutionEventPayload::schema(),
+            ));
             ExecutionEventPayload::schemas(schemas);
         }
     }

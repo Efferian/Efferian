@@ -19,6 +19,7 @@ use super::{OpenMode, StorageConfig, StorageError, WriteError};
 
 const PRIORITY_CAPACITY: usize = 128;
 const WORK_CAPACITY: usize = 256;
+const MAX_QUEUED_WORK_BYTES: usize = 128 * 1024 * 1024;
 const MIN_SUBSCRIPTION_CAPACITY: usize = 512;
 const MAX_COMMANDS: usize = 32;
 const PRIORITY_BURST: usize = 16;
@@ -157,6 +158,28 @@ impl StorageHandle {
         self.readers.snapshot(read).await
     }
 
+    pub(crate) async fn read_auth_snapshot<T, E>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        self.readers.auth_snapshot(read).await
+    }
+
+    pub(crate) async fn read_stream_snapshot<T, E>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        self.readers.stream_snapshot(read).await
+    }
+
     pub(crate) async fn read_control_snapshot<T, E>(
         &self,
         read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
@@ -229,9 +252,12 @@ impl StorageHandle {
         });
         self.mailbox.enqueue(|state| {
             if let Some(bytes) = bytes {
-                if state.work.len() == WORK_CAPACITY {
+                if state.work.len() == WORK_CAPACITY
+                    || state.queued_work_bytes.saturating_add(bytes) > MAX_QUEUED_WORK_BYTES
+                {
                     return Err(StorageError::Overloaded);
                 }
+                state.queued_work_bytes = state.queued_work_bytes.saturating_add(bytes);
                 state.work.push_back(Work { bytes, command });
             } else {
                 if state.priority.len() == PRIORITY_CAPACITY {
@@ -400,16 +426,20 @@ impl DbActor {
         let committed = matches!(outcome, BatchOutcome::Committed);
         let mut reply_outcome = outcome;
         let result = match (outcome, fatal_commit) {
-            (BatchOutcome::Committed, _) => match self.publish(effects) {
-                Ok(follow_ups) => self.run_follow_ups(db, follow_ups).inspect_err(|_| {
+            (BatchOutcome::Committed, _) => {
+                let (follow_ups, hook_panicked) = self.publish(effects);
+                let follow_up = self.run_follow_ups(db, follow_ups).inspect_err(|_| {
                     reply_outcome = BatchOutcome::Unknown;
-                }),
-                Err(error) => Err(error),
-            },
-            (_, Some(error)) => {
-                effects.publish_indeterminate();
-                Err(error)
+                });
+                follow_up.and_then(|()| {
+                    if hook_panicked {
+                        Err(StorageError::ActorStopped)
+                    } else {
+                        Ok(())
+                    }
+                })
             }
+            (_, Some(error)) => Err(error),
             _ if db.conn.is_autocommit() => Ok(()),
             _ => db
                 .conn
@@ -443,6 +473,7 @@ impl DbActor {
     ) -> Result<(), StorageError> {
         // Continuations are already accepted obligations. Never enqueue them
         // behind an external request or drop them when ingress is full.
+        let mut hook_panicked = false;
         while !commands.is_empty() {
             let mut effects = Effects::default();
             let mut probe = PressureProbe {
@@ -453,7 +484,6 @@ impl DbActor {
                 run_transaction(db, &mut commands, &mut effects, &self.waiters, &mut probe);
             if !matches!(outcome, BatchOutcome::Committed) {
                 if let Some(error) = error {
-                    effects.publish_indeterminate();
                     return Err(error);
                 }
                 if !db.conn.is_autocommit() {
@@ -463,20 +493,27 @@ impl DbActor {
                     "post-commit continuation could not be persisted",
                 ));
             }
+            let wrote_result_blob = effects.wrote_result_blob;
+            let appended = effects.events.len();
+            let (next_commands, panicked) = self.publish(effects);
+            hook_panicked |= panicked;
             self.maintenance.after_write(
                 db,
                 true,
                 0,
-                effects.wrote_result_blob,
-                effects.events.len(),
+                wrote_result_blob,
+                appended,
                 probe.changed,
             )?;
-            commands = self.publish(effects)?;
+            commands = next_commands;
+        }
+        if hook_panicked {
+            return Err(StorageError::ActorStopped);
         }
         Ok(())
     }
 
-    fn publish(&mut self, effects: Effects) -> Result<Vec<Box<dyn Command>>, StorageError> {
+    fn publish(&mut self, effects: Effects) -> (Vec<Box<dyn Command>>, bool) {
         for signal in effects.revocations {
             let _ = self.revocations.send(Arc::new(signal));
         }
@@ -497,19 +534,15 @@ impl DbActor {
             let _ = self.events.send(Arc::new(event));
         }
         let mut follow_ups = Vec::<Box<dyn Command>>::new();
-        let mut failed = false;
+        let mut panicked = false;
         for hook in effects.hooks {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
                 Ok(Some(write)) => follow_ups.push(Box::new(write)),
                 Ok(None) => {}
-                Err(_) => failed = true,
+                Err(_) => panicked = true,
             }
         }
-        if failed {
-            Err(StorageError::ActorStopped)
-        } else {
-            Ok(follow_ups)
-        }
+        (follow_ups, panicked)
     }
 }
 
@@ -607,7 +640,6 @@ struct Effects {
     updated: Vec<(ExecutionId, ExecutionSnapshot)>,
     finished: Vec<(ExecutionId, ExecutionSnapshot)>,
     hooks: Vec<Box<dyn FnOnce() -> Option<FollowUpWrite> + Send>>,
-    indeterminate_hooks: Vec<Box<dyn FnOnce() + Send>>,
     wrote_result_blob: bool,
 }
 
@@ -619,16 +651,7 @@ impl Effects {
         self.updated.extend(other.updated);
         self.finished.extend(other.finished);
         self.hooks.extend(other.hooks);
-        self.indeterminate_hooks.extend(other.indeterminate_hooks);
         self.wrote_result_blob |= other.wrote_result_blob;
-    }
-
-    fn publish_indeterminate(self) {
-        // Keep staged commit hooks alive until the associated guards have had
-        // a chance to fail closed. A durable commit cannot be ruled out.
-        for hook in self.indeterminate_hooks {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
-        }
     }
 }
 
@@ -741,12 +764,6 @@ impl WriteTx<'_> {
         hook: impl FnOnce() -> Option<FollowUpWrite> + Send + 'static,
     ) {
         self.effects.hooks.push(Box::new(hook));
-    }
-
-    /// Fail closed when SQLite ends a failed COMMIT without a provable rollback.
-    /// This runs before staged commit hooks are discarded and the writer stops.
-    pub(crate) fn on_indeterminate_commit(&mut self, hook: impl FnOnce() + Send + 'static) {
-        self.effects.indeterminate_hooks.push(Box::new(hook));
     }
 }
 
@@ -924,6 +941,7 @@ struct Mailbox {
 struct MailboxState {
     priority: VecDeque<Box<dyn Command>>,
     work: VecDeque<Work>,
+    queued_work_bytes: usize,
     subscriptions: VecDeque<(ExecutionId, SubscribeReply)>,
     shutting_down: bool,
     stopped: bool,
@@ -984,6 +1002,7 @@ impl Mailbox {
             } else {
                 state.shutting_down = true;
             }
+            state.queued_work_bytes = 0;
             (
                 std::mem::take(&mut state.priority),
                 std::mem::take(&mut state.work),
@@ -1031,6 +1050,7 @@ impl Mailbox {
                     .is_some_and(|next| next.bytes <= remaining)
             {
                 let next = state.work.pop_front()?;
+                state.queued_work_bytes = state.queued_work_bytes.saturating_sub(next.bytes);
                 remaining -= next.bytes;
                 turn.bytes += next.bytes;
                 turn.commands.push(next.command);

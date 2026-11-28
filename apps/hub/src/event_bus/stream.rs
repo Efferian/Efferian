@@ -10,7 +10,7 @@ use efferian_authz::AuthContext;
 use efferian_protocol::{EventEnvelope, EventStreamFrame};
 use hyper::body::{Body as HttpBody, Frame};
 use tokio::sync::{broadcast, watch};
-use tokio::time::{Instant, Interval, MissedTickBehavior};
+use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep};
 
 use super::{AuthorizedPage, CATCH_UP_LIMIT, EventKinds, EventReader, PageError};
 use crate::storage::{EventsPageRaw, EventsReadError, RevocationWatch, StorageClock, StoredEvent};
@@ -32,12 +32,17 @@ pub(super) fn body(
         scope,
         events: page,
     } = initial;
+    let expiry = scope
+        .token
+        .expires_at_ms
+        .map(|deadline| expiry_sleep(reader.clock.as_ref(), deadline));
     let stream = EventStream {
         context: scope,
         kinds,
         revocations,
         shutdown,
         ping,
+        expiry,
         clock: reader.clock.clone(),
         feed: Feed {
             reader,
@@ -97,39 +102,42 @@ struct EventStream {
     shutdown: watch::Receiver<bool>,
     clock: Arc<dyn StorageClock>,
     ping: Interval,
+    expiry: Option<Pin<Box<Sleep>>>,
     feed: Feed,
 }
 
 impl EventStream {
     async fn next_frame(mut self) -> Option<(Self, EventStreamFrame)> {
-        let frame = {
-            let expired = wait_for_expiry(self.clock.as_ref(), self.context.token.expires_at_ms);
-            tokio::pin!(expired);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = self.shutdown.wait_for(|stopped| *stopped) => return None,
-                    signal = self.revocations.recv() => {
-                        if signal.map_or(true, |signal| signal.affects_caller(&self.context)) {
-                            return None;
-                        }
-                    }
-                    _ = &mut expired => return None,
-                    _ = self.ping.tick() => break EventStreamFrame::Ping {},
-                    item = self.feed.next(&self.context, &self.kinds) => match item {
-                        Ok(FeedItem::Event(event)) => break EventStreamFrame::Event { event },
-                        Ok(FeedItem::Skipped) => {}
-                        Err(PageError::Events(EventsReadError::ResyncRequired {
-                            oldest_available_seq,
-                            latest_seq,
-                        })) => {
-                            break EventStreamFrame::ResyncRequired { oldest_available_seq, latest_seq };
-                        }
-                        Ok(FeedItem::Closed) | Err(_) => return None,
+        let frame = loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.wait_for(|stopped| *stopped) => return None,
+                signal = self.revocations.recv() => {
+                    if signal.map_or(true, |signal| signal.affects_caller(&self.context)) {
+                        return None;
                     }
                 }
-                tokio::task::consume_budget().await;
+                _ = poll_expiry(&mut self.expiry) => {
+                    let deadline = self.context.token.expires_at_ms?;
+                    if !self.context.token.is_active(self.clock.wall_now_ms()) {
+                        return None;
+                    }
+                    self.expiry = Some(expiry_sleep(self.clock.as_ref(), deadline));
+                }
+                _ = self.ping.tick() => break EventStreamFrame::Ping {},
+                item = self.feed.next(&self.context, &self.kinds) => match item {
+                    Ok(FeedItem::Event(event)) => break EventStreamFrame::Event { event },
+                    Ok(FeedItem::Skipped) => {}
+                    Err(PageError::Events(EventsReadError::ResyncRequired {
+                        oldest_available_seq,
+                        latest_seq,
+                    })) => {
+                        break EventStreamFrame::ResyncRequired { oldest_available_seq, latest_seq };
+                    }
+                    Ok(FeedItem::Closed) | Err(_) => return None,
+                }
             }
+            tokio::task::consume_budget().await;
         };
         if !self.can_send_frame() {
             return None;
@@ -154,14 +162,15 @@ impl EventStream {
     }
 }
 
-async fn wait_for_expiry(clock: &dyn StorageClock, expiry: Option<i64>) {
-    let Some(expiry) = expiry else {
-        return pending().await;
-    };
-    while let Ok(remaining) = u64::try_from(expiry.saturating_sub(clock.wall_now_ms()))
-        && remaining > 0
-    {
-        tokio::time::sleep(Duration::from_millis(remaining)).await;
+fn expiry_sleep(clock: &dyn StorageClock, deadline: i64) -> Pin<Box<Sleep>> {
+    let remaining = u64::try_from(deadline.saturating_sub(clock.wall_now_ms())).unwrap_or(0);
+    Box::pin(tokio::time::sleep(Duration::from_millis(remaining)))
+}
+
+async fn poll_expiry(sleep: &mut Option<Pin<Box<Sleep>>>) {
+    match sleep.as_mut() {
+        Some(timer) => timer.as_mut().await,
+        None => pending().await,
     }
 }
 
@@ -219,28 +228,29 @@ impl Feed {
                 self.after = page.scanned_through;
                 self.page = None;
                 if let Some(through) = more {
-                    self.read_page(Some(through));
+                    self.read_page(Some(through), kinds);
                     continue;
                 }
             }
 
             match self.events.recv().await {
                 Ok(event) => return Ok(self.observe(&event, ctx, kinds)),
-                Err(broadcast::error::RecvError::Lagged(_)) => self.read_page(None),
+                Err(broadcast::error::RecvError::Lagged(_)) => self.read_page(None, kinds),
                 Err(broadcast::error::RecvError::Closed) => return Ok(FeedItem::Closed),
             }
         }
     }
 
-    fn read_page(&mut self, through: Option<i64>) {
+    fn read_page(&mut self, through: Option<i64>, kinds: &EventKinds) {
         // Preserve this read across selections of a ping or irrelevant revocation.
         let after = self.after;
         let reader = self.reader.clone();
+        let kinds = kinds.clone();
         self.pending = Some((
             through,
             Box::pin(async move {
                 reader
-                    .read(after, through, CATCH_UP_LIMIT, false)
+                    .read(after, through, CATCH_UP_LIMIT, false, &kinds)
                     .await
                     .map(|page| page.events)
             }),

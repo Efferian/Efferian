@@ -2453,3 +2453,67 @@ async fn revoke_token_and_grant_ignore_principal_being_purged() -> TestResult {
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }
+
+#[tokio::test]
+async fn sibling_hook_panic_still_persists_collected_follow_up_write() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+
+    handle
+        .execute_work(0, |tx| {
+            tx.on_commit(|| assert_eq!(1, 0, "simulated sibling hook panic"));
+            tx.on_commit_follow_up(|| {
+                Some(FollowUpWrite::new(|tx| {
+                    tx.conn()
+                        .execute("UPDATE hub_meta SET updated_at_ms = 99", [])?;
+                    Ok(())
+                }))
+            });
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+
+    tokio::time::timeout(TIMEOUT, runtime.wait_stopped()).await?;
+    let report = tokio::time::timeout(TIMEOUT, runtime.shutdown()).await?;
+    assert!(matches!(
+        report,
+        ShutdownReport::Failed(StorageError::ActorStopped)
+    ));
+
+    let conn = Connection::open_with_flags(f.path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let updated: i64 =
+        conn.query_row("SELECT updated_at_ms FROM hub_meta", [], |row| row.get(0))?;
+    assert_eq!(updated, 99);
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_queue_enforces_total_queued_byte_cap_before_slot_cap() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let (release, anchor) = pause_writer(&handle).await?;
+
+    let mut queued = Vec::new();
+    let chunk = 4 * 1024 * 1024;
+    // 32 * 4 MiB = 128 MiB fits within MAX_QUEUED_WORK_BYTES (well below WORK_CAP = 256).
+    for _ in 0..32 {
+        let mut fut =
+            Box::pin(handle.execute_work(chunk, |_| Ok::<_, WriteTxError<Infallible>>(())));
+        assert!(poll!(&mut fut).is_pending());
+        queued.push(fut);
+    }
+    let mut overflow =
+        Box::pin(handle.execute_work(chunk, |_| Ok::<_, WriteTxError<Infallible>>(())));
+    assert!(matches!(
+        poll!(&mut overflow),
+        std::task::Poll::Ready(Err(WriteError::Storage(StorageError::Overloaded)))
+    ));
+
+    release.send(()).map_err(|_| "writer stopped")?;
+    anchor.await?;
+    for fut in queued {
+        fut.await?;
+    }
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}

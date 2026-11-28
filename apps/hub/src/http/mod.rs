@@ -14,7 +14,13 @@ use efferian_authz::{AuthContext, AuthzError, authorize_admin};
 use efferian_protocol::{PrincipalKind, error_codes as code};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{
+    ToSchema,
+    openapi::{
+        Ref, RefOr,
+        schema::{ArrayBuilder, ObjectBuilder, Schema, SchemaType, Type},
+    },
+};
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::{
@@ -124,10 +130,55 @@ pub(crate) fn checked_page_limit(limit: Option<u16>) -> ApiResult<usize> {
     Ok(usize::from(limit))
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Outcome {
+    Created,
+    Updated,
+    Unchanged,
+}
+
+impl Outcome {
+    pub(crate) const fn status(self) -> StatusCode {
+        match self {
+            Self::Created => StatusCode::CREATED,
+            Self::Updated | Self::Unchanged => StatusCode::OK,
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub(crate) struct Page<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
+}
+
+impl<T: ToSchema> utoipa::__dev::ComposeSchema for Page<T> {
+    fn compose(_new_generics: Vec<RefOr<Schema>>) -> RefOr<Schema> {
+        ObjectBuilder::new()
+            .property(
+                "items",
+                ArrayBuilder::new().items(Ref::from_schema_name(T::name())),
+            )
+            .required("items")
+            .property(
+                "next_cursor",
+                ObjectBuilder::new().schema_type(SchemaType::from_iter([Type::String, Type::Null])),
+            )
+            .required("next_cursor")
+            .into()
+    }
+}
+
+impl<T: ToSchema> ToSchema for Page<T> {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("Page")
+    }
+
+    fn schemas(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+        schemas.push((T::name().into_owned(), T::schema()));
+        T::schemas(schemas);
+    }
 }
 
 impl<T> Page<T> {

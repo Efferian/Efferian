@@ -3,6 +3,7 @@
 mod discover;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use axum::{Json, extract::State};
 use efferian_authz::authorize_admin;
@@ -27,7 +28,10 @@ use crate::vault::auth::refresh_api;
 
 pub(crate) use discover::DiscoveredToolSummary;
 
-use super::{Outcome, references::upstream_in_use};
+use super::{
+    Outcome,
+    references::{DELETE_REFERENCE_WORK_BYTES, upstream_in_use},
+};
 
 const MAX_HEADER_COUNT: usize = 32;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -53,6 +57,7 @@ pub(crate) struct UpstreamSummary {
     pub slug: String,
     pub url: String,
     pub headers: BTreeMap<String, String>,
+    #[schema(minimum = 1)]
     pub config_version: u64,
     pub discovered_at_ms: Option<i64>,
     pub discovered_tool_count: usize,
@@ -324,9 +329,26 @@ async fn delete(
     _: EmptyBody,
 ) -> ApiResult<StatusCode> {
     validate_slug(&slug).map_err(|_| ApiError::bad_input())?;
+    {
+        let slug = slug.clone();
+        let clock = Arc::clone(&state.clock);
+        let credential = caller.credential.clone();
+        state
+            .storage
+            .read_snapshot(move |conn| -> ApiResult<()> {
+                let ctx = refresh_api(conn, &credential, clock.wall_now_ms())?;
+                authorize_admin(&ctx)?;
+                let upstream = upstream_id(conn, &slug)?.ok_or_else(ApiError::not_found)?;
+                if upstream_in_use(conn, upstream)? {
+                    return Err(ApiError::conflict(code::RESOURCE_IN_USE));
+                }
+                Ok(())
+            })
+            .await?;
+    }
     state
         .storage
-        .execute_work(slug.len(), move |tx| {
+        .execute_work(DELETE_REFERENCE_WORK_BYTES, move |tx| {
             let ctx = refresh_api(tx.conn(), &caller.credential, tx.now_ms())?;
             authorize_admin(&ctx)?;
             let upstream = upstream_id(tx.conn(), &slug)?.ok_or_else(ApiError::not_found)?;

@@ -87,12 +87,10 @@ pub(crate) trait UpstreamDispatcher: Send + Sync {
 
     /// Returns the bounded JSON value of the corresponding MCP result.
     ///
-    /// Construct the future promptly. Inside it, submit the first tool request
-    /// through `cancellation.start_io(|| ...).await` after asynchronous pool or
-    /// connection preparation. The closure must perform a nonblocking handoff.
-    /// Wait for transport readiness outside that closure, and retry the handoff
-    /// through the fence. After submission, use `cancelled().await` to stop this
-    /// execution's I/O without interrupting unrelated pooled requests.
+    /// Check `cancellation.is_cancelled()` before submitting the first wire
+    /// request and observe `cancellation.cancelled().await` while awaiting I/O
+    /// so this execution stops promptly without interrupting unrelated pooled
+    /// requests.
     fn invoke(
         &self,
         _request: InvokeUpstream,

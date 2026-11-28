@@ -98,6 +98,16 @@ pub mod error_codes {
     pub const NODE_BUSY: &str = "node_busy";
     pub const UPSTREAM_BUSY: &str = "upstream_busy";
     pub const UPSTREAM_AUTH_FAILED: &str = "upstream_auth_failed";
+    pub const UPSTREAM_TIMEOUT: &str = "upstream_timeout";
+    pub const UPSTREAM_INVALID_RESPONSE: &str = "upstream_invalid_response";
+    pub const UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
+    pub const UPSTREAM_DISCONNECTED: &str = "upstream_disconnected";
+    pub const RESULT_STORAGE_FAILED: &str = "result_storage_failed";
+    pub const NODE_WS_BACKPRESSURE: &str = "node_ws_backpressure";
+    pub const NODE_DISCONNECTED_BEFORE_DISPATCH: &str = "node_disconnected_before_dispatch";
+    pub const DEADLINE_EXCEEDED: &str = "deadline_exceeded";
+    pub const HUB_RESTARTED: &str = "hub_restarted";
+    pub const HUB_SHUTTING_DOWN: &str = "hub_shutting_down";
     pub const OVERLOADED: &str = "overloaded";
     pub const STORAGE_PRESSURE: &str = "storage_pressure";
     pub const RESYNC_REQUIRED: &str = "resync_required";

@@ -75,6 +75,7 @@ impl<Id: fmt::Debug> fmt::Debug for VerifiedCredential<Id> {
 #[derive(Clone)]
 pub struct AuthenticatedApi {
     pub principal_id: PrincipalId,
+    pub principal_kind: PrincipalKind,
     pub credential: VerifiedCredential<TokenId>,
 }
 
@@ -157,6 +158,7 @@ pub fn authenticate_api(
     let context = active_principal_context(conn, token, now_ms)?;
     Ok(AuthenticatedApi {
         principal_id: context.caller.principal_id,
+        principal_kind: context.caller.kind,
         credential: VerifiedCredential {
             id: token_id,
             key_id: ACTIVE_KEY_ID,

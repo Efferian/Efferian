@@ -400,6 +400,7 @@ impl ToolDefinition {
             if !discovered.input_schema.is_object() {
                 return Err(ValidationError::InvalidField("discovered input schema"));
             }
+            validate_input_schema_structure(&discovered.input_schema)?;
             // Measure the authored object plus precisely the fields discovery supplies
             // before allocating owned copies of any upstream-controlled material.
             #[derive(serde::Serialize)]
