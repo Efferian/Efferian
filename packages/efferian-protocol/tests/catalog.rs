@@ -238,6 +238,16 @@ fn upstream_revision_captures_exact_discovery_schema_and_uses_both_deadlines() -
             Err(ValidationError::InvalidField("discovered input schema"))
         );
     }
+    let remote_ref = DiscoveredUpstreamTool {
+        input_schema: json!({"type":"object","definitions":{"x":{"$ref":"https://example.invalid/s"}}}),
+        ..discovered.clone()
+    };
+    assert_eq!(
+        tool.freeze_revision(Some(&remote_ref), 200, 200, &policy),
+        Err(ValidationError::InvalidField(
+            "non-local input schema reference"
+        ))
+    );
     let snapshot = tool.freeze_revision(Some(&discovered), 200, 200, &policy)?;
     assert_eq!(
         snapshot.definition.description.as_deref(),

@@ -112,6 +112,21 @@ pub struct AuthContext {
     pub now_ms: i64,
 }
 
+impl AuthContext {
+    /// Manager whose nodes an ownerless agent may target. Use this to narrow
+    /// candidate queries before authorizing the selected node.
+    pub fn orchestrator_node_manager(&self) -> Option<PrincipalId> {
+        if self.caller.kind == PrincipalKind::Agent && self.owner.is_none() {
+            return self
+                .managed_by
+                .as_ref()
+                .filter(|manager| manager.orchestrator())
+                .map(|manager| manager.principal_id);
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeAuthTarget {
     pub node_id: NodeId,

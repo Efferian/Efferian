@@ -1,7 +1,7 @@
 //! Principal management and the caller's current identity.
 
 mod data;
-mod introspection;
+pub(crate) mod introspection;
 
 use axum::{Json, extract::State};
 use efferian_authz::{PrincipalAccess, authorize_principal_manage};
@@ -117,11 +117,12 @@ async fn put(
     let new_id = request.new_id();
     let bytes = name.len() + request.work_bytes();
     let config = state.config;
+    let upstream = state.upstream;
     let result = state
         .storage
         .execute_work(bytes, move |tx| {
             let ctx = refresh_api(tx.conn(), &caller.credential, tx.now_ms())?;
-            upsert_principal(tx, &ctx, &config, name, new_id, request)
+            upsert_principal(tx, &ctx, &config, &upstream, name, new_id, request)
         })
         .await?;
     Ok((result.status(), Json(result)))
@@ -146,6 +147,7 @@ async fn disable(
     _: EmptyBody,
 ) -> ApiResult<StatusCode> {
     let bridge = state.bridge;
+    let upstream = state.upstream;
     state
         .storage
         .execute_priority(PriorityKind::DisablePrincipal, move |tx| {
@@ -154,12 +156,16 @@ async fn disable(
             let target =
                 read_principal(tx.conn(), principal)?.ok_or_else(|| point_missing(&ctx, true))?;
             authorize_principal_manage(&ctx, &target, PrincipalAccess::Disable)?;
-            if let Some(revoked) =
+            if let Some(disabled) =
                 tx.disable_principal(ActorId::Principal(ctx.caller.principal_id), principal)?
-                && !revoked.is_empty()
             {
                 tx.on_commit(move || {
-                    for (node, epoch) in revoked {
+                    for affected in disabled.affected_principals {
+                        upstream.invalidate(
+                            crate::upstream_dispatch::UpstreamInvalidation::Principal(affected),
+                        );
+                    }
+                    for (node, epoch) in disabled.revoked_nodes {
                         bridge.close_session(node, epoch, BridgeCloseReason::NodeRevoked);
                     }
                 });

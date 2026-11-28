@@ -75,6 +75,7 @@ impl<Id: fmt::Debug> fmt::Debug for VerifiedCredential<Id> {
 #[derive(Clone)]
 pub struct AuthenticatedApi {
     pub principal_id: PrincipalId,
+    pub principal_kind: PrincipalKind,
     pub credential: VerifiedCredential<TokenId>,
 }
 
@@ -157,6 +158,7 @@ pub fn authenticate_api(
     let context = active_principal_context(conn, token, now_ms)?;
     Ok(AuthenticatedApi {
         principal_id: context.caller.principal_id,
+        principal_kind: context.caller.kind,
         credential: VerifiedCredential {
             id: token_id,
             key_id: ACTIVE_KEY_ID,
@@ -192,6 +194,26 @@ pub(crate) fn refresh_api_with_label(
     conn: &Connection,
     credential: &VerifiedCredential<TokenId>,
     now_ms: i64,
+) -> Result<(AuthContext, String), CredentialError> {
+    let (context, label) = load_api_context(conn, credential, now_ms, true)?;
+    Ok((context, label))
+}
+
+/// Invocation policy decides how much an agent with a disabled owner can see.
+/// The credential is still rechecked before constructing this context.
+pub(crate) fn refresh_invoke(
+    conn: &Connection,
+    credential: &VerifiedCredential<TokenId>,
+    now_ms: i64,
+) -> Result<AuthContext, CredentialError> {
+    load_api_context(conn, credential, now_ms, false).map(|(ctx, _)| ctx)
+}
+
+fn load_api_context(
+    conn: &Connection,
+    credential: &VerifiedCredential<TokenId>,
+    now_ms: i64,
+    require_active: bool,
 ) -> Result<(AuthContext, String), CredentialError> {
     let token_id = credential.id();
     let row = conn
@@ -231,7 +253,10 @@ pub(crate) fn refresh_api_with_label(
     if !token.is_active(now_ms) {
         return Err(CredentialError::Unauthenticated);
     }
-    let mut context = active_principal_context(conn, token, now_ms)?;
+    let mut context = principal_context(conn, token, now_ms)?;
+    if require_active {
+        check_active(&context)?;
+    }
     context.caller_grants = grant_views(conn, context.caller.principal_id)?;
     if let Some(owner) = &context.owner {
         context.owner_grants = grant_views(conn, owner.principal_id)?;
@@ -462,9 +487,19 @@ fn active_principal_context(
     token: TokenScope,
     now_ms: i64,
 ) -> Result<AuthContext, CredentialError> {
+    let context = principal_context(conn, token, now_ms)?;
+    check_active(&context)?;
+    Ok(context)
+}
+
+fn principal_context(
+    conn: &Connection,
+    token: TokenScope,
+    now_ms: i64,
+) -> Result<AuthContext, CredentialError> {
     let caller =
         read_principal(conn, token.principal_id)?.ok_or(CredentialError::Unauthenticated)?;
-    let context = AuthContext {
+    Ok(AuthContext {
         owner: load_parent(conn, caller.owner_principal_id)?,
         managed_by: load_parent(conn, caller.managed_by_principal_id)?,
         caller,
@@ -473,9 +508,7 @@ fn active_principal_context(
         owner_grants: Vec::new(),
         managed_by_grants: Vec::new(),
         now_ms,
-    };
-    check_active(&context)?;
-    Ok(context)
+    })
 }
 
 fn load_parent(

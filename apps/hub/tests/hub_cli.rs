@@ -14,7 +14,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use efferian_protocol::HubId;
+use efferian_protocol::{ExecutionId, HubId, NodeId, RequestId, ToolId, UpstreamId};
 use futures_util::{StreamExt, stream};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
@@ -195,6 +195,98 @@ fn client() -> Client {
 }
 
 #[tokio::test]
+async fn startup_recovers_upstream_and_preserves_pending_node_execution() {
+    let client = client();
+    let dir = RunDir::new();
+    let state = dir.path("state");
+    let credential = token(success(
+        hub()
+            .args(["init", "--state-dir"])
+            .arg(&state)
+            .output()
+            .unwrap(),
+    ));
+    let node_execution = ExecutionId::new();
+    let upstream_execution = ExecutionId::new();
+    let conn = rusqlite::Connection::open(state.join("hub.sqlite3")).unwrap();
+    let request_id = RequestId::new();
+    for (execution, request, kind, state, node, upstream) in [
+        (
+            node_execution,
+            request_id,
+            "node",
+            "accepted",
+            Some(NodeId::new()),
+            None,
+        ),
+        (
+            upstream_execution,
+            RequestId::new(),
+            "upstream",
+            "running",
+            None,
+            Some(UpstreamId::new()),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO executions (
+                execution_id, invoke_kind, request_id, request_digest, caller_principal_id,
+                caller_token_id, tool_id, tool_version, public_name, executor_kind, node_id,
+                node_session_epoch, upstream_id, state, deadline_at_ms, created_at_ms,
+                result_expires_at_ms, expires_at_ms
+             ) SELECT ?1, 'tool_test', ?2, 'fixture', principal_id, token_id, ?3, 1, 'fixture',
+                 ?4, ?5, CASE WHEN ?5 IS NOT NULL THEN 1 END, ?6, ?7, ?8 + 300000, ?8,
+                 ?8 + 604800000, ?8 + 2592000000 FROM auth_tokens",
+            rusqlite::params![
+                execution.to_string(),
+                request.to_string(),
+                ToolId::new().to_string(),
+                kind,
+                node.map(|id| id.to_string()),
+                upstream.map(|id| id.to_string()),
+                state,
+                request_id.timestamp_ms()
+            ],
+        )
+        .unwrap();
+    }
+    conn.close().unwrap();
+
+    let server = Server::start(&state, "2", None);
+    let recovered = json(
+        client
+            .get(server.url(&format!("executions/{upstream_execution}")))
+            .bearer_auth(&credential),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(recovered["state"], "unknown");
+    assert_eq!(recovered["summary"]["error_code"], "hub_restarted");
+    let status = json(
+        client
+            .get(server.url("admin/status"))
+            .bearer_auth(&credential),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(status["active_waiters_count"], 1);
+    assert_eq!(status["active_upstream_executions"], 0);
+    assert!(status["events_head_seq"].as_u64().unwrap() > 0);
+    server.stop("TERM");
+
+    let server = Server::start(&state, "2", None);
+    let pending = json(
+        client
+            .get(server.url(&format!("executions/{node_execution}")))
+            .bearer_auth(&credential),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(pending["state"], "accepted");
+    server.stop("TERM");
+}
+
+#[tokio::test]
 async fn bootstrap_snapshot_restore_and_offline_recovery() {
     let client = client();
     let dir = RunDir::new();
@@ -232,7 +324,20 @@ async fn bootstrap_snapshot_restore_and_offline_recovery() {
     assert_eq!(me["principal"]["kind"], "admin");
     let token_id = me["token_scope"]["token_id"].as_str().unwrap();
     let info = json(client.get(server.url("info")), StatusCode::OK).await;
-    let spec = json(client.get(server.url("openapi.json")), StatusCode::OK).await;
+    let spec = client.get(server.url("openapi.json")).send().await.unwrap();
+    assert_eq!(spec.status(), StatusCode::OK);
+    let etag = spec.headers()[reqwest::header::ETAG].clone();
+    let bytes = spec.bytes().await.unwrap();
+    assert!(bytes.as_ref() == include_bytes!("../../../contracts/openapi-hub.json"));
+    let unchanged = client
+        .get(server.url("openapi.json"))
+        .header(reqwest::header::IF_NONE_MATCH, etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+    assert!(unchanged.bytes().await.unwrap().is_empty());
+    let spec: Value = serde_json::from_slice(&bytes).unwrap();
     for (path, code) in [
         ("/v1/me", "401"),
         ("/v1/tokens", "403"),
@@ -395,6 +500,25 @@ async fn enrollment_and_revocation_preserve_node_identity() {
     let node_id = original["node_id"].as_str().unwrap();
     let old_node_token = original["node_token"].as_str().unwrap();
     json(exchange().bearer_auth(enrollment), StatusCode::UNAUTHORIZED).await;
+    let handshake = |credential: &str, version: &'static str| {
+        client
+            .get(server.url("bridge/connect"))
+            .bearer_auth(credential)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", version)
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+    };
+    let unauthorized = json(handshake(&admin, "12"), StatusCode::UNAUTHORIZED).await;
+    assert_eq!(unauthorized["code"], "unauthenticated");
+    let malformed = json(handshake(old_node_token, "12"), StatusCode::BAD_REQUEST).await;
+    assert_eq!(malformed["code"], "invalid_input");
+    let unavailable = json(
+        handshake(old_node_token, "13"),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    assert_eq!(unavailable["code"], "overloaded");
 
     let reenroll = || {
         client

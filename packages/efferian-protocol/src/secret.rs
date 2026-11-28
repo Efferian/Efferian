@@ -9,7 +9,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     AccountKind, ValidationError,
-    validate::{validate_http_header_value, validate_secret_header_name, validate_secret_key},
+    validate::{
+        validate_env_var_value, validate_http_header_value, validate_secret_header_name,
+        validate_secret_key,
+    },
 };
 
 /// A secret backed by a zeroizing string. Serde explicitly reads and writes its wire value.
@@ -244,7 +247,10 @@ impl AccountSecretPayload {
                 if !(1..=MAX_SECRET_KV_ENTRIES).contains(&entries.len()) {
                     return Err(ValidationError::InvalidField("secret entries count"));
                 }
-                entries.keys().try_for_each(|key| validate_secret_key(key))
+                entries.iter().try_for_each(|(key, value)| {
+                    validate_secret_key(key)?;
+                    validate_env_var_value(value.expose_secret())
+                })
             }
         }
     }

@@ -1,4 +1,4 @@
-use efferian_protocol::{Capability, GrantScope, PrincipalId, PrincipalKind, ProfileId};
+use efferian_protocol::{Capability, GrantScope, PrincipalKind, ProfileId};
 
 use crate::{AuthContext, AuthzError, GrantView, PrincipalView};
 
@@ -34,18 +34,6 @@ impl<'a> CheckedContext<'a> {
             return Err(AuthzError::ManagedByDisabled);
         }
         Ok(ActiveContext(self))
-    }
-
-    pub(crate) fn orchestrator_manager(self) -> Option<PrincipalId> {
-        let ctx = self.context();
-        if ctx.caller.kind == PrincipalKind::Agent && ctx.owner.is_none() {
-            return ctx
-                .managed_by
-                .as_ref()
-                .filter(|parent| parent.orchestrator())
-                .map(|parent| parent.principal_id);
-        }
-        None
     }
 
     pub(crate) fn effective_profile_capability(self, profile_id: ProfileId) -> Option<Capability> {

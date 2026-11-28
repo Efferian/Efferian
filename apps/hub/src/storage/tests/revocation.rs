@@ -267,18 +267,17 @@ async fn node_revoke_commits_invites_executions_events_and_waiters_together() ->
             .await?,
         Some(100)
     );
+    // Revocation fences receipts even from the last issued epoch.
+    let mut receipt = f.receipt(accepted_id, TerminalExecutionState::Failed);
+    receipt.frame_epoch = 7;
     assert_eq!(
-        handle
-            .apply_receipt(f.receipt(accepted_id, TerminalExecutionState::Failed))
-            .await?,
-        ReceiptOutcome::LateReceiptRecorded
+        handle.apply_receipt(receipt).await?,
+        ReceiptOutcome::NotOwnedOrNotFound
     );
-    assert_eq!(
-        handle
-            .apply_receipt(f.receipt(accepted_id, TerminalExecutionState::Failed))
-            .await?,
-        ReceiptOutcome::AlreadyTerminalOwned
-    );
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }

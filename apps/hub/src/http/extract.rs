@@ -11,7 +11,7 @@ use http::{
 };
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Body as _;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 
 use crate::vault::auth::{AuthenticatedApi, AuthenticatedEnrollment, VerifiedCredential};
 
@@ -31,10 +31,7 @@ pub struct ApiCaller(pub AuthenticatedApi);
 pub struct EnrollmentCaller(pub AuthenticatedEnrollment);
 
 #[derive(Clone)]
-pub struct NodeCaller(
-    #[allow(dead_code, reason = "node bridge handshake extractor seam for #7")]
-    pub  VerifiedCredential<NodeId>,
-);
+pub struct NodeCaller(pub VerifiedCredential<NodeId>);
 
 macro_rules! extract_caller {
     ($name:ty) => {
@@ -91,6 +88,12 @@ where
 
 pub struct ApiJson<T>(pub T);
 
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ApiJson<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        efferian_protocol::deserialize_object(deserializer).map(Self)
+    }
+}
+
 impl<S, T> FromRequest<S> for ApiJson<T>
 where
     S: Send + Sync,
@@ -116,7 +119,7 @@ where
                     JsonRejection::BytesRejection(error) => ApiError::body_error(&error),
                     _ => ApiError::bad_input(),
                 })?;
-        Ok(Self(value))
+        Ok(value)
     }
 }
 

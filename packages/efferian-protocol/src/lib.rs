@@ -51,3 +51,4 @@ pub use ssrf::*;
 pub use tool::*;
 pub use validate::*;
 pub use validation_error::ValidationError;
+pub use wire::deserialize_object;

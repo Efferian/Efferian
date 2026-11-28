@@ -1,13 +1,13 @@
 include .devkit/runtime/devkit.mk
 
-.PHONY: gate_crate_dag gate_banned_crates gate_unsafe_and_clippy gate_no_internal_leaks gate_sqlite_hygiene report_loc_stats
+.PHONY: gate_crate_dag gate_banned_crates gate_unsafe_and_clippy gate_no_internal_leaks gate_sqlite_hygiene gate_openapi_drift report_loc_stats
 
 ifeq ($(strip $(value app)$(value package)),)
-check: gate_no_internal_leaks gate_crate_dag gate_banned_crates gate_unsafe_and_clippy gate_sqlite_hygiene report_loc_stats
+check: gate_no_internal_leaks gate_crate_dag gate_banned_crates gate_unsafe_and_clippy gate_sqlite_hygiene gate_openapi_drift report_loc_stats
 endif
 
 # Workspace gates run in the same offline Cargo container and reuse its target.
-gate_crate_dag gate_banned_crates gate_sqlite_hygiene: test/packages/efferian-authz
+gate_crate_dag gate_banned_crates gate_sqlite_hygiene gate_openapi_drift: test/packages/efferian-authz
 
 gate_unsafe_and_clippy: $(call devkit_targets,check) test/packages/efferian-platform
 

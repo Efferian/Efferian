@@ -3,7 +3,7 @@ use std::fs;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use efferian_protocol::{
@@ -131,7 +131,7 @@ impl Fixture {
             execution_id,
             node_id: self.node,
             state,
-            finished_at_ms: 77,
+            frame_epoch: 0,
             sealed_result_blob: Some(vec![1, 2, 3]),
             summary: ExecutionSummary {
                 exit_code: Some(42),
@@ -189,6 +189,27 @@ async fn pause_writer(
     });
     tokio::time::timeout(TIMEOUT, started).await??;
     Ok((release, task))
+}
+
+#[tokio::test]
+async fn work_barrier_retries_a_rolled_back_batch() -> TestResult {
+    let fixture = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = fixture.start()?;
+    let (release, anchor) = pause_writer(&handle).await?;
+    let mut aborted = std::pin::pin!(handle.execute_work(0, |tx| {
+        tx.conn()
+            .execute_batch("INSERT INTO missing_table VALUES (1)")?;
+        Ok::<_, WriteTxError<Infallible>>(())
+    }));
+    let mut barrier = std::pin::pin!(handle.work_barrier());
+    assert!(poll!(aborted.as_mut()).is_pending());
+    assert!(poll!(barrier.as_mut()).is_pending());
+    release.send(()).map_err(|()| "writer dropped the pause")?;
+    anchor.await?;
+    assert!(matches!(aborted.await, Err(WriteError::PreCommitAborted)));
+    tokio::time::timeout(TIMEOUT, barrier).await??;
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
 }
 
 #[tokio::test]
@@ -466,6 +487,7 @@ async fn late_receipt_is_deduplicated_even_after_event_pruning() -> TestResult {
         handle.apply_receipt(not_owned).await?,
         ReceiptOutcome::NotOwnedOrNotFound
     );
+    f.set_wall_ms(12);
     assert_eq!(
         handle
             .apply_receipt(f.receipt(exec, TerminalExecutionState::Failed))
@@ -479,7 +501,7 @@ async fn late_receipt_is_deduplicated_even_after_event_pruning() -> TestResult {
     assert_eq!(payload.state, ExecutionState::Failed);
     assert_eq!(payload.exit_code, Some(42));
     assert_eq!(payload.error_code.as_deref(), Some("receipt_code"));
-    assert_eq!(payload.duration_ms, Some(5));
+    assert_eq!(payload.duration_ms, Some(12));
     let row = handle.read_snapshot(move |conn| {
         let row = conn.query_row("SELECT state, summary_json, sealed_result_blob FROM executions WHERE execution_id = ?1",
             [exec.to_string()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
@@ -2162,7 +2184,7 @@ fn receipt_prepare_enforces_error_code_and_summary_invariants() {
         execution_id: ExecutionId::new(),
         node_id: NodeId::new(),
         state: TerminalExecutionState::Failed,
-        finished_at_ms: 10,
+        frame_epoch: 0,
         summary: ExecutionSummary {
             effect_may_have_occurred: Some(true),
             error_code: Some("ok_code".to_owned()),
@@ -2301,6 +2323,48 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
         .await?
         .execution_id;
 
+    let (reader_entered, entered) = tokio::sync::oneshot::channel();
+    let (release_reader, released) = std::sync::mpsc::channel();
+    let reader_handle = handle.clone();
+    let reader = tokio::spawn(async move {
+        reader_handle
+            .read_snapshot(move |conn| {
+                let head: i64 =
+                    conn.query_row("SELECT events_head_seq FROM hub_meta", [], |row| row.get(0))?;
+                let _ = reader_entered.send(());
+                let _ = released.recv();
+                Ok::<_, StorageError>(head)
+            })
+            .await
+    });
+    entered.await?;
+
+    // Saturate AUTH_READERS (2) and queue a 3rd waiter on the auth semaphore so
+    // we prove ReadPool::stop closes self.auth immediately upon writer failure.
+    let mut auth_entered = Vec::new();
+    let mut auth_release = Vec::new();
+    let mut auth_holders = Vec::new();
+    for _ in 0..2 {
+        let (etx, erx) = oneshot::channel();
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let ah = handle.clone();
+        auth_holders.push(tokio::spawn(async move {
+            ah.read_auth_snapshot(move |_conn| {
+                let _ = etx.send(());
+                let _ = rrx.recv();
+                Ok::<_, StorageError>(())
+            })
+            .await
+        }));
+        auth_entered.push(erx);
+        auth_release.push(rtx);
+    }
+    for erx in auth_entered {
+        tokio::time::timeout(TIMEOUT, erx).await??;
+    }
+    let mut waiting_auth = Box::pin(handle.read_auth_snapshot(|_| Ok::<_, StorageError>(())));
+    assert!(poll!(&mut waiting_auth).is_pending());
+
     // Trigger an unexpected writer exit via a panicking post-commit hook.
     handle
         .execute_work(0, |tx| {
@@ -2310,6 +2374,19 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
         .await?;
 
     tokio::time::timeout(TIMEOUT, runtime.wait_stopped()).await?;
+
+    // Waiting auth semaphore acquirer must fail fast with ActorStopped before
+    // the 2 in-flight auth readers release and before runtime.shutdown() runs.
+    assert!(matches!(
+        tokio::time::timeout(TIMEOUT, waiting_auth).await?,
+        Err(StorageError::ActorStopped)
+    ));
+    for rtx in auth_release {
+        let _ = rtx.send(());
+    }
+    for holder in auth_holders {
+        holder.await??;
+    }
 
     // hub.lock must remain held until the runtime is explicitly shut down.
     assert!(matches!(
@@ -2331,6 +2408,24 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
         Err(StorageError::ActorStopped)
     ));
     assert!(matches!(
+        handle
+            .read_auth_snapshot(|_| Ok::<_, StorageError>(()))
+            .await,
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
+        handle
+            .read_stream_snapshot(|_| Ok::<_, StorageError>(()))
+            .await,
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
+        handle
+            .read_control_snapshot(|_| Ok::<_, StorageError>(()))
+            .await,
+        Err(StorageError::ActorStopped)
+    ));
+    assert!(matches!(
         handle.subscribe_events(),
         Err(StorageError::ActorStopped)
     ));
@@ -2343,7 +2438,11 @@ async fn unexpected_writer_exit_wakes_wait_stopped_holds_lock_and_reports_actor_
         Err(StorageError::ActorStopped)
     ));
 
-    let report = tokio::time::timeout(TIMEOUT, runtime.shutdown()).await?;
+    let stopping = tokio::spawn(runtime.shutdown());
+    assert!(!stopping.is_finished());
+    release_reader.send(())?;
+    reader.await??;
+    let report = tokio::time::timeout(TIMEOUT, stopping).await??;
     assert!(matches!(
         report,
         ShutdownReport::Failed(StorageError::ActorStopped)
@@ -2408,6 +2507,140 @@ async fn revoke_token_and_grant_ignore_principal_being_purged() -> TestResult {
         events.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sibling_hook_panic_still_persists_collected_follow_up_write() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+
+    handle
+        .execute_work(0, |tx| {
+            tx.on_commit(|| assert_eq!(1, 0, "simulated sibling hook panic"));
+            tx.on_commit_follow_up(|| {
+                Some(FollowUpWrite::new(|tx| {
+                    tx.conn()
+                        .execute("UPDATE hub_meta SET updated_at_ms = 99", [])?;
+                    Ok(())
+                }))
+            });
+            Ok::<_, WriteTxError<Infallible>>(())
+        })
+        .await?;
+
+    tokio::time::timeout(TIMEOUT, runtime.wait_stopped()).await?;
+    let report = tokio::time::timeout(TIMEOUT, runtime.shutdown()).await?;
+    assert!(matches!(
+        report,
+        ShutdownReport::Failed(StorageError::ActorStopped)
+    ));
+
+    let conn = Connection::open_with_flags(f.path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let updated: i64 =
+        conn.query_row("SELECT updated_at_ms FROM hub_meta", [], |row| row.get(0))?;
+    assert_eq!(updated, 99);
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_queue_enforces_total_queued_byte_cap_before_slot_cap() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+    let (release, anchor) = pause_writer(&handle).await?;
+
+    let mut queued = Vec::new();
+    let chunk = 4 * 1024 * 1024;
+    // 32 * 4 MiB = 128 MiB fits within MAX_QUEUED_WORK_BYTES (well below WORK_CAP = 256).
+    for _ in 0..32 {
+        let mut fut =
+            Box::pin(handle.execute_work(chunk, |_| Ok::<_, WriteTxError<Infallible>>(())));
+        assert!(poll!(&mut fut).is_pending());
+        queued.push(fut);
+    }
+    let mut overflow =
+        Box::pin(handle.execute_work(chunk, |_| Ok::<_, WriteTxError<Infallible>>(())));
+    assert!(matches!(
+        poll!(&mut overflow),
+        std::task::Poll::Ready(Err(WriteError::Storage(StorageError::Overloaded)))
+    ));
+
+    release.send(()).map_err(|_| "writer stopped")?;
+    anchor.await?;
+    for fut in queued {
+        fut.await?;
+    }
+    assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_stream_catchup_retains_sub_semaphore_permit_until_worker_exits() -> TestResult {
+    let f = Fixture::create(StorageConfig::default())?;
+    let (handle, runtime) = f.start()?;
+
+    let mut entered_rx = Vec::new();
+    let mut release_tx = Vec::new();
+    let mut tasks = Vec::new();
+    // Saturate STREAM_CATCHUP_READERS = 2, then abort both async futures while
+    // their SQLite blocking workers are still active.
+    for _ in 0..2 {
+        let (etx, erx) = oneshot::channel();
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let h = handle.clone();
+        tasks.push(tokio::spawn(async move {
+            h.read_stream_snapshot(move |_conn| {
+                let _ = etx.send(());
+                let _ = rrx.recv();
+                Ok::<_, StorageError>(())
+            })
+            .await
+        }));
+        entered_rx.push(erx);
+        release_tx.push(rtx);
+    }
+    for erx in entered_rx {
+        tokio::time::timeout(TIMEOUT, erx).await??;
+    }
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        assert!(task.await.is_err());
+    }
+
+    // A 3rd stream catch-up read must stay blocked until the orphaned blocking
+    // workers finish, while a normal general read still succeeds immediately.
+    let third_entered = Arc::new(AtomicBool::new(false));
+    let entered_flag = Arc::clone(&third_entered);
+    let mut third_stream = Box::pin(handle.read_stream_snapshot(move |_| {
+        entered_flag.store(true, Ordering::SeqCst);
+        Ok::<_, StorageError>(())
+    }));
+    let head = tokio::time::timeout(
+        TIMEOUT,
+        handle.read_snapshot(|conn| {
+            conn.query_row("SELECT events_head_seq FROM hub_meta", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(StorageError::from)
+        }),
+    )
+    .await??;
+    assert_eq!(head, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut third_stream)
+            .await
+            .is_err()
+    );
+    assert!(!third_entered.load(Ordering::SeqCst));
+
+    for rtx in release_tx {
+        let _ = rtx.send(());
+    }
+    tokio::time::timeout(TIMEOUT, third_stream).await??;
+    assert!(third_entered.load(Ordering::SeqCst));
     assert!(matches!(runtime.shutdown().await, ShutdownReport::Complete));
     Ok(())
 }

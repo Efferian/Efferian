@@ -1,18 +1,21 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::oneshot;
 
 use crate::config::{self, Authority, Config, CsvList, Origin, Overrides};
 use crate::egress::EgressClient;
+use crate::execution::state::{finish_upstreams_for_shutdown, recover_upstreams, sweep_deadlines};
 use crate::http::{self, AppState};
 use crate::http_transport;
 use crate::node_bridge::OfflineNodeBridge;
 use crate::operations;
-use crate::storage::{OpenMode, ShutdownReport, StorageClock, SystemStorageClock};
+use crate::storage::{OpenMode, ShutdownReport, StorageClock, StorageRuntime, SystemStorageClock};
 
 #[derive(Parser)]
 #[command(version, about = "Run and administer an Efferian Hub")]
@@ -204,8 +207,8 @@ fn run(command: Command) -> CommandResult {
 }
 
 async fn serve(config: Config) -> CommandResult {
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
+    let interrupt = signal(SignalKind::interrupt())?;
+    let terminate = signal(SignalKind::terminate())?;
     let state_dir = config.state_dir()?.to_path_buf();
     let storage_config = config.storage_config();
     let egress = EgressClient::new(config.egress_policy()?)?;
@@ -220,37 +223,17 @@ async fn serve(config: Config) -> CommandResult {
         )
     })
     .await??;
-    let listener = TcpListener::bind(config.listen).await?;
-    let bound = listener.local_addr()?;
     let (storage, runtime) =
         tokio::task::spawn_blocking(move || opened.migrate_and_start_runtime()).await??;
-    let config = Arc::new(config);
-    let mut writer_stopped = false;
-    let app = AppState {
+    let app = AppState::new(
         storage,
         vault,
         clock,
-        config: Arc::clone(&config),
-        bridge: Arc::new(OfflineNodeBridge),
+        Arc::new(config),
+        Arc::new(OfflineNodeBridge),
         egress,
-    };
-    let server_result: CommandResult = match http::router(app, bound.port()) {
-        Ok(router) => {
-            eprintln!("Hub listening on {bound}");
-            let shutdown = async {
-                tokio::select! {
-                    biased;
-                    _ = runtime.wait_stopped() => writer_stopped = true,
-                    _ = interrupt.recv() => {}
-                    _ = terminate.recv() => {}
-                }
-            };
-            http_transport::serve(listener, router, config.max_tcp_connections, shutdown)
-                .await
-                .map_err(Into::into)
-        }
-        Err(error) => Err(error.into()),
-    };
+    );
+    let server_result = serve_running(app, &runtime, interrupt, terminate).await;
     match runtime.shutdown().await {
         ShutdownReport::Complete => {}
         ShutdownReport::WalCheckpointIncomplete {
@@ -264,14 +247,106 @@ async fn serve(config: Config) -> CommandResult {
         }
         ShutdownReport::Failed(error) => return Err(error.into()),
     }
-    if writer_stopped {
+    server_result
+}
+
+async fn serve_running(
+    app: AppState,
+    runtime: &StorageRuntime,
+    mut interrupt: tokio::signal::unix::Signal,
+    mut terminate: tokio::signal::unix::Signal,
+) -> CommandResult {
+    recover_upstreams(&app.storage).await?;
+    let listener = TcpListener::bind(app.config.listen).await?;
+    let bound = listener.local_addr()?;
+    let router = http::router(app.clone(), bound.port())?;
+    let (stop_http, http_stop) = oneshot::channel();
+    let server = http_transport::serve(listener, router, app.config.max_tcp_connections, async {
+        let _ = http_stop.await;
+    });
+    tokio::pin!(server);
+    let sweeper = tokio::spawn(deadline_sweeper(app.clone()));
+    eprintln!("Hub listening on {bound}");
+
+    let (writer_healthy, already_stopped) = tokio::select! {
+        biased;
+        _ = runtime.wait_stopped() => (false, None),
+        _ = interrupt.recv() => (true, None),
+        _ = terminate.recv() => (true, None),
+        result = &mut server => (true, Some(result)),
+    };
+    app.execution.stop();
+    let _ = stop_http.send(());
+
+    let (server_result, cleanup_result) = tokio::join!(
+        async {
+            match already_stopped {
+                Some(result) => result,
+                None => server.await,
+            }
+        },
+        async {
+            let _ = sweeper.await;
+            cleanup_dispatchers(&app, writer_healthy).await
+        },
+    );
+    if !writer_healthy {
         return Err("Hub database writer stopped unexpectedly".into());
     }
-    server_result
+    server_result?;
+    cleanup_result?;
+    Ok(())
+}
+
+async fn cleanup_dispatchers(app: &AppState, writer_healthy: bool) -> CommandResult {
+    let barrier = if writer_healthy {
+        app.storage.work_barrier().await
+    } else {
+        Ok(())
+    };
+    let can_flush_receipts = writer_healthy && barrier.is_ok();
+    tokio::join!(
+        drain_dispatcher(app.bridge.shutdown_graceful(can_flush_receipts)),
+        drain_dispatcher(app.upstream.shutdown()),
+    );
+    barrier?;
+    if writer_healthy {
+        finish_upstreams_for_shutdown(app).await?;
+    }
+    Ok(())
+}
+
+async fn drain_dispatcher(shutdown: impl std::future::Future<Output = ()>) {
+    if tokio::time::timeout(Duration::from_secs(2), shutdown)
+        .await
+        .is_err()
+    {
+        tracing::warn!("Dispatcher shutdown deadline elapsed");
+    }
+}
+
+async fn deadline_sweeper(app: AppState) {
+    let mut shutdown = app.execution.shutdown_receiver();
+    let period = Duration::from_secs(10);
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            () = async { let _ = shutdown.wait_for(|&stopping| stopping).await; } => return,
+            _ = interval.tick() => {
+                if let Err(error) = sweep_deadlines(&app).await {
+                    tracing::warn!(%error, "Execution deadline sweep did not complete");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    mod shutdown;
+
     use super::*;
 
     #[test]

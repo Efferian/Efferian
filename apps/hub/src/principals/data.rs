@@ -320,25 +320,14 @@ impl PrincipalPut {
 }
 
 #[derive(Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-enum PutOutcome {
-    Created,
-    Updated,
-    Unchanged,
-}
-
-#[derive(Serialize, ToSchema)]
 pub(super) struct PrincipalPutResponse {
-    outcome: PutOutcome,
+    outcome: crate::http::Outcome,
     principal: Principal,
 }
 
 impl PrincipalPutResponse {
     pub(super) const fn status(&self) -> StatusCode {
-        match self.outcome {
-            PutOutcome::Created => StatusCode::CREATED,
-            PutOutcome::Updated | PutOutcome::Unchanged => StatusCode::OK,
-        }
+        self.outcome.status()
     }
 }
 
@@ -348,6 +337,7 @@ pub(super) fn upsert_principal(
     tx: &mut WriteTx<'_>,
     ctx: &AuthContext,
     config: &Config,
+    upstream: &std::sync::Arc<dyn crate::upstream_dispatch::UpstreamDispatcher>,
     name: String,
     new_id: PrincipalId,
     body: PrincipalPut,
@@ -382,23 +372,23 @@ pub(super) fn upsert_principal(
         .map_err(ApiError::from)?;
         if requested == current {
             return Ok(PrincipalPutResponse {
-                outcome: PutOutcome::Unchanged,
+                outcome: crate::http::Outcome::Unchanged,
                 principal: existing,
             });
         }
         if requested.is_orchestrator && !current.is_orchestrator {
             check_managed_quota(tx.conn(), Some(&requested), config, 0)?;
         }
-        update_principal(tx, &current, &requested, now)?;
+        update_principal(tx, &current, &requested, upstream, now)?;
         Ok(PrincipalPutResponse {
-            outcome: PutOutcome::Updated,
+            outcome: crate::http::Outcome::Updated,
             principal: Principal::from_view(requested, name, existing.created_at_ms, now),
         })
     } else {
         check_managed_quota(tx.conn(), manager.as_ref(), config, 1)?;
         insert_principal(tx.conn(), &requested, &name, now)?;
         Ok(PrincipalPutResponse {
-            outcome: PutOutcome::Created,
+            outcome: crate::http::Outcome::Created,
             principal: Principal::from_view(requested, name, now, now),
         })
     }
@@ -504,6 +494,7 @@ fn update_principal(
     tx: &mut WriteTx<'_>,
     current: &PrincipalView,
     requested: &PrincipalView,
+    upstream: &std::sync::Arc<dyn crate::upstream_dispatch::UpstreamDispatcher>,
     now: i64,
 ) -> WriteResult<()> {
     let tags =
@@ -527,6 +518,15 @@ fn update_principal(
         || (current.inherit_owner_bindings && !requested.inherit_owner_bindings)
     {
         tx.principal_permissions_reduced(requested.principal_id)?;
+    }
+    if current.inherit_owner_bindings && !requested.inherit_owner_bindings {
+        let upstream = std::sync::Arc::clone(upstream);
+        let principal_id = requested.principal_id;
+        tx.on_commit(move || {
+            upstream.invalidate(crate::upstream_dispatch::UpstreamInvalidation::Principal(
+                principal_id,
+            ));
+        });
     }
     Ok(())
 }

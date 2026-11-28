@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::{Json, extract::State};
 use efferian_authz::{
@@ -6,16 +6,16 @@ use efferian_authz::{
     authorize_principal_manage, authorize_profile_discover,
 };
 use efferian_protocol::{
-    Capability, NodeId, PrincipalId, PrincipalKind, ProfileId, ProfileToolBinding, TokenId,
-    ToolDefinition, ToolSpec, UpstreamAccountMode, UpstreamId,
+    Capability, NodeId, PrincipalId, PrincipalKind, ProfileId, TokenId, UpstreamAccountMode,
+    UpstreamId,
 };
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use utoipa::ToSchema;
 use utoipa_axum::{router::UtoipaMethodRouter, routes};
 
 use crate::http::{ApiCaller, ApiError, ApiResult, AppState};
-use crate::storage::{id, json};
+use crate::storage::id;
 use crate::vault::auth::refresh_api_with_label;
 
 use super::data::{Principal, owned_agent_principals, principal_by_id};
@@ -51,9 +51,11 @@ struct OwnedAgent {
 }
 
 #[derive(Serialize, ToSchema)]
-struct CallerBoundUpstream {
-    upstream_id: UpstreamId,
+pub(crate) struct CallerBoundUpstream {
+    pub(crate) upstream_id: UpstreamId,
     slug: String,
+    #[serde(skip)]
+    pub(crate) caller_bound_profiles: Vec<ProfileId>,
 }
 
 #[utoipa::path(
@@ -118,120 +120,174 @@ fn owned_agents(conn: &Connection, ctx: &AuthContext) -> ApiResult<Vec<OwnedAgen
     Ok(visible)
 }
 
-fn caller_bound_upstreams(
+pub(crate) fn caller_bound_upstreams(
     conn: &Connection,
     ctx: &AuthContext,
 ) -> ApiResult<Vec<CallerBoundUpstream>> {
     if ctx.token.allowed_nodes.is_some() {
         return Ok(Vec::new());
     }
-    if let Some(ids) = &ctx.token.allowed_profiles {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids_json = serde_json::to_string(ids).map_err(|_| ApiError::internal())?;
-        let mut profiles = conn.prepare_cached(
-            "SELECT p.profile_id FROM profiles p
-             WHERE p.published_version > 0 AND p.disabled_at_ms IS NULL
-               AND p.profile_id IN (SELECT value FROM json_each(?1))",
-        )?;
-        return upstreams_for_profiles(
-            conn,
-            ctx,
-            profiles.query_map([ids_json], |row| id(row, 0))?,
-        );
+    let profiles = visible_published_profiles(conn, ctx)?;
+    if profiles.is_empty() {
+        return Ok(Vec::new());
     }
-    let mut profiles = conn.prepare_cached(
-        "SELECT profile_id FROM profiles WHERE published_version > 0 AND disabled_at_ms IS NULL",
-    )?;
-    upstreams_for_profiles(conn, ctx, profiles.query_map([], |row| id(row, 0))?)
-}
-
-fn upstreams_for_profiles(
-    conn: &Connection,
-    ctx: &AuthContext,
-    profiles: impl Iterator<Item = rusqlite::Result<ProfileId>>,
-) -> ApiResult<Vec<CallerBoundUpstream>> {
-    let mut published = conn.prepare_cached(
-        "SELECT pe.bindings_json
-         FROM profiles p JOIN profile_editions pe
+    let mut pinned = conn.prepare_cached(
+        "SELECT DISTINCT json_extract(tr.definition_json, '$.spec.upstream_id')
+         FROM profiles p
+         JOIN profile_editions pe
            ON pe.profile_id = p.profile_id AND pe.version = p.published_version
+         JOIN json_each(pe.bindings_json) b
+         JOIN tools t ON t.tool_id = json_extract(b.value, '$.tool_id')
+         JOIN tool_revisions tr
+           ON tr.tool_id = t.tool_id AND tr.version = json_extract(b.value, '$.tool_version')
          WHERE p.profile_id = ?1 AND p.published_version > 0
-           AND p.disabled_at_ms IS NULL AND pe.disabled_at_ms IS NULL",
-    )?;
-    let mut pinned_definition = conn.prepare_cached(
-        "SELECT tr.definition_json FROM tools t JOIN tool_revisions tr ON tr.tool_id = t.tool_id
-         WHERE t.tool_id = ?1 AND tr.version = ?2
-           AND t.kind = 'upstream_ref' AND t.disabled_at_ms IS NULL",
+           AND p.disabled_at_ms IS NULL AND pe.disabled_at_ms IS NULL
+           AND t.disabled_at_ms IS NULL
+           AND json_extract(tr.definition_json, '$.spec.kind') = 'upstream_ref'
+           AND json_extract(tr.definition_json, '$.spec.account_mode') = 'caller_bound'",
     )?;
     let mut active_upstream = conn.prepare_cached(
         "SELECT slug FROM upstreams WHERE upstream_id = ?1 AND disabled_at_ms IS NULL",
     )?;
-    let mut revisions = HashMap::new();
-    let mut visible = BTreeSet::new();
+    let mut visible = BTreeMap::<UpstreamId, Vec<ProfileId>>::new();
     for profile_id in profiles {
-        let profile_id = profile_id?;
-        if authorize_profile_discover(ctx, Some(profile_id)).is_err() {
-            continue;
-        }
-        let Some(bindings) = published
-            .query_row([profile_id.to_string()], |row| {
-                json::<Vec<ProfileToolBinding>>(row, 0)
-            })
-            .optional()?
-        else {
-            continue;
-        };
-        let mut upstreams = BTreeSet::new();
-        for binding in bindings {
-            let key = (binding.tool_id, binding.tool_version);
-            let upstream_id = match revisions.entry(key) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => *entry.insert(
-                    pinned_definition
-                        .query_row(
-                            params![binding.tool_id.to_string(), binding.tool_version],
-                            caller_bound_upstream_id,
-                        )
-                        .optional()?
-                        .flatten(),
-                ),
-            };
-            if let Some(upstream_id) = upstream_id {
-                upstreams.insert(upstream_id);
-            }
-        }
+        let upstreams: Vec<UpstreamId> = pinned
+            .query_map([profile_id.to_string()], |row| id(row, 0))?
+            .collect::<rusqlite::Result<_>>()?;
         for upstream_id in upstreams {
             let target = ExecutionTarget::Upstream {
                 upstream_id,
                 account: UpstreamAccountMode::CallerBound,
             };
             if authorize_discovery_target(ctx, profile_id, target).is_ok() {
-                visible.insert(upstream_id);
+                visible.entry(upstream_id).or_default().push(profile_id);
             }
         }
     }
     let mut result = Vec::new();
-    for upstream_id in visible {
+    for (upstream_id, caller_bound_profiles) in visible {
         if let Some(slug) = active_upstream
             .query_row([upstream_id.to_string()], |row| row.get(0))
             .optional()?
         {
-            result.push(CallerBoundUpstream { upstream_id, slug });
+            result.push(CallerBoundUpstream {
+                upstream_id,
+                slug,
+                caller_bound_profiles,
+            });
         }
     }
     result.sort_unstable_by(|left, right| left.slug.cmp(&right.slug));
     Ok(result)
 }
 
-fn caller_bound_upstream_id(row: &Row<'_>) -> rusqlite::Result<Option<UpstreamId>> {
-    let definition: ToolDefinition = json(row, 0)?;
-    Ok(match definition.spec {
-        ToolSpec::UpstreamRef {
-            upstream_id,
-            account_mode: UpstreamAccountMode::CallerBound,
-            ..
-        } => Some(upstream_id),
-        _ => None,
-    })
+/// Point check for a single upstream's caller-bound profile visibility.
+/// Avoids scanning unrelated upstreams and short-circuits when `first_only` is set.
+pub(crate) fn caller_bound_profiles_for_upstream(
+    conn: &Connection,
+    ctx: &AuthContext,
+    upstream_id: UpstreamId,
+    first_only: bool,
+) -> ApiResult<Vec<ProfileId>> {
+    if ctx.token.allowed_nodes.is_some() {
+        return Ok(Vec::new());
+    }
+    let active: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM upstreams WHERE upstream_id = ?1 AND disabled_at_ms IS NULL)",
+        )?
+        .query_row([upstream_id.to_string()], |row| row.get(0))?;
+    if !active {
+        return Ok(Vec::new());
+    }
+    let profiles = visible_published_profiles(conn, ctx)?;
+    if profiles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target = ExecutionTarget::Upstream {
+        upstream_id,
+        account: UpstreamAccountMode::CallerBound,
+    };
+    let upstream_text = upstream_id.to_string();
+    let mut has_caller_bound = conn.prepare_cached(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM profiles p
+             JOIN profile_editions pe
+               ON pe.profile_id = p.profile_id AND pe.version = p.published_version
+             JOIN json_each(pe.bindings_json) b
+             JOIN tools t ON t.tool_id = json_extract(b.value, '$.tool_id')
+             JOIN tool_revisions tr
+               ON tr.tool_id = t.tool_id AND tr.version = json_extract(b.value, '$.tool_version')
+             WHERE p.profile_id = ?1 AND p.published_version > 0
+               AND p.disabled_at_ms IS NULL AND pe.disabled_at_ms IS NULL
+               AND t.disabled_at_ms IS NULL
+               AND json_extract(tr.definition_json, '$.spec.kind') = 'upstream_ref'
+               AND json_extract(tr.definition_json, '$.spec.account_mode') = 'caller_bound'
+               AND json_extract(tr.definition_json, '$.spec.upstream_id') = ?2
+         )",
+    )?;
+    let mut matching = Vec::new();
+    for profile_id in profiles {
+        if authorize_discovery_target(ctx, profile_id, target).is_err() {
+            continue;
+        }
+        let found: bool = has_caller_bound
+            .query_row(params![profile_id.to_string(), &upstream_text], |row| {
+                row.get(0)
+            })?;
+        if found {
+            matching.push(profile_id);
+            if first_only {
+                break;
+            }
+        }
+    }
+    Ok(matching)
+}
+
+fn visible_published_profiles(conn: &Connection, ctx: &AuthContext) -> ApiResult<Vec<ProfileId>> {
+    let has_global_grant = ctx
+        .caller_grants
+        .iter()
+        .any(|grant| matches!(grant.scope, efferian_protocol::GrantScope::Global));
+    let candidate_ids: Option<Vec<ProfileId>> =
+        match (&ctx.token.allowed_profiles, has_global_grant) {
+            (Some(allowed), _) => Some(allowed.iter().copied().collect()),
+            (None, false) => {
+                let ids: BTreeSet<ProfileId> = ctx
+                    .caller_grants
+                    .iter()
+                    .filter_map(|grant| match grant.scope {
+                        efferian_protocol::GrantScope::Profile(id) => Some(id),
+                        efferian_protocol::GrantScope::Global => None,
+                    })
+                    .collect();
+                Some(ids.into_iter().collect())
+            }
+            (None, true) => None,
+        };
+    let raw: Vec<ProfileId> = if let Some(ids) = candidate_ids {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json = serde_json::to_string(&ids).map_err(|_| ApiError::internal())?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT p.profile_id FROM profiles p
+             WHERE p.published_version > 0 AND p.disabled_at_ms IS NULL
+               AND p.profile_id IN (SELECT value FROM json_each(?1))",
+        )?;
+        stmt.query_map([ids_json], |row| id(row, 0))?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        let mut stmt = conn.prepare_cached(
+            "SELECT profile_id FROM profiles WHERE published_version > 0 AND disabled_at_ms IS NULL",
+        )?;
+        stmt.query_map([], |row| id(row, 0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    Ok(raw
+        .into_iter()
+        .filter(|&profile_id| authorize_profile_discover(ctx, Some(profile_id)).is_ok())
+        .collect())
 }

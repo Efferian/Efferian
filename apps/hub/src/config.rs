@@ -121,6 +121,17 @@ pub struct Config {
     pub max_app_requests: usize,
     pub max_requests_per_principal: usize,
     pub max_control_requests: usize,
+    pub max_runtime_ms: u64,
+    pub upstream_hard_timeout_ms: u64,
+    pub deadline_grace_ms: u64,
+    pub max_node_concurrent_executions: usize,
+    pub max_concurrent_waiters: usize,
+    pub max_concurrent_waiters_per_principal: usize,
+    pub max_event_streams: usize,
+    pub max_event_streams_per_principal: usize,
+    pub max_concurrent_upstream_executions: usize,
+    pub max_concurrent_upstream_executions_per_upstream: usize,
+    pub max_concurrent_upstream_executions_per_principal: usize,
     pub max_managed_agents_per_member: usize,
     pub max_managed_agents_per_orchestrator: usize,
     pub max_active_nodes_per_orchestrator: usize,
@@ -146,6 +157,17 @@ impl Default for Config {
             max_app_requests: 1024,
             max_requests_per_principal: 64,
             max_control_requests: 64,
+            max_runtime_ms: 300_000,
+            upstream_hard_timeout_ms: 300_000,
+            deadline_grace_ms: 30_000,
+            max_node_concurrent_executions: 64,
+            max_concurrent_waiters: 512,
+            max_concurrent_waiters_per_principal: 32,
+            max_event_streams: 256,
+            max_event_streams_per_principal: 8,
+            max_concurrent_upstream_executions: 256,
+            max_concurrent_upstream_executions_per_upstream: 32,
+            max_concurrent_upstream_executions_per_principal: 16,
             max_managed_agents_per_member: 16,
             max_managed_agents_per_orchestrator: 256,
             max_active_nodes_per_orchestrator: 256,
@@ -232,6 +254,35 @@ impl Config {
         overlay!(max_app_requests, "MAX_APP_REQUESTS");
         overlay!(max_requests_per_principal, "MAX_REQUESTS_PER_PRINCIPAL");
         overlay!(max_control_requests, "MAX_CONTROL_REQUESTS");
+        overlay!(max_runtime_ms, "MAX_RUNTIME_MS");
+        overlay!(upstream_hard_timeout_ms, "UPSTREAM_HARD_TIMEOUT_MS");
+        overlay!(deadline_grace_ms, "DEADLINE_GRACE_MS");
+        overlay!(
+            max_node_concurrent_executions,
+            "MAX_NODE_CONCURRENT_EXECUTIONS"
+        );
+        overlay!(max_concurrent_waiters, "MAX_CONCURRENT_WAITERS");
+        overlay!(
+            max_concurrent_waiters_per_principal,
+            "MAX_CONCURRENT_WAITERS_PER_PRINCIPAL"
+        );
+        overlay!(max_event_streams, "MAX_EVENT_STREAMS");
+        overlay!(
+            max_event_streams_per_principal,
+            "MAX_EVENT_STREAMS_PER_PRINCIPAL"
+        );
+        overlay!(
+            max_concurrent_upstream_executions,
+            "MAX_CONCURRENT_UPSTREAM_EXECUTIONS"
+        );
+        overlay!(
+            max_concurrent_upstream_executions_per_upstream,
+            "MAX_CONCURRENT_UPSTREAM_EXECUTIONS_PER_UPSTREAM"
+        );
+        overlay!(
+            max_concurrent_upstream_executions_per_principal,
+            "MAX_CONCURRENT_UPSTREAM_EXECUTIONS_PER_PRINCIPAL"
+        );
         overlay!(
             max_managed_agents_per_member,
             "MAX_MANAGED_AGENTS_PER_MEMBER"
@@ -310,6 +361,7 @@ impl Config {
         StorageConfig {
             synchronous: self.sqlite_synchronous,
             max_page_count: self.max_page_count,
+            max_concurrent_waiters: self.max_concurrent_waiters,
             ..StorageConfig::default()
         }
     }
@@ -332,10 +384,16 @@ impl Config {
         {
             return Err(ConfigError::InvalidSetting("state_dir"));
         }
-        self.storage_config()
-            .validate()
-            .map_err(|_| ConfigError::InvalidSetting("max_page_count"))?;
         self.egress_policy()?;
+        for (key, value, minimum) in [
+            ("max_runtime_ms", self.max_runtime_ms, 1),
+            ("upstream_hard_timeout_ms", self.upstream_hard_timeout_ms, 1),
+            ("deadline_grace_ms", self.deadline_grace_ms, 30_000),
+        ] {
+            if value < minimum {
+                return Err(ConfigError::InvalidSetting(key));
+            }
+        }
         for (key, limit) in [
             ("max_tcp_connections", self.max_tcp_connections),
             ("max_pre_auth_in_flight", self.max_pre_auth_in_flight),
@@ -345,12 +403,41 @@ impl Config {
                 self.max_requests_per_principal,
             ),
             ("max_control_requests", self.max_control_requests),
+            ("max_concurrent_waiters", self.max_concurrent_waiters),
+            (
+                "max_concurrent_waiters_per_principal",
+                self.max_concurrent_waiters_per_principal,
+            ),
+            ("max_event_streams", self.max_event_streams),
+            (
+                "max_event_streams_per_principal",
+                self.max_event_streams_per_principal,
+            ),
         ] {
             if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&limit) {
                 return Err(ConfigError::InvalidSetting(key));
             }
         }
+        self.storage_config()
+            .validate()
+            .map_err(|_| ConfigError::InvalidSetting("max_page_count"))?;
         for (key, limit) in [
+            (
+                "max_node_concurrent_executions",
+                self.max_node_concurrent_executions,
+            ),
+            (
+                "max_concurrent_upstream_executions",
+                self.max_concurrent_upstream_executions,
+            ),
+            (
+                "max_concurrent_upstream_executions_per_upstream",
+                self.max_concurrent_upstream_executions_per_upstream,
+            ),
+            (
+                "max_concurrent_upstream_executions_per_principal",
+                self.max_concurrent_upstream_executions_per_principal,
+            ),
             (
                 "max_active_tokens_per_principal",
                 self.max_active_tokens_per_principal,

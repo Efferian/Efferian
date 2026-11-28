@@ -5,8 +5,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     ExecutionId, ExecutionSummary, HubId, MAX_OUTPUT_BYTES, NodeId, OutputDiscardedReason,
-    PlatformOs, ResolvedAction, SecretString, TerminalExecutionState, ValidationError, error_codes,
-    result::{DecodedOutput, decode_output, validate_error_code, validate_error_message},
+    PlatformOs, ResolvedAction, SecretString, TerminalExecutionState, ValidationError,
+    result::{DecodedOutput, decode_output},
     wire::{deserialize_object, strict_struct},
 };
 
@@ -177,21 +177,15 @@ strict_struct! {
 
 impl ExecuteResPayload {
     fn validate_receipt(&self) -> Result<(), ValidationError> {
-        use TerminalExecutionState::{Cancelled, TimedOut, Unknown};
-
-        if (matches!(self.state, Unknown | Cancelled | TimedOut) && !self.effect_may_have_occurred)
-            || (self.error_code.as_deref() == Some(error_codes::NODE_BUSY)
-                && self.effect_may_have_occurred)
-        {
-            return Err(ValidationError::InvalidReceipt);
-        }
-        if self.output_discarded_reason.is_some()
-            && (!self.truncated || self.stdout_b64.is_some() || self.stderr_b64.is_some())
-        {
-            return Err(ValidationError::InvalidReceipt);
-        }
-        validate_error_code(self.error_code.as_deref())?;
-        validate_error_message(self.error_message.as_deref())
+        crate::result::validate_terminal_fields(
+            self.state,
+            self.effect_may_have_occurred,
+            self.error_code.as_deref(),
+            self.error_message.as_deref(),
+            self.output_discarded_reason,
+            self.stdout_b64.is_some() || self.stderr_b64.is_some(),
+            self.truncated,
+        )
     }
 
     pub fn decode_and_validate_output(

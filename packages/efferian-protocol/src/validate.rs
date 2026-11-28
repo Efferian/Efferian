@@ -426,8 +426,11 @@ pub fn validate_public_tool_name(name: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Gate references in positions occupied by Draft 2020-12 schemas. The
-/// consumer compiles the schema separately with external resolution disabled.
+const DRAFT_2020_12_SCHEMA_URI: &str = "https://json-schema.org/draft/2020-12/schema";
+
+/// Gate references in positions occupied by Draft 2020-12 schemas and reject
+/// remote references or alternate draft declarations anywhere in the JSON tree.
+/// The consumer compiles the schema separately with external resolution disabled.
 pub fn validate_input_schema_structure(schema: &Value) -> Result<(), ValidationError> {
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         return Err(ValidationError::InvalidField("object input schema"));
@@ -440,17 +443,6 @@ pub fn validate_input_schema_structure(schema: &Value) -> Result<(), ValidationE
             }
             return Err(ValidationError::InvalidField("input subschema"));
         };
-        for keyword in ["$ref", "$dynamicRef"] {
-            if let Some(reference) = schema.get(keyword)
-                && !reference
-                    .as_str()
-                    .is_some_and(|reference| reference.starts_with('#'))
-            {
-                return Err(ValidationError::InvalidField(
-                    "non-local input schema reference",
-                ));
-            }
-        }
         for keyword in [
             "$defs",
             "properties",
@@ -491,6 +483,50 @@ pub fn validate_input_schema_structure(schema: &Value) -> Result<(), ValidationE
             if let Some(value) = schema.get(keyword) {
                 pending.push(value);
             }
+        }
+    }
+    // Walk non-data subtrees (including legacy `definitions` and custom keys
+    // reachable through local JSON Pointers) so no remote `$ref` or alternate
+    // `$schema` URI can hide outside standard Draft 2020-12 keywords, while
+    // leaving literal data keywords (`const`, `default`, `examples`, `enum`)
+    // and schema-map property names untouched.
+    let mut walk = vec![schema];
+    while let Some(node) = walk.pop() {
+        match node {
+            Value::Object(map) => {
+                if let Some(uri) = map.get("$schema")
+                    && uri.as_str() != Some(DRAFT_2020_12_SCHEMA_URI)
+                {
+                    return Err(ValidationError::InvalidField("input schema draft"));
+                }
+                for keyword in ["$ref", "$dynamicRef"] {
+                    if let Some(reference) = map.get(keyword)
+                        && !reference
+                            .as_str()
+                            .is_some_and(|reference| reference.starts_with('#'))
+                    {
+                        return Err(ValidationError::InvalidField(
+                            "non-local input schema reference",
+                        ));
+                    }
+                }
+                for (key, value) in map {
+                    match key.as_str() {
+                        "const" | "default" | "examples" | "enum" => continue,
+                        "$defs" | "definitions" | "properties" | "patternProperties"
+                        | "dependentSchemas" => {
+                            if let Some(entries) = value.as_object() {
+                                walk.extend(entries.values());
+                            } else {
+                                walk.push(value);
+                            }
+                        }
+                        _ => walk.push(value),
+                    }
+                }
+            }
+            Value::Array(items) => walk.extend(items),
+            _ => {}
         }
     }
     Ok(())

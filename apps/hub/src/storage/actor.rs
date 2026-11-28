@@ -19,11 +19,14 @@ use super::{OpenMode, StorageConfig, StorageError, WriteError};
 
 const PRIORITY_CAPACITY: usize = 128;
 const WORK_CAPACITY: usize = 256;
+const MAX_QUEUED_WORK_BYTES: usize = 128 * 1024 * 1024;
+const MIN_SUBSCRIPTION_CAPACITY: usize = 512;
 const MAX_COMMANDS: usize = 32;
 const PRIORITY_BURST: usize = 16;
 pub(crate) const MAX_WORK_BYTES: usize = 4 * 1024 * 1024;
 const EVENTS_CAPACITY: usize = 1024;
 const REVOCATIONS_CAPACITY: usize = 128;
+const MAX_BARRIER_RETRIES: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionSnapshot {
@@ -65,8 +68,8 @@ pub enum ShutdownReport {
 }
 
 impl StorageRuntime {
-    /// Resolves when the background writer thread exits (either gracefully or
-    /// after an unrecoverable error). Safe to use in a supervisor `select!`.
+    /// Resolves when the writer stops accepting commands. Reader drain and
+    /// SQLite close can still be in progress until `shutdown` joins the thread.
     pub async fn wait_stopped(&self) {
         let mut rx = self.stopped.clone();
         let _ = rx.wait_for(|&stopped| stopped).await;
@@ -135,7 +138,7 @@ impl StorageHandle {
     ) -> Result<Option<watch::Receiver<ExecutionSnapshot>>, StorageError> {
         let (send, recv) = oneshot::channel();
         self.mailbox.enqueue(|state| {
-            if state.subscriptions.len() == WORK_CAPACITY {
+            if state.subscriptions.len() >= self.mailbox.subscription_capacity {
                 return Err(StorageError::Overloaded);
             }
             state.subscriptions.push_back((execution_id, send));
@@ -153,6 +156,28 @@ impl StorageHandle {
         E: From<StorageError> + Send + 'static,
     {
         self.readers.snapshot(read).await
+    }
+
+    pub(crate) async fn read_auth_snapshot<T, E>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        self.readers.auth_snapshot(read).await
+    }
+
+    pub(crate) async fn read_stream_snapshot<T, E>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<StorageError> + Send + 'static,
+    {
+        self.readers.stream_snapshot(read).await
     }
 
     pub(crate) async fn read_control_snapshot<T, E>(
@@ -195,6 +220,24 @@ impl StorageHandle {
         self.execute(None, op).await
     }
 
+    pub(crate) async fn work_barrier(&self) -> Result<(), WriteError<std::convert::Infallible>> {
+        let mut commit_retries = 0;
+        loop {
+            match self.execute_work(0, |_| Ok(())).await {
+                Err(WriteError::Storage(StorageError::Overloaded)) => {}
+                Err(WriteError::PreCommitAborted | WriteError::CommitOutcomeUnknown)
+                    if commit_retries < MAX_BARRIER_RETRIES =>
+                {
+                    commit_retries += 1;
+                }
+                result => return result,
+            }
+            // A neighboring command can roll back the barrier's entire batch.
+            // Re-enqueuing an empty barrier remains safe after an unknown commit.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     async fn execute<T, E, F>(&self, bytes: Option<usize>, op: F) -> Result<T, WriteError<E>>
     where
         T: Send + 'static,
@@ -209,9 +252,12 @@ impl StorageHandle {
         });
         self.mailbox.enqueue(|state| {
             if let Some(bytes) = bytes {
-                if state.work.len() == WORK_CAPACITY {
+                if state.work.len() == WORK_CAPACITY
+                    || state.queued_work_bytes.saturating_add(bytes) > MAX_QUEUED_WORK_BYTES
+                {
                     return Err(StorageError::Overloaded);
                 }
+                state.queued_work_bytes = state.queued_work_bytes.saturating_add(bytes);
                 state.work.push_back(Work { bytes, command });
             } else {
                 if state.priority.len() == PRIORITY_CAPACITY {
@@ -239,7 +285,12 @@ impl OpenedDb {
         migrate_to_current(&mut self.conn, found)?;
 
         let readers = ReadPool::open(database_path(&self.lock))?;
-        let mailbox = Arc::new(Mailbox::default());
+        let mailbox = Arc::new(Mailbox {
+            subscription_capacity: MIN_SUBSCRIPTION_CAPACITY
+                .max(self.config.max_concurrent_waiters),
+            state: Mutex::default(),
+            wake: Condvar::new(),
+        });
         let (events, _) = broadcast::channel(EVENTS_CAPACITY);
         let (revocations, _) = broadcast::channel(REVOCATIONS_CAPACITY);
         let (stopped_tx, stopped_rx) = watch::channel(false);
@@ -278,9 +329,10 @@ impl OpenedDb {
                 }));
                 // End live streams promptly if the writer can no longer publish.
                 drop(actor);
-                writer_readers.finish_close(failed);
+                writer_readers.stop(failed);
+                stopped_tx.send_replace(true);
+                writer_readers.wait_drained();
                 let (report, lock) = finish_writer(self, result);
-                let _ = stopped_tx.send(true);
                 (report, lock)
             })?;
         Ok((
@@ -372,8 +424,21 @@ impl DbActor {
         let appended = effects.events.len();
         let wrote_result_blob = effects.wrote_result_blob;
         let committed = matches!(outcome, BatchOutcome::Committed);
+        let mut reply_outcome = outcome;
         let result = match (outcome, fatal_commit) {
-            (BatchOutcome::Committed, _) => self.publish(effects),
+            (BatchOutcome::Committed, _) => {
+                let (follow_ups, hook_panicked) = self.publish(effects);
+                let follow_up = self.run_follow_ups(db, follow_ups).inspect_err(|_| {
+                    reply_outcome = BatchOutcome::Unknown;
+                });
+                follow_up.and_then(|()| {
+                    if hook_panicked {
+                        Err(StorageError::ActorStopped)
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
             (_, Some(error)) => Err(error),
             _ if db.conn.is_autocommit() => Ok(()),
             _ => db
@@ -382,7 +447,7 @@ impl DbActor {
                 .map_err(StorageError::from),
         };
         for command in commands {
-            command.reply(outcome);
+            command.reply(reply_outcome);
         }
         result?;
         if !db.conn.is_autocommit() {
@@ -401,7 +466,54 @@ impl DbActor {
         Ok(committed)
     }
 
-    fn publish(&mut self, effects: Effects) -> Result<(), StorageError> {
+    fn run_follow_ups(
+        &mut self,
+        db: &OpenedDb,
+        mut commands: Vec<Box<dyn Command>>,
+    ) -> Result<(), StorageError> {
+        // Continuations are already accepted obligations. Never enqueue them
+        // behind an external request or drop them when ingress is full.
+        let mut hook_panicked = false;
+        while !commands.is_empty() {
+            let mut effects = Effects::default();
+            let mut probe = PressureProbe {
+                cached: self.maintenance.level(),
+                changed: false,
+            };
+            let (outcome, error) =
+                run_transaction(db, &mut commands, &mut effects, &self.waiters, &mut probe);
+            if !matches!(outcome, BatchOutcome::Committed) {
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                if !db.conn.is_autocommit() {
+                    db.conn.execute_batch("ROLLBACK")?;
+                }
+                return Err(StorageError::InvalidDatabase(
+                    "post-commit continuation could not be persisted",
+                ));
+            }
+            let wrote_result_blob = effects.wrote_result_blob;
+            let appended = effects.events.len();
+            let (next_commands, panicked) = self.publish(effects);
+            hook_panicked |= panicked;
+            self.maintenance.after_write(
+                db,
+                true,
+                0,
+                wrote_result_blob,
+                appended,
+                probe.changed,
+            )?;
+            commands = next_commands;
+        }
+        if hook_panicked {
+            return Err(StorageError::ActorStopped);
+        }
+        Ok(())
+    }
+
+    fn publish(&mut self, effects: Effects) -> (Vec<Box<dyn Command>>, bool) {
         for signal in effects.revocations {
             let _ = self.revocations.send(Arc::new(signal));
         }
@@ -421,15 +533,16 @@ impl DbActor {
         for event in effects.events {
             let _ = self.events.send(Arc::new(event));
         }
-        let mut failed = false;
+        let mut follow_ups = Vec::<Box<dyn Command>>::new();
+        let mut panicked = false;
         for hook in effects.hooks {
-            failed |= std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)).is_err();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+                Ok(Some(write)) => follow_ups.push(Box::new(write)),
+                Ok(None) => {}
+                Err(_) => panicked = true,
+            }
         }
-        if failed {
-            Err(StorageError::ActorStopped)
-        } else {
-            Ok(())
-        }
+        (follow_ups, panicked)
     }
 }
 
@@ -526,7 +639,7 @@ struct Effects {
     registered: Waiters,
     updated: Vec<(ExecutionId, ExecutionSnapshot)>,
     finished: Vec<(ExecutionId, ExecutionSnapshot)>,
-    hooks: Vec<Box<dyn FnOnce() + Send>>,
+    hooks: Vec<Box<dyn FnOnce() -> Option<FollowUpWrite> + Send>>,
     wrote_result_blob: bool,
 }
 
@@ -639,6 +752,17 @@ impl WriteTx<'_> {
 
     /// Runs on the writer thread after event publication and must return promptly.
     pub(crate) fn on_commit(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.on_commit_follow_up(move || {
+            hook();
+            None
+        });
+    }
+
+    /// Run a nonblocking effect, optionally returning a writer-local continuation.
+    pub(crate) fn on_commit_follow_up(
+        &mut self,
+        hook: impl FnOnce() -> Option<FollowUpWrite> + Send + 'static,
+    ) {
         self.effects.hooks.push(Box::new(hook));
     }
 }
@@ -704,6 +828,9 @@ pub(crate) enum PriorityKind {
     DisablePrincipal,
     RevokeNode,
     RevokeGrant,
+    DisableUpstream,
+    DisableTool,
+    DisableProfile,
     DisableEdition,
     CancelExecution,
 }
@@ -724,6 +851,30 @@ enum CommandResult {
 trait Command: Send {
     fn run(&mut self, tx: &mut WriteTx<'_>) -> CommandResult;
     fn reply(self: Box<Self>, outcome: BatchOutcome);
+}
+
+type Continuation = Box<dyn FnOnce(&mut WriteTx<'_>) -> Result<(), StorageError> + Send>;
+
+/// A metadata write required by an effect that ran after a durable commit.
+pub(crate) struct FollowUpWrite(Option<Continuation>);
+
+impl FollowUpWrite {
+    pub(crate) fn new(
+        write: impl FnOnce(&mut WriteTx<'_>) -> Result<(), StorageError> + Send + 'static,
+    ) -> Self {
+        Self(Some(Box::new(write)))
+    }
+}
+
+impl Command for FollowUpWrite {
+    fn run(&mut self, tx: &mut WriteTx<'_>) -> CommandResult {
+        match self.0.take().map(|write| write(tx)) {
+            Some(Ok(())) => CommandResult::Success,
+            Some(Err(_)) | None => CommandResult::FatalError,
+        }
+    }
+
+    fn reply(self: Box<Self>, _outcome: BatchOutcome) {}
 }
 
 struct Operation<T, E, F> {
@@ -780,8 +931,8 @@ struct Work {
     command: Box<dyn Command>,
 }
 
-#[derive(Default)]
 struct Mailbox {
+    subscription_capacity: usize,
     state: Mutex<MailboxState>,
     wake: Condvar,
 }
@@ -790,6 +941,7 @@ struct Mailbox {
 struct MailboxState {
     priority: VecDeque<Box<dyn Command>>,
     work: VecDeque<Work>,
+    queued_work_bytes: usize,
     subscriptions: VecDeque<(ExecutionId, SubscribeReply)>,
     shutting_down: bool,
     stopped: bool,
@@ -850,6 +1002,7 @@ impl Mailbox {
             } else {
                 state.shutting_down = true;
             }
+            state.queued_work_bytes = 0;
             (
                 std::mem::take(&mut state.priority),
                 std::mem::take(&mut state.work),
@@ -897,6 +1050,7 @@ impl Mailbox {
                     .is_some_and(|next| next.bytes <= remaining)
             {
                 let next = state.work.pop_front()?;
+                state.queued_work_bytes = state.queued_work_bytes.saturating_sub(next.bytes);
                 remaining -= next.bytes;
                 turn.bytes += next.bytes;
                 turn.commands.push(next.command);

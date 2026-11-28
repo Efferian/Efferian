@@ -137,14 +137,14 @@ impl Fixture {
         .unwrap();
         let (storage, runtime) = opened.migrate_and_start_runtime().unwrap();
         let egress = EgressClient::new(config.egress_policy().unwrap()).unwrap();
-        let state = AppState {
+        let state = AppState::new(
             storage,
             vault,
             clock,
             config,
-            bridge: Arc::new(OfflineNodeBridge),
+            Arc::new(OfflineNodeBridge),
             egress,
-        };
+        );
         let bearer = |secret: efferian_protocol::SecretString| {
             let mut value =
                 HeaderValue::from_str(&format!("Bearer {}", secret.expose_secret())).unwrap();
@@ -291,6 +291,7 @@ fn routes_for_tests(gate: Arc<Gate>) -> RouteGroups {
             .route("/v1/enrollment/exchange", post(enrollment_json)),
         node_handshake: OpenApiRouter::default().route("/v1/bridge/connect", get(node_only)),
         mcp: OpenApiRouter::default().route("/mcp/{slug}", any_service(FakeMcp)),
+        ..RouteGroups::default()
     }
 }
 
@@ -1361,7 +1362,8 @@ async fn openapi_metadata_caps_extensions_and_live_response_schemas() {
                     for param in params {
                         if param["name"] == "limit" {
                             assert_eq!(param["schema"]["minimum"].as_f64(), Some(1.0));
-                            assert_eq!(param["schema"]["maximum"].as_f64(), Some(200.0));
+                            let max = if path == "/v1/events" { 500.0 } else { 200.0 };
+                            assert_eq!(param["schema"]["maximum"].as_f64(), Some(max));
                         }
                     }
                 }
@@ -1419,4 +1421,350 @@ async fn openapi_metadata_caps_extensions_and_live_response_schemas() {
         );
     }
     fixture.finish().await;
+}
+
+#[tokio::test]
+async fn control_lane_caps_non_admin_and_reserves_capacity_for_admin() {
+    let fixture = Fixture::new();
+    let now = fixture.state.clock.wall_now_ms();
+    let mut member_bearers = Vec::new();
+    for name in ["m1", "m2", "m3"] {
+        let principal = PrincipalId::new_for_kind(PrincipalKind::Member);
+        let token_id = TokenId::new_for_kind(PrincipalKind::Member);
+        let issued = fixture.state.vault.issue_token(token_id).unwrap();
+        let verifier = issued.verifier.as_str().to_owned();
+        let name = name.to_owned();
+        fixture
+            .state
+            .storage
+            .execute_work(0, move |tx| {
+                tx.conn().execute(
+                    "INSERT INTO principals(principal_id, name, kind, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, 'member', ?3, ?3)",
+                    params![principal.to_string(), name, now],
+                )?;
+                tx.conn().execute(
+                    "INSERT INTO auth_tokens(token_id, principal_id, created_by, label, verifier_hmac, created_at_ms)
+                     VALUES (?1, ?2, ?2, 'ctl-test', ?3, ?4)",
+                    params![token_id.to_string(), principal.to_string(), verifier, now],
+                )?;
+                Ok::<_, crate::storage::WriteTxError<Infallible>>(())
+            })
+            .await
+            .unwrap();
+        let mut bearer =
+            HeaderValue::from_str(&format!("Bearer {}", issued.secret.expose_secret())).unwrap();
+        bearer.set_sensitive(true);
+        member_bearers.push(bearer);
+    }
+
+    let mut state = fixture.state.clone();
+    let cfg = Arc::make_mut(&mut state.config);
+    cfg.max_control_requests = 4; // per_principal = 1, non_admin = 2, 2 reserved for Admin
+    let gate_a = Arc::new(Gate::default());
+    let gate_b = Arc::new(Gate::default());
+    let routes = RouteGroups {
+        control: OpenApiRouter::default()
+            .route(
+                "/v1/test/ctl-a",
+                post(hold).layer(Extension(Arc::clone(&gate_a))),
+            )
+            .route(
+                "/v1/test/ctl-b",
+                post(hold).layer(Extension(Arc::clone(&gate_b))),
+            )
+            .route("/v1/test/ctl-ok", post(control)),
+        ..RouteGroups::default()
+    };
+    let router = assemble(state, 8101, routes).unwrap();
+
+    // Member 1 occupies its 1 per-principal control slot; a second call from Member 1 is rejected.
+    let held_a = tokio::spawn(send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/v1/test/ctl-a",
+            Some(&member_bearers[0]),
+            Body::empty(),
+        ),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), gate_a.entered.notified())
+        .await
+        .unwrap();
+    problem(
+        send(
+            router.clone(),
+            request(
+                Method::POST,
+                "/v1/test/ctl-ok",
+                Some(&member_bearers[0]),
+                Body::empty(),
+            ),
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        code::OVERLOADED,
+    )
+    .await;
+
+    // Member 2 fills the 2nd (and final) non-admin control slot; Member 3 is rejected,
+    // while Admin still passes through its reserved control capacity.
+    let held_b = tokio::spawn(send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/v1/test/ctl-b",
+            Some(&member_bearers[1]),
+            Body::empty(),
+        ),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), gate_b.entered.notified())
+        .await
+        .unwrap();
+    problem(
+        send(
+            router.clone(),
+            request(
+                Method::POST,
+                "/v1/test/ctl-ok",
+                Some(&member_bearers[2]),
+                Body::empty(),
+            ),
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        code::OVERLOADED,
+    )
+    .await;
+    assert_eq!(
+        send(
+            router,
+            request(
+                Method::POST,
+                "/v1/test/ctl-ok",
+                Some(&fixture.api),
+                Body::empty(),
+            ),
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    gate_a.release.notify_one();
+    gate_b.release.notify_one();
+    assert_eq!(held_a.await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(held_b.await.unwrap().status(), StatusCode::NO_CONTENT);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn openapi_live_responses_match_schemas_for_catalog_execution_and_events() {
+    use crate::test_support::TestHub;
+
+    let now = efferian_protocol::RequestId::new().timestamp_ms();
+    let hub = TestHub::start("openapi-live-surface", Config::default(), now)
+        .await
+        .unwrap();
+    let doc_value: serde_json::Value = serde_json::to_value(openapi_doc()).unwrap();
+    let validate = |schema_ref: &str, body: &serde_json::Value| {
+        let validator = jsonschema::validator_for(&serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": schema_ref,
+            "components": doc_value["components"],
+        }))
+        .unwrap();
+        assert!(validator.is_valid(body), "body failed {schema_ref}: {body}");
+    };
+
+    // Seed upstream, account, binding, node, tool, profile, edition, and an execution.
+    let node_id = NodeId::new();
+    hub.write(move |conn| {
+        conn.execute(
+            "INSERT INTO nodes(node_id, name, credential_hmac, created_at_ms, updated_at_ms)
+             VALUES (?1, 'schema-node', 'fixture-hmac', ?2, ?2)",
+            params![node_id.to_string(), now],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (s, upstream) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/upstreams/up",
+            Some(serde_json::json!({"url": "https://example.com/mcp"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s, StatusCode::CREATED, "{upstream}");
+    let upstream_id = upstream["upstream"]["upstream_id"].clone();
+    let (s, acct) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/accounts/cred",
+            Some(serde_json::json!({
+                "upstream_id": upstream_id,
+                "secret": {"kind": "http_auth", "auth": {"kind": "bearer", "token": "tok"}}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s, StatusCode::CREATED, "{acct}");
+    let (s, bind) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/account-bindings/me/up",
+            Some(serde_json::json!({"account_slug": "cred"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s, StatusCode::CREATED, "{bind}");
+    let (s, tool) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/tools/cmd",
+            Some(serde_json::json!({
+                "description": "Schema check tool",
+                "input_schema": {"type": "object"},
+                "spec": {
+                    "kind": "command", "program": "/bin/echo", "cwd": "/", "args": [], "env": {},
+                    "target_selector": {"kind": "fixed", "node_ids": [node_id]},
+                    "runtime_ms": 5000, "max_output_bytes": 1024
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s, StatusCode::CREATED, "{tool}");
+    let (s, prof) = hub
+        .request_admin(
+            Method::PUT,
+            "/v1/profiles/prof",
+            Some(serde_json::json!({
+                "discovery_mode": "full",
+                "bindings": [{
+                    "public_name": "cmd",
+                    "tool_id": tool["tool"]["tool_id"],
+                    "tool_version": 1,
+                    "execution_mode": "async"
+                }]
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(s, StatusCode::CREATED, "{prof}");
+    let (s, ed) = hub
+        .request_admin(Method::POST, "/v1/profiles/prof/publish", None)
+        .await
+        .unwrap();
+    assert_eq!(s, StatusCode::CREATED, "{ed}");
+
+    let exec_id = efferian_protocol::ExecutionId::new();
+    let req_id = efferian_protocol::RequestId::new();
+    let prof_id: String = serde_json::from_value(prof["profile"]["profile_id"].clone()).unwrap();
+    let tool_id: String = serde_json::from_value(tool["tool"]["tool_id"].clone()).unwrap();
+    let admin_id = hub.admin_id;
+    hub.write(move |conn| {
+        conn.execute(
+            "INSERT INTO executions(
+                execution_id, invoke_kind, request_id, request_digest,
+                caller_principal_id, caller_token_id, profile_id, profile_version,
+                tool_id, tool_version, public_name, executor_kind, node_id,
+                state, summary_json, result_bytes, result_truncated, result_expired,
+                deadline_at_ms, created_at_ms, started_at_ms, finished_at_ms,
+                result_expires_at_ms, expires_at_ms
+             )
+             SELECT ?1, 'profile', ?2, 'digest',
+                    ?3, token_id, ?4, 1,
+                    ?5, 1, 'cmd', 'node', ?6,
+                    'succeeded', '{\"duration_ms\":12,\"exit_code\":0,\"effect_may_have_occurred\":true}',
+                    0, 0, 0,
+                    ?7, ?8, ?8, ?9,
+                    ?10, ?10
+             FROM auth_tokens WHERE principal_id = ?3 LIMIT 1",
+            params![
+                exec_id.to_string(),
+                req_id.to_string(),
+                admin_id.to_string(),
+                prof_id,
+                tool_id,
+                node_id.to_string(),
+                now + 60_000,
+                now,
+                now + 12,
+                now + 86_400_000,
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let exec_detail_path = format!("/v1/executions/{exec_id}?sensitive=true");
+    for (path, template, expect_non_empty_items) in [
+        ("/v1/upstreams", "/v1/upstreams", true),
+        ("/v1/accounts", "/v1/accounts", true),
+        ("/v1/account-bindings", "/v1/account-bindings", true),
+        ("/v1/tools", "/v1/tools", true),
+        ("/v1/profiles", "/v1/profiles", true),
+        ("/v1/profiles/prof/tools", "/v1/profiles/{slug}/tools", true),
+        (
+            "/v1/profiles/prof/tools/cmd",
+            "/v1/profiles/{slug}/tools/{public_name}",
+            false,
+        ),
+        ("/v1/executions", "/v1/executions", true),
+        (exec_detail_path.as_str(), "/v1/executions/{id}", false),
+        ("/v1/events", "/v1/events", true),
+    ] {
+        let (status, body) = hub.request_admin(Method::GET, path, None).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        if expect_non_empty_items {
+            assert!(
+                !body["items"].as_array().unwrap().is_empty(),
+                "expected non-empty items for {path}: {body}"
+            );
+        }
+        let schema_ref =
+            doc_value["paths"][template]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"]
+                .as_str()
+                .unwrap();
+        validate(schema_ref, &body);
+    }
+
+    // Validate live NDJSON EventStreamFrame from /v1/events/stream.
+    let stream_res = hub
+        .router
+        .clone()
+        .call(
+            Request::builder()
+                .uri("/v1/events/stream?after=0")
+                .header(HOST, "localhost:8080")
+                .header(AUTHORIZATION, format!("Bearer {}", hub.admin_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_res.status(), StatusCode::OK);
+    let mut body = stream_res.into_body();
+    let first_chunk = tokio::time::timeout(Duration::from_secs(3), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let line = std::str::from_utf8(&first_chunk)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
+    let frame_json: serde_json::Value = serde_json::from_str(line).unwrap();
+    validate("#/components/schemas/EventStreamFrame", &frame_json);
+    drop(body);
+
+    hub.shutdown().await;
 }

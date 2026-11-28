@@ -85,6 +85,32 @@ pub const fn canonicalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Compare the credential recipient of two parsed HTTP(S) URLs. IPv4-mapped
+/// literals and default ports describe the same recipient as their canonical forms.
+pub fn egress_url_origin_eq(left: &str, right: &str) -> Result<bool, SsrfError> {
+    fn origin(url: &Url) -> Result<(&str, Host<&str>, u16), SsrfError> {
+        let host = match url.host().ok_or(SsrfError::MissingHost)? {
+            Host::Ipv6(ip) => match canonicalize_ip(IpAddr::V6(ip)) {
+                IpAddr::V4(mapped) => Host::Ipv4(mapped),
+                IpAddr::V6(ip) => Host::Ipv6(ip),
+            },
+            host => host,
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(SsrfError::InvalidScheme);
+        }
+        let port = url
+            .port_or_known_default()
+            .filter(|&port| port != 0)
+            .ok_or(SsrfError::InvalidUrl)?;
+        Ok((url.scheme(), host, port))
+    }
+
+    let left = Url::parse(left).map_err(|_| SsrfError::InvalidUrl)?;
+    let right = Url::parse(right).map_err(|_| SsrfError::InvalidUrl)?;
+    Ok(origin(&left)? == origin(&right)?)
+}
+
 // Kept explicit even where a broader entry covers a network. These are the v0
 // policy ranges, rather than a claim about every IANA special-purpose network.
 const BLOCKED_V4: [(u32, u8); 15] = [
@@ -208,6 +234,9 @@ pub fn validate_egress_url(
     if url.fragment().is_some() {
         return Err(SsrfError::FragmentForbidden);
     }
+    if url.port() == Some(0) {
+        return Err(SsrfError::InvalidUrl);
+    }
 
     let literal = match url.host().ok_or(SsrfError::MissingHost)? {
         Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
@@ -237,6 +266,44 @@ pub fn validate_egress_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_compares_literal_hosts_and_default_ports_without_paths() {
+        assert_eq!(
+            egress_url_origin_eq(
+                "https://[::ffff:8.8.8.8]/first",
+                "https://8.8.8.8:443/second?q=1"
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            egress_url_origin_eq("HTTPS://Example.COM", "https://example.com:443/"),
+            Ok(true)
+        );
+        for other_origin in [
+            "http://example.com:443/",
+            "https://example.com:444/",
+            "https://example.com./",
+            "https://another.example/",
+        ] {
+            assert_eq!(
+                egress_url_origin_eq("https://example.com", other_origin),
+                Ok(false)
+            );
+        }
+        assert_eq!(
+            egress_url_origin_eq("https://example.com:0/", "https://example.com:0/"),
+            Err(SsrfError::InvalidUrl)
+        );
+        assert_eq!(
+            validate_egress_url(
+                "https://example.com:0/mcp",
+                &EgressPolicy::default(),
+                EgressUrlMode::RequireHttpsByDefault,
+            ),
+            Err(SsrfError::InvalidUrl)
+        );
+    }
 
     #[test]
     fn ranges_match_the_published_policy() {

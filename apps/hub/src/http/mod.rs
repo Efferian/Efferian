@@ -6,7 +6,7 @@ mod extract;
 mod headers;
 mod system;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{Extension, Router, extract::DefaultBodyLimit, middleware::from_fn_with_state};
 use bytes::Bytes;
@@ -14,14 +14,23 @@ use efferian_authz::{AuthContext, AuthzError, authorize_admin};
 use efferian_protocol::{PrincipalKind, error_codes as code};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{
+    ToSchema,
+    openapi::{
+        Ref, RefOr,
+        schema::{ArrayBuilder, ObjectBuilder, Schema, SchemaType, Type},
+    },
+};
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::{
+    catalog::schema::SchemaCache,
     config::Config,
     egress::EgressClient,
-    node_bridge::NodeBridgeControl,
+    execution::state::ExecutionControl,
+    node_bridge::NodeDispatcher,
     storage::{StorageClock, StorageHandle},
+    upstream_dispatch::{OfflineUpstreamDispatcher, UpstreamDispatcher},
     vault::Vault,
 };
 
@@ -38,14 +47,41 @@ pub use extract::{
 };
 
 #[derive(Clone)]
-pub struct AppState {
+pub(crate) struct AppState {
     pub storage: StorageHandle,
     pub vault: Arc<Vault>,
     pub clock: Arc<dyn StorageClock>,
     pub config: Arc<Config>,
-    pub bridge: Arc<dyn NodeBridgeControl>,
+    pub bridge: Arc<dyn NodeDispatcher>,
+    pub upstream: Arc<dyn UpstreamDispatcher>,
+    pub execution: Arc<ExecutionControl>,
+    pub schemas: Arc<SchemaCache>,
     #[allow(dead_code, reason = "upstream HTTP egress seam for #6/#8")]
     pub egress: EgressClient,
+}
+
+impl AppState {
+    pub(crate) fn new(
+        storage: StorageHandle,
+        vault: Arc<Vault>,
+        clock: Arc<dyn StorageClock>,
+        config: Arc<Config>,
+        bridge: Arc<dyn NodeDispatcher>,
+        egress: EgressClient,
+    ) -> Self {
+        let execution = Arc::new(ExecutionControl::new(&config));
+        Self {
+            storage,
+            vault,
+            clock,
+            config,
+            bridge,
+            upstream: Arc::new(OfflineUpstreamDispatcher),
+            execution,
+            schemas: Arc::new(SchemaCache::default()),
+            egress,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -55,6 +91,7 @@ pub(crate) struct RouteGroups {
     pub enrollment_api: OpenApiRouter<AppState>,
     pub enrollment_exchange: OpenApiRouter<AppState>,
     pub node_handshake: OpenApiRouter<AppState>,
+    pub event_stream: OpenApiRouter<AppState>,
     pub mcp: OpenApiRouter<AppState>,
 }
 
@@ -66,6 +103,7 @@ impl RouteGroups {
             enrollment_api: self.enrollment_api.merge(other.enrollment_api),
             enrollment_exchange: self.enrollment_exchange.merge(other.enrollment_exchange),
             node_handshake: self.node_handshake.merge(other.node_handshake),
+            event_stream: self.event_stream.merge(other.event_stream),
             mcp: self.mcp.merge(other.mcp),
         }
     }
@@ -92,10 +130,55 @@ pub(crate) fn checked_page_limit(limit: Option<u16>) -> ApiResult<usize> {
     Ok(usize::from(limit))
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Outcome {
+    Created,
+    Updated,
+    Unchanged,
+}
+
+impl Outcome {
+    pub(crate) const fn status(self) -> StatusCode {
+        match self {
+            Self::Created => StatusCode::CREATED,
+            Self::Updated | Self::Unchanged => StatusCode::OK,
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub(crate) struct Page<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
+}
+
+impl<T: ToSchema> utoipa::__dev::ComposeSchema for Page<T> {
+    fn compose(_new_generics: Vec<RefOr<Schema>>) -> RefOr<Schema> {
+        ObjectBuilder::new()
+            .property(
+                "items",
+                ArrayBuilder::new().items(Ref::from_schema_name(T::name())),
+            )
+            .required("items")
+            .property(
+                "next_cursor",
+                ObjectBuilder::new().schema_type(SchemaType::from_iter([Type::String, Type::Null])),
+            )
+            .required("next_cursor")
+            .into()
+    }
+}
+
+impl<T: ToSchema> ToSchema for Page<T> {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("Page")
+    }
+
+    fn schemas(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+        schemas.push((T::name().into_owned(), T::schema()));
+        T::schemas(schemas);
+    }
 }
 
 impl<T> Page<T> {
@@ -169,9 +252,13 @@ fn production_routes() -> RouteGroups {
         .merge(crate::principals::routes())
         .merge(crate::grants_tokens::routes())
         .merge(crate::nodes::routes())
+        .merge(crate::catalog::routes())
+        .merge(crate::execution::routes())
+        .merge(crate::event_bus::routes())
+        .merge(super::node_bridge::routes())
 }
 
-pub fn openapi_doc() -> utoipa::openapi::OpenApi {
+fn openapi_doc() -> utoipa::openapi::OpenApi {
     let routes = production_routes();
     let (_, mut doc) = system::routes()
         .merge(routes.application)
@@ -179,24 +266,53 @@ pub fn openapi_doc() -> utoipa::openapi::OpenApi {
         .merge(routes.enrollment_api)
         .merge(routes.enrollment_exchange)
         .merge(routes.node_handshake)
+        .merge(routes.event_stream)
         .merge(routes.mcp)
         .split_for_parts();
-    system::document_boundary_errors(&mut doc);
+    system::complete_operations(&mut doc);
     doc
 }
 
 pub fn openapi_bytes() -> Result<Bytes, serde_json::Error> {
-    system::build_openapi_bytes(&openapi_doc())
+    Ok(production_openapi()?.bytes.clone())
 }
 
-pub fn router(state: AppState, bound_port: u16) -> Result<Router, serde_json::Error> {
-    assemble(state, bound_port, production_routes())
+fn production_openapi() -> Result<Arc<system::OpenApiArtifact>, serde_json::Error> {
+    static ARTIFACT: OnceLock<Result<Arc<system::OpenApiArtifact>, String>> = OnceLock::new();
+    ARTIFACT
+        .get_or_init(|| {
+            system::OpenApiArtifact::build(&openapi_doc())
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|message| serde_json::Error::io(std::io::Error::other(message.clone())))
 }
 
+pub(crate) fn router(state: AppState, bound_port: u16) -> Result<Router, serde_json::Error> {
+    assemble_routes(
+        state,
+        bound_port,
+        production_routes(),
+        Some(production_openapi()?),
+    )
+}
+
+#[cfg(test)]
 fn assemble(
     state: AppState,
     bound_port: u16,
     routes: RouteGroups,
+) -> Result<Router, serde_json::Error> {
+    assemble_routes(state, bound_port, routes, None)
+}
+
+fn assemble_routes(
+    state: AppState,
+    bound_port: u16,
+    routes: RouteGroups,
+    artifact: Option<Arc<system::OpenApiArtifact>>,
 ) -> Result<Router, serde_json::Error> {
     let policy = Arc::new(HeaderPolicy {
         hub_id: *state.storage.hub_id(),
@@ -224,6 +340,10 @@ fn assemble(
     let node_handshake = routes
         .node_handshake
         .layer(from_fn_with_state(Arc::clone(&admission), admission::node));
+    let event_stream = routes.event_stream.layer(from_fn_with_state(
+        (Arc::clone(&admission), ApiLane::EventStream),
+        admission::api,
+    ));
     let mcp = routes.mcp.layer(from_fn_with_state(
         (admission, ApiLane::Mcp),
         admission::api,
@@ -235,11 +355,17 @@ fn assemble(
         .merge(enrollment_api)
         .merge(enrollment_exchange)
         .merge(node_handshake)
+        .merge(event_stream)
         .merge(mcp)
         .split_for_parts();
 
-    system::document_boundary_errors(&mut doc);
-    let artifact = Arc::new(system::OpenApiArtifact::build(&doc)?);
+    let artifact = match artifact {
+        Some(artifact) => artifact,
+        None => {
+            system::complete_operations(&mut doc);
+            Arc::new(system::OpenApiArtifact::build(&doc)?)
+        }
+    };
     Ok(router
         .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {

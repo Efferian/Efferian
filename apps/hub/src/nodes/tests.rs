@@ -8,7 +8,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::node_bridge::{BridgeCloseReason, NodeBridgeControl};
+use crate::node_bridge::{BridgeCloseReason, NodeDispatcher};
 use crate::test_support::{ClosedSession, TestHub, TestResult};
 use crate::vault::auth::{CredentialError, authenticate_node};
 
